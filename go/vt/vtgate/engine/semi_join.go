@@ -18,6 +18,7 @@ package engine
 
 import (
 	"context"
+	"sync/atomic"
 
 	"vitess.io/vitess/go/sqltypes"
 	querypb "vitess.io/vitess/go/vt/proto/query"
@@ -62,23 +63,25 @@ func (jn *SemiJoin) TryExecute(ctx context.Context, vcursor VCursor, bindVars ma
 
 // TryStreamExecute performs a streaming exec.
 func (jn *SemiJoin) TryStreamExecute(ctx context.Context, vcursor VCursor, bindVars map[string]*querypb.BindVariable, wantfields bool, callback func(*sqltypes.Result) error) error {
-	joinVars := make(map[string]*querypb.BindVariable)
 	err := vcursor.StreamExecutePrimitive(ctx, jn.Left, bindVars, wantfields, func(lresult *sqltypes.Result) error {
+		joinVars := make(map[string]*querypb.BindVariable)
 		result := &sqltypes.Result{Fields: lresult.Fields}
 		for _, lrow := range lresult.Rows {
 			for k, col := range jn.Vars {
 				joinVars[k] = sqltypes.ValueBindVariable(lrow[col])
 			}
-			rowAdded := false
+			var rowAdded atomic.Bool
 			err := vcursor.StreamExecutePrimitive(ctx, jn.Right, combineVars(bindVars, joinVars), false, func(rresult *sqltypes.Result) error {
-				if len(rresult.Rows) > 0 && !rowAdded {
-					result.Rows = append(result.Rows, lrow)
-					rowAdded = true
+				if len(rresult.Rows) > 0 {
+					rowAdded.Store(true)
 				}
 				return nil
 			})
 			if err != nil {
 				return err
+			}
+			if rowAdded.Load() {
+				result.Rows = append(result.Rows, lrow)
 			}
 		}
 		return callback(result)
@@ -100,33 +103,13 @@ func (jn *SemiJoin) Inputs() ([]Primitive, []map[string]any) {
 	}}
 }
 
-// RouteType returns a description of the query routing type used by the primitive
-func (jn *SemiJoin) RouteType() string {
-	return "SemiJoin"
-}
-
-// GetKeyspaceName specifies the Keyspace that this primitive routes to.
-func (jn *SemiJoin) GetKeyspaceName() string {
-	if jn.Left.GetKeyspaceName() == jn.Right.GetKeyspaceName() {
-		return jn.Left.GetKeyspaceName()
-	}
-	return jn.Left.GetKeyspaceName() + "_" + jn.Right.GetKeyspaceName()
-}
-
-// GetTableName specifies the table that this primitive routes to.
-func (jn *SemiJoin) GetTableName() string {
-	return jn.Left.GetTableName() + "_" + jn.Right.GetTableName()
-}
-
 // NeedsTransaction implements the Primitive interface
 func (jn *SemiJoin) NeedsTransaction() bool {
 	return jn.Right.NeedsTransaction() || jn.Left.NeedsTransaction()
 }
 
 func (jn *SemiJoin) description() PrimitiveDescription {
-	other := map[string]any{
-		"TableName": jn.GetTableName(),
-	}
+	other := map[string]any{}
 	if len(jn.Vars) > 0 {
 		other["JoinVars"] = orderedStringIntMap(jn.Vars)
 	}

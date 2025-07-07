@@ -72,12 +72,13 @@ GROUP BY table_name,
 // We join with a subquery that materializes the data from `information_schema.innodb_sys_tablespaces`
 // early for performance reasons. This effectively causes only a single read of `information_schema.innodb_sys_tablespaces`
 // per query.
+// Note that 5.7 has NULL for a VIEW's create_time, so we use IFNULL to make it 1 (non NULL and non zero).
 const TablesWithSize57 = `SELECT t.table_name,
 	t.table_type,
-	UNIX_TIMESTAMP(t.create_time),
+	IFNULL(UNIX_TIMESTAMP(t.create_time), 1),
 	t.table_comment,
-	IFNULL(SUM(i.file_size), SUM(t.data_length + t.index_length)),
-	IFNULL(SUM(i.allocated_size), SUM(t.data_length + t.index_length))
+	IFNULL(SUM(i.file_size), SUM(t.data_length + t.index_length)) AS file_size,
+	IFNULL(SUM(i.allocated_size), SUM(t.data_length + t.index_length)) AS allocated_size
 FROM information_schema.tables t
 LEFT OUTER JOIN (
 	SELECT space, file_size, allocated_size, name
@@ -211,7 +212,7 @@ func (mysqlFlavorLegacy) catchupToGTIDCommands(params *ConnParams, replPos repli
 		cmds = append(cmds, cmd+";")
 	} else {
 		// No TLS
-		cmds = append(cmds, fmt.Sprintf("CHANGE MASTER TO MASTER_HOST='%s', MASTER_PORT=%d, MASTER_USER='%s', MASTER_PASSWORD='%s', MASTER_AUTO_POSITION=1;", params.Host, params.Port, params.Uname, params.Pass))
+		cmds = append(cmds, fmt.Sprintf("CHANGE MASTER TO MASTER_HOST='%s', MASTER_PORT=%d, MASTER_USER='%s', MASTER_PASSWORD='%s', GET_MASTER_PUBLIC_KEY=1, MASTER_AUTO_POSITION=1;", params.Host, params.Port, params.Uname, params.Pass))
 	}
 
 	if replPos.IsZero() { // when the there is no afterPos, that means need to replicate completely
@@ -232,6 +233,8 @@ func (mysqlFlavorLegacy) setReplicationSourceCommand(params *ConnParams, host st
 	}
 	if params.SslEnabled() {
 		args = append(args, "MASTER_SSL = 1")
+	} else {
+		args = append(args, "GET_MASTER_PUBLIC_KEY = 1")
 	}
 	if params.SslCa != "" {
 		args = append(args, fmt.Sprintf("MASTER_SSL_CA = '%s'", params.SslCa))

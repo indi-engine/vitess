@@ -21,6 +21,9 @@ import (
 	"fmt"
 	"os"
 	"path"
+	"slices"
+	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -41,7 +44,7 @@ const (
 
 // ClearOutTable deletes everything from a table. Sometimes the table might have more rows than allowed in a single delete query,
 // so we have to do the deletions iteratively.
-func ClearOutTable(t *testing.T, vtParams mysql.ConnParams, tableName string) {
+func ClearOutTable(t testing.TB, vtParams mysql.ConnParams, tableName string) {
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 	for {
@@ -86,8 +89,31 @@ func ClearOutTable(t *testing.T, vtParams mysql.ConnParams, tableName string) {
 // WriteTestCommunicationFile writes the content to the file with the given name.
 // We use these files to coordinate with the vttablets running in the debug mode.
 func WriteTestCommunicationFile(t *testing.T, fileName string, content string) {
+	// Delete the file just to make sure it doesn't exist before we write to it.
+	DeleteFile(fileName)
 	err := os.WriteFile(path.Join(os.Getenv("VTDATAROOT"), fileName), []byte(content), 0644)
 	require.NoError(t, err)
+}
+
+// RunMultiShardCommitWithDelay runs a multi shard commit and configures it to wait for a certain amount of time in the commit phase.
+func RunMultiShardCommitWithDelay(t *testing.T, conn *mysql.Conn, commitDelayTime string, wg *sync.WaitGroup, queries []string) {
+	// Run all the queries to start the transaction.
+	for _, query := range queries {
+		utils.Exec(t, conn, query)
+	}
+	// We want to delay the commit on one of the shards to simulate slow commits on a shard.
+	WriteTestCommunicationFile(t, DebugDelayCommitShard, "80-")
+	WriteTestCommunicationFile(t, DebugDelayCommitTime, commitDelayTime)
+	// We will execute a commit in a go routine, because we know it will take some time to complete.
+	// While the commit is ongoing, we would like to run the disruption.
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		_, err := utils.ExecAllowError(t, conn, "commit")
+		if err != nil {
+			log.Errorf("Error in commit - %v", err)
+		}
+	}()
 }
 
 // DeleteFile deletes the file specified.
@@ -168,5 +194,73 @@ func WaitForMigrationStatus(t *testing.T, vtParams *mysql.ConnParams, ks string,
 		if countMatchedShards == len(shards) {
 			return schema.OnlineDDLStatus(lastKnownStatus)
 		}
+	}
+}
+
+func RunReshard(t *testing.T, clusterInstance *cluster.LocalProcessCluster, workflowName, keyspaceName string, sourceShards, targetShards string) error {
+	rw := cluster.NewReshard(t, clusterInstance, workflowName, keyspaceName, targetShards, sourceShards)
+	// Initiate Reshard.
+	output, err := rw.Create()
+	require.NoError(t, err, output)
+	// Wait for vreplication to catchup. Should be very fast since we don't have a lot of rows.
+	rw.WaitForVreplCatchup(10 * time.Second)
+	// SwitchTraffic
+	output, err = rw.SwitchReadsAndWrites()
+	require.NoError(t, err, output)
+	output, err = rw.Complete()
+	require.NoError(t, err, output)
+
+	// When Reshard completes, it has already deleted the source shards from the topo server.
+	// We just need to shutdown the vttablets, and remove them from the cluster.
+	removeShards(t, clusterInstance, keyspaceName, sourceShards)
+	return nil
+}
+
+func removeShards(t *testing.T, clusterInstance *cluster.LocalProcessCluster, keyspaceName string, shards string) {
+	sourceShardsList := strings.Split(shards, ",")
+	var remainingShards []cluster.Shard
+	for idx, keyspace := range clusterInstance.Keyspaces {
+		if keyspace.Name != keyspaceName {
+			continue
+		}
+		for _, shard := range keyspace.Shards {
+			if slices.Contains(sourceShardsList, shard.Name) {
+				for _, vttablet := range shard.Vttablets {
+					err := vttablet.VttabletProcess.TearDown()
+					require.NoError(t, err)
+				}
+				continue
+			}
+			remainingShards = append(remainingShards, shard)
+		}
+		clusterInstance.Keyspaces[idx].Shards = remainingShards
+	}
+}
+
+func AddShards(t *testing.T, clusterInstance *cluster.LocalProcessCluster, keyspaceName string, shardNames []string) {
+	for _, shardName := range shardNames {
+		t.Helper()
+		shard, err := clusterInstance.AddShard(keyspaceName, shardName, 3, false, nil)
+		require.NoError(t, err)
+		clusterInstance.Keyspaces[0].Shards = append(clusterInstance.Keyspaces[0].Shards, *shard)
+		for _, vttablet := range shard.Vttablets {
+			err = vttablet.VttabletProcess.WaitForTabletStatuses([]string{"SERVING"})
+			require.NoError(t, err)
+		}
+	}
+}
+
+type Warn struct {
+	Level string
+	Code  uint16
+	Msg   string
+}
+
+func ToWarn(row sqltypes.Row) Warn {
+	code, _ := row[1].ToUint16()
+	return Warn{
+		Level: row[0].ToString(),
+		Code:  code,
+		Msg:   row[2].ToString(),
 	}
 }

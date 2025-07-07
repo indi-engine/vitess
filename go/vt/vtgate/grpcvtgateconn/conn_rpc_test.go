@@ -29,6 +29,7 @@ import (
 
 	"vitess.io/vitess/go/vt/grpcclient"
 	"vitess.io/vitess/go/vt/servenv"
+	"vitess.io/vitess/go/vt/utils"
 	"vitess.io/vitess/go/vt/vtgate/grpcvtgateservice"
 	"vitess.io/vitess/go/vt/vtgate/vtgateconn"
 )
@@ -40,9 +41,7 @@ func TestGRPCVTGateConn(t *testing.T) {
 
 	// listen on a random port
 	listener, err := net.Listen("tcp", "127.0.0.1:0")
-	if err != nil {
-		t.Fatalf("Cannot listen: %v", err)
-	}
+	require.NoError(t, err)
 
 	// Create a gRPC server and listen on the port
 	server := grpc.NewServer()
@@ -52,9 +51,7 @@ func TestGRPCVTGateConn(t *testing.T) {
 	// Create a Go RPC client connecting to the server
 	ctx := context.Background()
 	client, err := dial(ctx, listener.Addr().String())
-	if err != nil {
-		t.Fatalf("dial failed: %v", err)
-	}
+	require.NoError(t, err)
 	RegisterTestDialProtocol(client)
 
 	// run the test suite
@@ -92,16 +89,12 @@ func TestGRPCVTGateConnAuth(t *testing.T) {
         }`
 
 	f, err := os.CreateTemp("", "static_auth_creds.json")
-	if err != nil {
-		t.Fatal(err)
-	}
+	require.NoError(t, err)
 	defer os.Remove(f.Name())
-	if _, err := io.WriteString(f, authJSON); err != nil {
-		t.Fatal(err)
-	}
-	if err := f.Close(); err != nil {
-		t.Fatal(err)
-	}
+	_, err = io.WriteString(f, authJSON)
+	require.NoError(t, err)
+	err = f.Close()
+	require.NoError(t, err)
 
 	// Create a Go RPC client connecting to the server
 	ctx := context.Background()
@@ -109,15 +102,17 @@ func TestGRPCVTGateConnAuth(t *testing.T) {
 	grpcclient.RegisterFlags(fs)
 
 	grpcclient.ResetStaticAuth()
+	authStaticClientCredsFlag := utils.GetFlagVariantForTests("--grpc-auth-static-client-creds")
+
+	// Parse the flag using the chosen variant
 	err = fs.Parse([]string{
-		"--grpc_auth_static_client_creds",
+		authStaticClientCredsFlag,
 		f.Name(),
 	})
-	require.NoError(t, err, "failed to set `--grpc_auth_static_client_creds=%s`", f.Name())
+
+	require.NoError(t, err, "failed to set `%s=%s`", authStaticClientCredsFlag, f.Name())
 	client, err := dial(ctx, listener.Addr().String())
-	if err != nil {
-		t.Fatalf("dial failed: %v", err)
-	}
+	require.NoError(t, err)
 	RegisterTestDialProtocol(client)
 
 	// run the test suite
@@ -133,16 +128,11 @@ func TestGRPCVTGateConnAuth(t *testing.T) {
 	}`
 
 	f, err = os.CreateTemp("", "static_auth_creds.json")
-	if err != nil {
-		t.Fatal(err)
-	}
+	require.NoError(t, err)
 	defer os.Remove(f.Name())
-	if _, err := io.WriteString(f, invalidAuthJSON); err != nil {
-		t.Fatal(err)
-	}
-	if err := f.Close(); err != nil {
-		t.Fatal(err)
-	}
+	_, err = io.WriteString(f, invalidAuthJSON)
+	require.NoError(t, err)
+	require.NoError(t, f.Close())
 
 	// Create a Go RPC client connecting to the server
 	ctx = context.Background()
@@ -150,11 +140,14 @@ func TestGRPCVTGateConnAuth(t *testing.T) {
 	grpcclient.RegisterFlags(fs)
 
 	grpcclient.ResetStaticAuth()
+	authStaticClientCredsFlag = utils.GetFlagVariantForTests("--grpc-auth-static-client-creds")
 	err = fs.Parse([]string{
-		"--grpc_auth_static_client_creds",
+		authStaticClientCredsFlag,
 		f.Name(),
 	})
-	require.NoError(t, err, "failed to set `--grpc_auth_static_client_creds=%s`", f.Name())
+
+	require.NoError(t, err, "failed to set `%s=%s`", authStaticClientCredsFlag, f.Name())
+
 	client, err = dial(ctx, listener.Addr().String())
 	if err != nil {
 		t.Fatalf("dial failed: %v", err)
@@ -162,7 +155,7 @@ func TestGRPCVTGateConnAuth(t *testing.T) {
 	RegisterTestDialProtocol(client)
 	conn, _ := vtgateconn.DialProtocol(context.Background(), "test", "")
 	// run the test suite
-	_, err = conn.Session("", nil).Execute(context.Background(), "select * from t", nil)
+	_, err = conn.Session("", nil).Execute(context.Background(), "select * from t", nil, false)
 	want := "rpc error: code = Unauthenticated desc = username and password must be provided"
 	if err == nil || err.Error() != want {
 		t.Errorf("expected auth failure:\n%v, want\n%s", err, want)

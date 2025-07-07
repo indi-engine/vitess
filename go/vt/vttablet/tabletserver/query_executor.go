@@ -40,6 +40,7 @@ import (
 	"vitess.io/vitess/go/vt/schema"
 	"vitess.io/vitess/go/vt/sqlparser"
 	"vitess.io/vitess/go/vt/tableacl"
+	"vitess.io/vitess/go/vt/tableacl/acl"
 	"vitess.io/vitess/go/vt/vterrors"
 	"vitess.io/vitess/go/vt/vtgate/evalengine"
 	"vitess.io/vitess/go/vt/vttablet/tabletserver/connpool"
@@ -69,7 +70,10 @@ type QueryExecutor struct {
 }
 
 const (
-	streamRowsSize = 256
+	streamRowsSize    = 256
+	resetLastIDQuery  = "select last_insert_id(18446744073709547416)"
+	resetLastIDValue  = 18446744073709547416
+	userLabelDisabled = "UserLabelDisabled"
 )
 
 var (
@@ -167,8 +171,14 @@ func (qre *QueryExecutor) Execute() (reply *sqltypes.Result, err error) {
 		}
 		defer conn.Unlock()
 		if qre.setting != nil {
-			if err = conn.ApplySetting(qre.ctx, qre.setting); err != nil {
+			applied, err := conn.ApplySetting(qre.ctx, qre.setting)
+			if err != nil {
 				return nil, vterrors.Wrap(err, "failed to execute system setting on the connection")
+			}
+			// If we have applied the settings on the connection, then we should record the query detail.
+			// This is required for redoing the transaction in case of a failure.
+			if applied {
+				conn.TxProperties().RecordQueryDetail(qre.setting.ApplyQuery(), nil)
 			}
 		}
 		return qre.txConnExec(conn)
@@ -235,7 +245,7 @@ func (qre *QueryExecutor) execAutocommit(f func(conn *StatefulConnection) (*sqlt
 		return nil, errTxThrottled
 	}
 
-	conn, _, _, err := qre.tsv.te.txPool.Begin(qre.ctx, qre.options, false, 0, nil, qre.setting)
+	conn, _, _, err := qre.tsv.te.txPool.Begin(qre.ctx, qre.options, false, 0, qre.setting)
 
 	if err != nil {
 		return nil, err
@@ -249,7 +259,7 @@ func (qre *QueryExecutor) execAsTransaction(f func(conn *StatefulConnection) (*s
 	if qre.tsv.txThrottler.Throttle(qre.tsv.getPriorityFromOptions(qre.options), qre.options.GetWorkloadName()) {
 		return nil, errTxThrottled
 	}
-	conn, beginSQL, _, err := qre.tsv.te.txPool.Begin(qre.ctx, qre.options, false, 0, nil, qre.setting)
+	conn, beginSQL, _, err := qre.tsv.te.txPool.Begin(qre.ctx, qre.options, false, 0, qre.setting)
 	if err != nil {
 		return nil, err
 	}
@@ -278,8 +288,10 @@ func (qre *QueryExecutor) execAsTransaction(f func(conn *StatefulConnection) (*s
 
 func (qre *QueryExecutor) txConnExec(conn *StatefulConnection) (*sqltypes.Result, error) {
 	switch qre.plan.PlanID {
-	case p.PlanInsert, p.PlanUpdate, p.PlanDelete, p.PlanSet:
+	case p.PlanInsert, p.PlanUpdate, p.PlanDelete:
 		return qre.txFetch(conn, true)
+	case p.PlanSet:
+		return qre.txFetch(conn, false)
 	case p.PlanInsertMessage:
 		qre.bindVars["#time_now"] = sqltypes.Int64BindVariable(time.Now().UnixNano())
 		return qre.txFetch(conn, true)
@@ -287,8 +299,17 @@ func (qre *QueryExecutor) txConnExec(conn *StatefulConnection) (*sqltypes.Result
 		return qre.execDMLLimit(conn)
 	case p.PlanOtherRead, p.PlanOtherAdmin, p.PlanFlush, p.PlanUnlockTables:
 		return qre.execStatefulConn(conn, qre.query, true)
-	case p.PlanSavepoint, p.PlanRelease, p.PlanSRollback:
-		return qre.execStatefulConn(conn, qre.query, true)
+	case p.PlanSavepoint:
+		return qre.execSavepointQuery(conn, qre.query, qre.plan.FullStmt)
+	case p.PlanSRollback:
+		return qre.execRollbackToSavepoint(conn, qre.query, qre.plan.FullStmt)
+	case p.PlanRelease:
+		return qre.execTxQuery(conn, qre.query, false)
+	case p.PlanSelectNoLimit:
+		if qre.bindVars[sqltypes.BvReplaceSchemaName] != nil {
+			qre.bindVars[sqltypes.BvSchemaName] = sqltypes.StringBindVariable(qre.tsv.config.DB.DBName)
+		}
+		return qre.txFetch(conn, false)
 	case p.PlanSelect, p.PlanSelectImpossible, p.PlanShow, p.PlanSelectLockFunc:
 		maxrows := qre.getSelectLimit()
 		qre.bindVars["#maxLimit"] = sqltypes.Int64BindVariable(maxrows + 1)
@@ -378,7 +399,7 @@ func (qre *QueryExecutor) Stream(callback StreamCallback) error {
 		}
 		defer txConn.Unlock()
 		if qre.setting != nil {
-			if err = txConn.ApplySetting(qre.ctx, qre.setting); err != nil {
+			if _, err = txConn.ApplySetting(qre.ctx, qre.setting); err != nil {
 				return vterrors.Wrap(err, "failed to execute system setting on the connection")
 			}
 		}
@@ -511,10 +532,14 @@ func (qre *QueryExecutor) checkPermissions() error {
 }
 
 func (qre *QueryExecutor) checkAccess(authorized *tableacl.ACLResult, tableName string, callerID *querypb.VTGateCallerID) error {
-	statsKey := []string{tableName, authorized.GroupName, qre.plan.PlanID.String(), callerID.Username}
+	var aclState acl.ACLState
+	defer func() {
+		statsKey := qre.generateACLStatsKey(tableName, authorized, callerID)
+		qre.recordACLStats(statsKey, aclState)
+	}()
 	if !authorized.IsMember(callerID) {
 		if qre.tsv.qe.enableTableACLDryRun {
-			qre.tsv.Stats().TableaclPseudoDenied.Add(statsKey, 1)
+			aclState = acl.ACLPseudoDenied
 			return nil
 		}
 
@@ -528,15 +553,35 @@ func (qre *QueryExecutor) checkAccess(authorized *tableacl.ACLResult, tableName 
 			if len(callerID.Groups) > 0 {
 				groupStr = fmt.Sprintf(", in groups [%s],", strings.Join(callerID.Groups, ", "))
 			}
+			aclState = acl.ACLDenied
 			errStr := fmt.Sprintf("%s command denied to user '%s'%s for table '%s' (ACL check error)", qre.plan.PlanID.String(), callerID.Username, groupStr, tableName)
-			qre.tsv.Stats().TableaclDenied.Add(statsKey, 1)
 			qre.tsv.qe.accessCheckerLogger.Infof("%s", errStr)
 			return vterrors.Errorf(vtrpcpb.Code_PERMISSION_DENIED, "%s", errStr)
 		}
 		return nil
 	}
-	qre.tsv.Stats().TableaclAllowed.Add(statsKey, 1)
+	aclState = acl.ACLAllow
 	return nil
+}
+
+func (qre *QueryExecutor) generateACLStatsKey(tableName string, authorized *tableacl.ACLResult, callerID *querypb.VTGateCallerID) []string {
+	if qre.tsv.Config().SkipUserMetrics {
+		return []string{tableName, authorized.GroupName, qre.plan.PlanID.String(), userLabelDisabled}
+	}
+	return []string{tableName, authorized.GroupName, qre.plan.PlanID.String(), callerID.Username}
+}
+
+func (qre *QueryExecutor) recordACLStats(key []string, aclState acl.ACLState) {
+	switch aclState {
+	case acl.ACLAllow:
+		qre.tsv.Stats().TableaclAllowed.Add(key, 1)
+	case acl.ACLDenied:
+		qre.tsv.Stats().TableaclDenied.Add(key, 1)
+	case acl.ACLPseudoDenied:
+		qre.tsv.Stats().TableaclPseudoDenied.Add(key, 1)
+	case acl.ACLUnknown:
+		// nothing to record here.
+	}
 }
 
 func (qre *QueryExecutor) execDDL(conn *StatefulConnection) (result *sqltypes.Result, err error) {
@@ -704,10 +749,14 @@ func (qre *QueryExecutor) execSelect() (*sqltypes.Result, error) {
 				q.SetErr(err)
 			}
 		} else {
-			qre.logStats.QuerySources |= tabletenv.QuerySourceConsolidator
-			startTime := time.Now()
-			q.Wait()
-			qre.tsv.stats.WaitTimings.Record("Consolidations", startTime)
+			waiterCap := qre.tsv.config.ConsolidatorQueryWaiterCap
+			if waiterCap == 0 || *q.AddWaiterCounter(0) <= waiterCap {
+				qre.logStats.QuerySources |= tabletenv.QuerySourceConsolidator
+				startTime := time.Now()
+				q.Wait()
+				qre.tsv.stats.WaitTimings.Record("Consolidations", startTime)
+			}
+			q.AddWaiterCounter(-1)
 		}
 		if q.Err() != nil {
 			return nil, q.Err()
@@ -790,6 +839,11 @@ func (qre *QueryExecutor) txFetch(conn *StatefulConnection, record bool) (*sqlty
 	if err != nil {
 		return nil, err
 	}
+	return qre.execTxQuery(conn, sql, record)
+}
+
+// execTxQuery executes the query provided and record in Tx Property if record is true.
+func (qre *QueryExecutor) execTxQuery(conn *StatefulConnection, sql string, record bool) (*sqltypes.Result, error) {
 	qr, err := qre.execStatefulConn(conn, sql, true)
 	if err != nil {
 		return nil, err
@@ -798,6 +852,40 @@ func (qre *QueryExecutor) txFetch(conn *StatefulConnection, record bool) (*sqlty
 	if record {
 		conn.TxProperties().RecordQueryDetail(sql, qre.plan.TableNames())
 	}
+	return qr, nil
+}
+
+// execTxQuery executes the query provided and record in Tx Property if record is true.
+func (qre *QueryExecutor) execSavepointQuery(conn *StatefulConnection, sql string, ast sqlparser.Statement) (*sqltypes.Result, error) {
+	qr, err := qre.execStatefulConn(conn, sql, true)
+	if err != nil {
+		return nil, err
+	}
+
+	// Only record successful queries.
+	sp, ok := ast.(*sqlparser.Savepoint)
+	if !ok {
+		return nil, vterrors.VT13001("expected to get a savepoint statement")
+	}
+	conn.TxProperties().RecordSavePointDetail(sp.Name.String())
+
+	return qr, nil
+}
+
+// execTxQuery executes the query provided and record in Tx Property if record is true.
+func (qre *QueryExecutor) execRollbackToSavepoint(conn *StatefulConnection, sql string, ast sqlparser.Statement) (*sqltypes.Result, error) {
+	qr, err := qre.execStatefulConn(conn, sql, true)
+	if err != nil {
+		return nil, err
+	}
+
+	// Only record successful queries.
+	sp, ok := ast.(*sqlparser.SRollback)
+	if !ok {
+		return nil, vterrors.VT13001("expected to get a rollback statement")
+	}
+
+	_ = conn.TxProperties().RollbackToSavepoint(sp.Name.String())
 	return qr, nil
 }
 
@@ -921,9 +1009,13 @@ func (qre *QueryExecutor) execAlterMigration() (*sqltypes.Result, error) {
 	case sqlparser.LaunchAllMigrationType:
 		return qre.tsv.onlineDDLExecutor.LaunchMigrations(qre.ctx)
 	case sqlparser.CompleteMigrationType:
-		return qre.tsv.onlineDDLExecutor.CompleteMigration(qre.ctx, alterMigration.UUID)
+		return qre.tsv.onlineDDLExecutor.CompleteMigration(qre.ctx, alterMigration.UUID, alterMigration.Shards)
 	case sqlparser.CompleteAllMigrationType:
 		return qre.tsv.onlineDDLExecutor.CompletePendingMigrations(qre.ctx)
+	case sqlparser.PostponeCompleteMigrationType:
+		return qre.tsv.onlineDDLExecutor.PostponeCompleteMigration(qre.ctx, alterMigration.UUID)
+	case sqlparser.PostponeCompleteAllMigrationType:
+		return qre.tsv.onlineDDLExecutor.PostponeCompletePendingMigrations(qre.ctx)
 	case sqlparser.CancelMigrationType:
 		return qre.tsv.onlineDDLExecutor.CancelMigration(qre.ctx, alterMigration.UUID, "CANCEL issued by user", true)
 	case sqlparser.CancelAllMigrationType:
@@ -940,6 +1032,8 @@ func (qre *QueryExecutor) execAlterMigration() (*sqltypes.Result, error) {
 		return qre.tsv.onlineDDLExecutor.ForceCutOverMigration(qre.ctx, alterMigration.UUID)
 	case sqlparser.ForceCutOverAllMigrationType:
 		return qre.tsv.onlineDDLExecutor.ForceCutOverPendingMigrations(qre.ctx)
+	case sqlparser.SetCutOverThresholdMigrationType:
+		return qre.tsv.onlineDDLExecutor.SetMigrationCutOverThreshold(qre.ctx, alterMigration.UUID, alterMigration.Threshold)
 	}
 	return nil, vterrors.New(vtrpcpb.Code_UNIMPLEMENTED, "ALTER VITESS_MIGRATION not implemented")
 }
@@ -1058,42 +1152,104 @@ func (qre *QueryExecutor) getSelectLimit() int64 {
 func (qre *QueryExecutor) execDBConn(conn *connpool.Conn, sql string, wantfields bool) (*sqltypes.Result, error) {
 	span, ctx := trace.NewSpan(qre.ctx, "QueryExecutor.execDBConn")
 	defer span.Finish()
-
 	defer qre.logStats.AddRewrittenSQL(sql, time.Now())
 
 	qd := NewQueryDetail(qre.logStats.Ctx, conn)
-	err := qre.tsv.statelessql.Add(qd)
-	if err != nil {
+
+	if err := qre.tsv.statelessql.Add(qd); err != nil {
 		return nil, err
 	}
 	defer qre.tsv.statelessql.Remove(qd)
 
-	return conn.Exec(ctx, sql, int(qre.tsv.qe.maxResultSize.Load()), wantfields)
+	if err := qre.resetLastInsertIDIfNeeded(ctx, conn); err != nil {
+		return nil, err
+	}
+
+	exec, err := conn.Exec(ctx, sql, int(qre.tsv.qe.maxResultSize.Load()), wantfields)
+	if err != nil {
+		return nil, err
+	}
+
+	if err := qre.fetchLastInsertID(ctx, conn, exec); err != nil {
+		return nil, err
+	}
+
+	return exec, nil
 }
 
 func (qre *QueryExecutor) execStatefulConn(conn *StatefulConnection, sql string, wantfields bool) (*sqltypes.Result, error) {
 	span, ctx := trace.NewSpan(qre.ctx, "QueryExecutor.execStatefulConn")
 	defer span.Finish()
-
 	defer qre.logStats.AddRewrittenSQL(sql, time.Now())
 
 	qd := NewQueryDetail(qre.logStats.Ctx, conn)
-	err := qre.tsv.statefulql.Add(qd)
-	if err != nil {
+
+	if err := qre.tsv.statefulql.Add(qd); err != nil {
 		return nil, err
 	}
 	defer qre.tsv.statefulql.Remove(qd)
 
-	return conn.Exec(ctx, sql, int(qre.tsv.qe.maxResultSize.Load()), wantfields)
+	if err := qre.resetLastInsertIDIfNeeded(ctx, conn.UnderlyingDBConn().Conn); err != nil {
+		return nil, err
+	}
+
+	exec, err := conn.Exec(ctx, sql, qre.getMaxResultSize(), wantfields)
+	if err != nil {
+		return nil, err
+	}
+
+	if err := qre.fetchLastInsertID(ctx, conn.UnderlyingDBConn().Conn, exec); err != nil {
+		return nil, err
+	}
+
+	return exec, nil
+}
+
+func (qre *QueryExecutor) getMaxResultSize() int {
+	if qre.plan.PlanID == p.PlanSelectNoLimit {
+		return mysql.FETCH_ALL_ROWS
+	}
+	return int(qre.tsv.qe.maxResultSize.Load())
+}
+
+func (qre *QueryExecutor) resetLastInsertIDIfNeeded(ctx context.Context, conn *connpool.Conn) error {
+	if qre.options.GetFetchLastInsertId() {
+		// if the query contains a last_insert_id(x) function,
+		// we need to reset the last insert id to check if it was set by the query or not
+		_, err := conn.Exec(ctx, resetLastIDQuery, 1, false)
+		if err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func (qre *QueryExecutor) fetchLastInsertID(ctx context.Context, conn *connpool.Conn, exec *sqltypes.Result) error {
+	if exec.InsertIDUpdated() || !qre.options.GetFetchLastInsertId() {
+		return nil
+	}
+
+	result, err := conn.Exec(ctx, "select last_insert_id()", 1, false)
+	if err != nil {
+		return err
+	}
+
+	cell := result.Rows[0][0]
+	insertID, err := cell.ToCastUint64()
+	if err != nil {
+		return err
+	}
+	if resetLastIDValue != insertID {
+		exec.InsertID = insertID
+		exec.InsertIDChanged = true
+	}
+	return nil
 }
 
 func (qre *QueryExecutor) execStreamSQL(conn *connpool.PooledConn, isTransaction bool, sql string, callback func(*sqltypes.Result) error) error {
 	span, ctx := trace.NewSpan(qre.ctx, "QueryExecutor.execStreamSQL")
+	defer span.Finish()
 	trace.AnnotateSQL(span, sqlparser.Preview(sql))
-	callBackClosingSpan := func(result *sqltypes.Result) error {
-		defer span.Finish()
-		return callback(result)
-	}
 
 	start := time.Now()
 	defer qre.logStats.AddRewrittenSQL(sql, start)
@@ -1104,26 +1260,58 @@ func (qre *QueryExecutor) execStreamSQL(conn *connpool.PooledConn, isTransaction
 	// This change will ensure that long-running streaming stateful queries get gracefully shutdown during ServingTypeChange
 	// once their grace period is over.
 	qd := NewQueryDetail(qre.logStats.Ctx, conn.Conn)
+
+	if err := qre.resetLastInsertIDIfNeeded(ctx, conn.Conn); err != nil {
+		return err
+	}
+
+	lastInsertIDSet := false
+	cb := func(result *sqltypes.Result) error {
+		if result != nil && result.InsertIDUpdated() {
+			lastInsertIDSet = true
+		}
+		return callback(result)
+	}
+
+	var err error
 	if isTransaction {
-		err := qre.tsv.statefulql.Add(qd)
+		err = qre.tsv.statefulql.Add(qd)
 		if err != nil {
 			return err
 		}
 		defer qre.tsv.statefulql.Remove(qd)
-		return conn.Conn.StreamOnce(ctx, sql, callBackClosingSpan, allocStreamResult, int(qre.tsv.qe.streamBufferSize.Load()), sqltypes.IncludeFieldsOrDefault(qre.options))
+		err = conn.Conn.StreamOnce(ctx, sql, cb, allocStreamResult, int(qre.tsv.qe.streamBufferSize.Load()), sqltypes.IncludeFieldsOrDefault(qre.options))
+	} else {
+		err = qre.tsv.olapql.Add(qd)
+		if err != nil {
+			return err
+		}
+		defer qre.tsv.olapql.Remove(qd)
+		err = conn.Conn.Stream(ctx, sql, cb, allocStreamResult, int(qre.tsv.qe.streamBufferSize.Load()), sqltypes.IncludeFieldsOrDefault(qre.options))
 	}
-	err := qre.tsv.olapql.Add(qd)
-	if err != nil {
+
+	if err != nil || lastInsertIDSet || !qre.options.GetFetchLastInsertId() {
 		return err
 	}
-	defer qre.tsv.olapql.Remove(qd)
-	return conn.Conn.Stream(ctx, sql, callBackClosingSpan, allocStreamResult, int(qre.tsv.qe.streamBufferSize.Load()), sqltypes.IncludeFieldsOrDefault(qre.options))
+	res := &sqltypes.Result{}
+	if err = qre.fetchLastInsertID(ctx, conn.Conn, res); err != nil {
+		return err
+	}
+	if res.InsertIDUpdated() {
+		return callback(res)
+	}
+	return nil
 }
 
 func (qre *QueryExecutor) recordUserQuery(queryType string, duration int64) {
-	username := callerid.GetPrincipal(callerid.EffectiveCallerIDFromContext(qre.ctx))
-	if username == "" {
-		username = callerid.GetUsername(callerid.ImmediateCallerIDFromContext(qre.ctx))
+	var username string
+	if qre.tsv.config.SkipUserMetrics {
+		username = userLabelDisabled
+	} else {
+		username = callerid.GetPrincipal(callerid.EffectiveCallerIDFromContext(qre.ctx))
+		if username == "" {
+			username = callerid.GetUsername(callerid.ImmediateCallerIDFromContext(qre.ctx))
+		}
 	}
 	tableName := qre.plan.TableName().String()
 	qre.tsv.Stats().UserTableQueryCount.Add([]string{tableName, username, queryType}, 1)

@@ -22,6 +22,7 @@ import (
 	"reflect"
 	"strings"
 	"sync"
+	"time"
 
 	"vitess.io/vitess/go/stats"
 	"vitess.io/vitess/go/vt/sidecardb"
@@ -113,8 +114,7 @@ func (vte *VTExplain) newTablet(ctx context.Context, env *vtenv.Environment, opt
 	config := tabletenv.NewCurrentConfig()
 	config.TrackSchemaVersions = false
 	if opts.ExecutionMode == ModeTwoPC {
-		config.TwoPCAbandonAge = 1.0
-		config.TwoPCEnable = true
+		config.TwoPCAbandonAge = 1 * time.Second
 	}
 	config.EnableOnlineDDL = false
 	config.EnableTableGC = false
@@ -232,7 +232,7 @@ func (t *explainTablet) CreateTransaction(ctx context.Context, target *querypb.T
 }
 
 // StartCommit is part of the QueryService interface.
-func (t *explainTablet) StartCommit(ctx context.Context, target *querypb.Target, transactionID int64, dtid string) (err error) {
+func (t *explainTablet) StartCommit(ctx context.Context, target *querypb.Target, transactionID int64, dtid string) (state querypb.StartCommitState, err error) {
 	t.mu.Lock()
 	t.currentTime = t.vte.batchTime.Wait()
 	t.mu.Unlock()
@@ -430,6 +430,7 @@ func newTabletEnvironment(ddls []sqlparser.DDLStatement, opts *Options, collatio
 
 	showTableRows := make([][]sqltypes.Value, 0, len(ddls))
 	showTableWithSizesRows := make([][]sqltypes.Value, 0, len(ddls))
+	innodbTableSizesRows := make([][]sqltypes.Value, 0, len(ddls))
 
 	for _, ddl := range ddls {
 		table := ddl.GetTable().Name.String()
@@ -455,9 +456,9 @@ func newTabletEnvironment(ddls []sqlparser.DDLStatement, opts *Options, collatio
 		Fields: mysql.BaseShowTablesWithSizesFields,
 		Rows:   showTableWithSizesRows,
 	})
-	tEnv.addResult(mysql.TablesWithSize80, &sqltypes.Result{
-		Fields: mysql.BaseShowTablesWithSizesFields,
-		Rows:   showTableWithSizesRows,
+	tEnv.addResult(mysql.InnoDBTableSizes, &sqltypes.Result{
+		Fields: mysql.BaseInnoDBTableSizesFields,
+		Rows:   innodbTableSizesRows,
 	})
 
 	indexRows := make([][]sqltypes.Value, 0, 4)
@@ -620,7 +621,10 @@ func (t *explainTablet) handleSelect(query string) (*sqltypes.Result, error) {
 	case *sqlparser.Select:
 		selStmt = stmt
 	case *sqlparser.Union:
-		selStmt = sqlparser.GetFirstSelect(stmt)
+		selStmt, err = sqlparser.GetFirstSelect(stmt)
+		if err != nil {
+			return nil, err
+		}
 	default:
 		return nil, fmt.Errorf("vtexplain: unsupported statement type +%v", reflect.TypeOf(stmt))
 	}
@@ -785,7 +789,7 @@ func (t *explainTablet) analyzeWhere(selStmt *sqlparser.Select, tableColumnMap m
 func (t *explainTablet) analyzeExpressions(selStmt *sqlparser.Select, tableColumnMap map[sqlparser.IdentifierCS]map[string]querypb.Type) ([]string, []querypb.Type) {
 	colNames := make([]string, 0, 4)
 	colTypes := make([]querypb.Type, 0, 4)
-	for _, node := range selStmt.SelectExprs {
+	for _, node := range selStmt.GetColumns() {
 		switch node := node.(type) {
 		case *sqlparser.AliasedExpr:
 			colNames, colTypes = inferColTypeFromExpr(node.Expr, tableColumnMap, colNames, colTypes)

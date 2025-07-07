@@ -22,12 +22,10 @@ import (
 	"strconv"
 	"strings"
 
-	"vitess.io/vitess/go/mysql/collations"
 	"vitess.io/vitess/go/slice"
 	"vitess.io/vitess/go/sqltypes"
 	"vitess.io/vitess/go/vt/sqlparser"
 	"vitess.io/vitess/go/vt/sysvars"
-	"vitess.io/vitess/go/vt/vtenv"
 	"vitess.io/vitess/go/vt/vterrors"
 	"vitess.io/vitess/go/vt/vtgate/engine"
 	"vitess.io/vitess/go/vt/vtgate/engine/opcode"
@@ -38,6 +36,20 @@ import (
 )
 
 func transformToPrimitive(ctx *plancontext.PlanningContext, op operators.Operator) (engine.Primitive, error) {
+	prim, err := recursiveTransform(ctx, op)
+	if err != nil {
+		return nil, err
+	}
+	if len(ctx.Conditions) > 0 {
+		prim = &engine.PlanSwitcher{
+			Conditions: ctx.Conditions,
+			Optimized:  prim,
+		}
+	}
+	return prim, nil
+}
+
+func recursiveTransform(ctx *plancontext.PlanningContext, op operators.Operator) (engine.Primitive, error) {
 	switch op := op.(type) {
 	case *operators.Route:
 		return transformRoutePlan(ctx, op)
@@ -192,6 +204,7 @@ func transformInsertionSelection(ctx *plancontext.PlanningContext, op *operators
 			ForceNonStreaming: op.ForceNonStreaming,
 			Generate:          autoIncGenerate(ins.AutoIncrement),
 			ColVindexes:       ins.ColVindexes,
+			FetchLastInsertID: ctx.SemTable.ShouldFetchLastInsertID(),
 		},
 		VindexValueOffset: ins.VindexValueOffset,
 	}
@@ -524,18 +537,13 @@ func transformApplyJoinPlan(ctx *plancontext.PlanningContext, n *operators.Apply
 }
 
 func routeToEngineRoute(ctx *plancontext.PlanningContext, op *operators.Route, hints *queryHints) (*engine.Route, error) {
-	tableNames, err := getAllTableNames(op)
-	if err != nil {
-		return nil, err
-	}
-
 	rp := newRoutingParams(ctx, op.Routing.OpCode())
 	op.Routing.UpdateRoutingParams(ctx, rp)
 
 	e := &engine.Route{
-		TableName:           strings.Join(tableNames, ", "),
 		RoutingParameters:   rp,
 		TruncateColumnCount: op.ResultColumns,
+		FetchLastInsertID:   ctx.SemTable.ShouldFetchLastInsertID(),
 	}
 	if hints != nil {
 		e.ScatterErrorsAsWarnings = hints.scatterErrorsAsWarnings
@@ -545,7 +553,7 @@ func routeToEngineRoute(ctx *plancontext.PlanningContext, op *operators.Route, h
 }
 
 func newRoutingParams(ctx *plancontext.PlanningContext, opCode engine.Opcode) *engine.RoutingParameters {
-	ks, _ := ctx.VSchema.DefaultKeyspace()
+	ks, _ := ctx.VSchema.SelectedKeyspace()
 	if ks == nil {
 		// if we don't have a selected keyspace, any keyspace will do
 		// this is used by operators that do not set the keyspace
@@ -579,6 +587,8 @@ func getHints(cmt *sqlparser.ParsedComments) *queryHints {
 }
 
 func transformRoutePlan(ctx *plancontext.PlanningContext, op *operators.Route) (engine.Primitive, error) {
+	ctx.CollectConditions(op.Conditions)
+
 	stmt, dmlOp, err := operators.ToSQL(ctx, op.Source)
 	if err != nil {
 		return nil, err
@@ -601,7 +611,7 @@ func transformRoutePlan(ctx *plancontext.PlanningContext, op *operators.Route) (
 	case *sqlparser.Delete:
 		return buildDeletePrimitive(ctx, op, dmlOp, stmt, hints)
 	case *sqlparser.Insert:
-		return buildInsertPrimitive(op, dmlOp, stmt, hints)
+		return buildInsertPrimitive(ctx, op, dmlOp, stmt, hints)
 	default:
 		return nil, vterrors.VT13001(fmt.Sprintf("dont know how to %T", stmt))
 	}
@@ -637,18 +647,22 @@ func buildRoutePrimitive(ctx *plancontext.PlanningContext, op *operators.Route, 
 }
 
 func buildInsertPrimitive(
-	rb *operators.Route, op operators.Operator, stmt *sqlparser.Insert,
+	ctx *plancontext.PlanningContext,
+	rb *operators.Route,
+	op operators.Operator,
+	stmt *sqlparser.Insert,
 	hints *queryHints,
 ) (engine.Primitive, error) {
 	ins := op.(*operators.Insert)
 
 	ic := engine.InsertCommon{
-		Opcode:      mapToInsertOpCode(rb.Routing.OpCode()),
-		Keyspace:    rb.Routing.Keyspace(),
-		TableName:   ins.VTable.Name.String(),
-		Ignore:      ins.Ignore,
-		Generate:    autoIncGenerate(ins.AutoIncrement),
-		ColVindexes: ins.ColVindexes,
+		Opcode:            mapToInsertOpCode(rb.Routing.OpCode()),
+		Keyspace:          rb.Routing.Keyspace(),
+		TableName:         ins.VTable.Name.String(),
+		Ignore:            ins.Ignore,
+		Generate:          autoIncGenerate(ins.AutoIncrement),
+		ColVindexes:       ins.ColVindexes,
+		FetchLastInsertID: ctx.SemTable.ShouldFetchLastInsertID(),
 	}
 	if hints != nil {
 		ic.MultiShardAutocommit = hints.multiShardAutocommit
@@ -685,9 +699,9 @@ func autoIncGenerate(gen *operators.Generate) *engine.Generate {
 		return nil
 	}
 	selNext := &sqlparser.Select{
-		From:        []sqlparser.TableExpr{&sqlparser.AliasedTableExpr{Expr: gen.TableName}},
-		SelectExprs: sqlparser.SelectExprs{&sqlparser.Nextval{Expr: &sqlparser.Argument{Name: "n", Type: sqltypes.Int64}}},
+		From: []sqlparser.TableExpr{&sqlparser.AliasedTableExpr{Expr: gen.TableName}},
 	}
+	selNext.AddSelectExpr(&sqlparser.Nextval{Expr: &sqlparser.Argument{Name: "n", Type: sqltypes.Int64}})
 	return &engine.Generate{
 		Keyspace: gen.Keyspace,
 		Query:    sqlparser.String(selNext),
@@ -741,6 +755,10 @@ func buildUpdatePrimitive(
 	upd := dmlOp.(*operators.Update)
 	var vindexes []*vindexes.ColumnVindex
 	vQuery := ""
+	if rb.Routing.OpCode() == engine.None {
+		// reset as no modification will happen for an impossible query.
+		upd.ChangedVindexValues = nil
+	}
 	if len(upd.ChangedVindexValues) > 0 {
 		upd.OwnedVindexQuery.From = stmt.GetFrom()
 		upd.OwnedVindexQuery.Where = stmt.Where
@@ -779,7 +797,7 @@ func buildDeletePrimitive(ctx *plancontext.PlanningContext, rb *operators.Route,
 	return &engine.Delete{DML: edml}, nil
 }
 
-func createDMLPrimitive(ctx *plancontext.PlanningContext, rb *operators.Route, hints *queryHints, vTbl *vindexes.Table, query string, colVindexes []*vindexes.ColumnVindex, vindexQuery string) *engine.DML {
+func createDMLPrimitive(ctx *plancontext.PlanningContext, rb *operators.Route, hints *queryHints, vTbl *vindexes.BaseTable, query string, colVindexes []*vindexes.ColumnVindex, vindexQuery string) *engine.DML {
 	rp := newRoutingParams(ctx, rb.Routing.OpCode())
 	rb.Routing.UpdateRoutingParams(ctx, rp)
 	edml := &engine.DML{
@@ -788,9 +806,15 @@ func createDMLPrimitive(ctx *plancontext.PlanningContext, rb *operators.Route, h
 		Vindexes:          colVindexes,
 		OwnedVindexQuery:  vindexQuery,
 		RoutingParameters: rp,
+		FetchLastInsertID: ctx.SemTable.ShouldFetchLastInsertID(),
 	}
 
-	if rb.Routing.OpCode() != engine.Unsharded && vindexQuery != "" {
+	if rb.Routing.OpCode() == engine.None {
+		// reset as no modification will happen for an impossible query.
+		edml.OwnedVindexQuery = ""
+		edml.Vindex = nil
+		edml.Values = nil
+	} else if rb.Routing.OpCode() != engine.Unsharded && vindexQuery != "" {
 		primary := vTbl.ColumnVindexes[0]
 		edml.KsidVindex = primary.Vindex
 		edml.KsidLength = len(primary.Columns)
@@ -880,18 +904,18 @@ func transformUnionPlan(ctx *plancontext.PlanningContext, op *operators.Union) (
 }
 
 func transformLimit(ctx *plancontext.PlanningContext, op *operators.Limit) (engine.Primitive, error) {
-	plan, err := transformToPrimitive(ctx, op.Source)
+	input, err := transformToPrimitive(ctx, op.Source)
 	if err != nil {
 		return nil, err
 	}
 
-	return createLimit(plan, op.AST, ctx.VSchema.Environment(), ctx.VSchema.ConnCollation())
+	return createLimit(ctx, input, op.AST)
 }
 
-func createLimit(input engine.Primitive, limit *sqlparser.Limit, env *vtenv.Environment, coll collations.ID) (engine.Primitive, error) {
+func createLimit(ctx *plancontext.PlanningContext, input engine.Primitive, limit *sqlparser.Limit) (engine.Primitive, error) {
 	cfg := &evalengine.Config{
-		Collation:   coll,
-		Environment: env,
+		Collation:   ctx.VSchema.ConnCollation(),
+		Environment: ctx.VSchema.Environment(),
 	}
 	count, err := evalengine.Translate(limit.Rowcount, cfg)
 	if err != nil {
@@ -906,9 +930,10 @@ func createLimit(input engine.Primitive, limit *sqlparser.Limit, env *vtenv.Envi
 	}
 
 	return &engine.Limit{
-		Input:  input,
-		Count:  count,
-		Offset: offset,
+		Count:                count,
+		Offset:               offset,
+		RequireCompleteInput: ctx.SemTable.ShouldFetchLastInsertID(),
+		Input:                input,
 	}, nil
 }
 

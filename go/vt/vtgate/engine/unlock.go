@@ -34,18 +34,6 @@ type Unlock struct {
 
 const unlockTables = "unlock tables"
 
-func (u *Unlock) RouteType() string {
-	return "UNLOCK"
-}
-
-func (u *Unlock) GetKeyspaceName() string {
-	return ""
-}
-
-func (u *Unlock) GetTableName() string {
-	return ""
-}
-
 func (u *Unlock) GetFields(ctx context.Context, vcursor VCursor, bindVars map[string]*querypb.BindVariable) (*sqltypes.Result, error) {
 	return nil, vterrors.VT13001("GetFields should not be called for unlock tables")
 }
@@ -60,7 +48,7 @@ func (u *Unlock) TryExecute(ctx context.Context, vcursor VCursor, bindVars map[s
 	for i := 0; i < len(rss); i++ {
 		bqs[i] = &querypb.BoundQuery{Sql: unlockTables}
 	}
-	qr, errs := vcursor.ExecuteMultiShard(ctx, u, rss, bqs, true, false)
+	qr, errs := vcursor.ExecuteMultiShard(ctx, u, rss, bqs, true, false, false)
 	return qr, vterrors.Aggregate(errs)
 }
 

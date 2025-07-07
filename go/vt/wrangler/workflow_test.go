@@ -325,6 +325,18 @@ func TestPartialMoveTables(t *testing.T) {
 	tme := newTestTablePartialMigrater(ctx, t, shards, shards[0:1], "select * %s")
 	defer tme.stopTablets(t)
 
+	// Add the schema for the primary tablets, so that we don't fail while applying the denied table rules.
+	schm := &tabletmanagerdatapb.SchemaDefinition{
+		TableDefinitions: []*tabletmanagerdatapb.TableDefinition{{
+			Name: "t1",
+		}, {
+			Name: "t2",
+		}},
+	}
+	for _, primary := range append(tme.sourcePrimaries, tme.targetPrimaries...) {
+		primary.FakeMysqlDaemon.Schema = schm
+	}
+
 	// Save some unrelated shard routing rules to be sure that
 	// they don't interfere in any way.
 	srr, err := tme.ts.GetShardRoutingRules(ctx)
@@ -400,6 +412,17 @@ func TestPartialMoveTablesShardSubset(t *testing.T) {
 	}
 	tme := newTestTablePartialMigrater(ctx, t, shards, shardsToMove, "select * %s")
 	defer tme.stopTablets(t)
+	// Add the schema for the primary tablets, so that we don't fail while applying the denied table rules.
+	schm := &tabletmanagerdatapb.SchemaDefinition{
+		TableDefinitions: []*tabletmanagerdatapb.TableDefinition{{
+			Name: "t1",
+		}, {
+			Name: "t2",
+		}},
+	}
+	for _, primary := range append(tme.sourcePrimaries, tme.targetPrimaries...) {
+		primary.FakeMysqlDaemon.Schema = schm
+	}
 
 	// Save some unrelated shard routing rules to be sure that
 	// they don't interfere in any way.
@@ -616,14 +639,12 @@ func TestMoveTablesV2Cancel(t *testing.T) {
 	// Should target vschema table entries be deleted upon Cancel. For unsharded
 	// keyspaces they should be as they are empty table entries that we also
 	// create when the workflow is Created.
-	targetVSchemaEntriesRemain := false
-	if len(tme.targetShards) > 1 {
-		// If the target keyspace is sharded -- which it is today in the test -- the
-		// vschema must be created by the user before the workflow is started. Thus
-		// we should also not delete the vschema table entries upon Cancel as the
-		// management of the sharded vschema is up to the user.
-		targetVSchemaEntriesRemain = true
-	}
+	// If the target keyspace is sharded -- which it is today in the test -- the
+	// vschema must be created by the user before the workflow is started. Thus
+	// we should also not delete the vschema table entries upon Cancel as the
+	// management of the sharded vschema is up to the user.
+	targetVSchemaEntriesRemain := len(tme.targetShards) > 1
+
 	require.Equal(t, targetVSchemaEntriesRemain, checkIfTableExistInVSchema(ctx, t, wf.wr.ts, "ks2", "t1"))
 	require.Equal(t, targetVSchemaEntriesRemain, checkIfTableExistInVSchema(ctx, t, wf.wr.ts, "ks2", "t2"))
 }

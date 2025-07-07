@@ -21,7 +21,6 @@ import (
 	"flag"
 	"fmt"
 	"math/rand/v2"
-	"net/http"
 	"os"
 	"path"
 	"strings"
@@ -33,7 +32,9 @@ import (
 	"vitess.io/vitess/go/mysql"
 	"vitess.io/vitess/go/mysql/capabilities"
 	"vitess.io/vitess/go/vt/log"
+	tabletmanagerdatapb "vitess.io/vitess/go/vt/proto/tabletmanagerdata"
 	"vitess.io/vitess/go/vt/schema"
+	"vitess.io/vitess/go/vt/utils"
 	"vitess.io/vitess/go/vt/vttablet/tabletserver/throttle/throttlerapp"
 
 	"vitess.io/vitess/go/test/endtoend/cluster"
@@ -137,7 +138,6 @@ type revertibleTestCase struct {
 }
 
 func TestMain(m *testing.M) {
-	defer cluster.PanicHandler(nil)
 	flag.Parse()
 
 	exitcode, err := func() (int, error) {
@@ -151,19 +151,19 @@ func TestMain(m *testing.M) {
 		}
 
 		clusterInstance.VtctldExtraArgs = []string{
-			"--schema_change_dir", schemaChangeDirectory,
-			"--schema_change_controller", "local",
-			"--schema_change_check_interval", "1s",
+			"--schema-change-dir", schemaChangeDirectory,
+			"--schema-change-controller", "local",
+			"--schema-change-check-interval", "1s",
 		}
 
 		clusterInstance.VtTabletExtraArgs = []string{
-			"--heartbeat_interval", "250ms",
-			"--heartbeat_on_demand_duration", "5s",
-			"--migration_check_interval", "5s",
-			"--watch_replication_stream",
+			utils.GetFlagVariantForTests("--heartbeat-interval"), "250ms",
+			utils.GetFlagVariantForTests("--heartbeat-on-demand-duration"), "5s",
+			utils.GetFlagVariantForTests("--migration-check-interval"), "5s",
+			utils.GetFlagVariantForTests("--watch-replication-stream"),
 		}
 		clusterInstance.VtGateExtraArgs = []string{
-			"--ddl_strategy", "online",
+			utils.GetFlagVariantForTests("--ddl-strategy"), "online",
 		}
 
 		if err := clusterInstance.StartTopo(); err != nil {
@@ -204,12 +204,11 @@ func TestMain(m *testing.M) {
 }
 
 func TestRevertSchemaChanges(t *testing.T) {
-	defer cluster.PanicHandler(t)
 	shards = clusterInstance.Keyspaces[0].Shards
 	require.Equal(t, 1, len(shards))
 
 	throttler.EnableLagThrottlerAndWaitForStatus(t, clusterInstance)
-	throttler.WaitForCheckThrottlerResult(t, clusterInstance, primaryTablet, throttlerapp.TestingName, nil, http.StatusOK, time.Minute)
+	throttler.WaitForCheckThrottlerResult(t, &clusterInstance.VtctldClientProcess, primaryTablet, throttlerapp.TestingName, nil, tabletmanagerdatapb.CheckThrottlerResponseCode_OK, time.Minute)
 
 	t.Run("revertible", testRevertible)
 	t.Run("revert", testRevert)
@@ -260,6 +259,11 @@ func testRevertible(t *testing.T) {
 			fromSchema:            `id int primary key, i1 int default null, unique key i1_uidx(i1)`,
 			toSchema:              `id int primary key, i2 int default null`,
 			removedUniqueKeyNames: `i1_uidx`,
+		},
+		{
+			name:       "removed expression unique key, skipped",
+			fromSchema: `id int primary key, i1 int default null, unique key idx1 ((id + 1))`,
+			toSchema:   `id int primary key, i2 int default null`,
 		},
 		{
 			name:                  "expanding unique key removes unique constraint",
@@ -386,7 +390,7 @@ func testRevertible(t *testing.T) {
 	onlineddl.VtgateExecQuery(t, &vtParams, createParentTable, "")
 
 	removeBackticks := func(s string) string {
-		return strings.Replace(s, "`", "", -1)
+		return strings.ReplaceAll(s, "`", "")
 	}
 
 	for _, testcase := range testCases {
@@ -415,7 +419,7 @@ func testRevertible(t *testing.T) {
 				toStatement := fmt.Sprintf(createTableWrapper, testcase.toSchema)
 				uuid = testOnlineDDLStatement(t, toStatement, ddlStrategy, "vtgate", tableName, "")
 				if !onlineddl.CheckMigrationStatus(t, &vtParams, shards, uuid, schema.OnlineDDLStatusComplete) {
-					resp, err := throttler.CheckThrottler(clusterInstance, primaryTablet, throttlerapp.TestingName, nil)
+					resp, err := throttler.CheckThrottler(&clusterInstance.VtctldClientProcess, primaryTablet, throttlerapp.TestingName, nil)
 					assert.NoError(t, err)
 					fmt.Println("Throttler check response: ", resp)
 

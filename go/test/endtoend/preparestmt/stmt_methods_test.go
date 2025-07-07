@@ -28,19 +28,44 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
-	"vitess.io/vitess/go/test/endtoend/cluster"
+	"vitess.io/vitess/go/vt/vtgate/engine"
 )
+
+// TestDMLNone tests that impossible query run without an error.
+func TestDMLNone(t *testing.T) {
+	dbo := Connect(t)
+	defer dbo.Close()
+
+	t.Run("delete none", func(t *testing.T) {
+		dmlquery(t, dbo, "delete from sks.t1 where 1 = 0")
+	})
+	t.Run("update none", func(t *testing.T) {
+		dmlquery(t, dbo, "update sks.t1 set age = 5 where 1 = 0")
+	})
+}
+
+func dmlquery(t *testing.T, dbo *sql.DB, query string) {
+	stmt, err := dbo.Prepare(query)
+	require.NoError(t, err)
+	defer stmt.Close()
+
+	qr, err := stmt.Exec()
+	require.NoError(t, err)
+
+	ra, err := qr.RowsAffected()
+	require.NoError(t, err)
+
+	require.Zero(t, ra)
+}
 
 // TestSelect simple select the data without any condition.
 func TestSelect(t *testing.T) {
-	defer cluster.PanicHandler(t)
 	dbo := Connect(t)
 	defer dbo.Close()
 	selectWhere(t, dbo, "")
 }
 
 func TestSelectDatabase(t *testing.T) {
-	defer cluster.PanicHandler(t)
 	dbo := Connect(t)
 	defer dbo.Close()
 	prepare, err := dbo.Prepare("select database()")
@@ -52,17 +77,16 @@ func TestSelectDatabase(t *testing.T) {
 	require.True(t, rows.Next(), "no rows found")
 	err = rows.Scan(&resultBytes)
 	require.NoError(t, err)
-	assert.Equal(t, string(resultBytes), "test_keyspace")
+	assert.Equal(t, string(resultBytes), "uks")
 }
 
 // TestInsertUpdateDelete validates all insert, update and
 // delete method on prepared statements.
 func TestInsertUpdateDelete(t *testing.T) {
-	defer cluster.PanicHandler(t)
 	dbo := Connect(t)
 	defer dbo.Close()
 	// prepare insert statement
-	insertStmt := `insert into ` + tableName + ` values( ?,  ?,  ?,  ?,  ?,  ?,  ?, ?,
+	insertStmt := `insert into vt_prepare_stmt_test values( ?,  ?,  ?,  ?,  ?,  ?,  ?, ?,
 		?,  ?,  ?,  ?,  ?,  ?,  ?,  ?,  ?,  ?,  ?,  ?,  ?,  ?,  ?,  ?,  ?, ?, ?, ?,
 		?,  ?,  ?,  ?,  ?,  ?,  ?,  ?,  ?,  ?,  ?,  ?,  ?,  ?,  ?,  ?,  ?, ?, ?, ?);`
 
@@ -134,8 +158,7 @@ func testReplica(t *testing.T) {
 
 // testcount validates inserted rows count with expected count.
 func testcount(t *testing.T, dbo *sql.DB, except int) {
-	defer cluster.PanicHandler(t)
-	r, err := dbo.Query("SELECT count(1) FROM " + tableName)
+	r, err := dbo.Query("SELECT count(1) FROM vt_prepare_stmt_test")
 	require.Nil(t, err)
 
 	r.Next()
@@ -148,11 +171,10 @@ func testcount(t *testing.T, dbo *sql.DB, except int) {
 // TestAutoIncColumns test insertion of row without passing
 // the value of auto increment columns (here it is id).
 func TestAutoIncColumns(t *testing.T) {
-	defer cluster.PanicHandler(t)
 	dbo := Connect(t)
 	defer dbo.Close()
 	// insert a row without id
-	insertStmt := "INSERT INTO " + tableName + ` (
+	insertStmt := "INSERT INTO vt_prepare_stmt_test" + ` (
 		msg,keyspace_id,tinyint_unsigned,bool_signed,smallint_unsigned,
 		mediumint_unsigned,int_unsigned,float_unsigned,double_unsigned,
 		decimal_unsigned,t_date,t_datetime,t_datetime_micros,t_time,t_timestamp,c8,c16,c24,
@@ -187,7 +209,7 @@ func TestAutoIncColumns(t *testing.T) {
 // deleteRecord test deletion operation corresponds to the testingID.
 func deleteRecord(t *testing.T, dbo *sql.DB) {
 	// delete the record with id 1
-	exec(t, dbo, "DELETE FROM "+tableName+" WHERE id = ?;", testingID)
+	exec(t, dbo, "DELETE FROM vt_prepare_stmt_test WHERE id = ?;", testingID)
 
 	data := selectWhere(t, dbo, "id = ?", testingID)
 	assert.Equal(t, 0, len(data))
@@ -199,7 +221,7 @@ func updateRecord(t *testing.T, dbo *sql.DB) {
 	// update the record with id 1
 	updateData := "new data value"
 	updateTextCol := "new text col value"
-	updateQuery := "update " + tableName + " set data = ? , text_col = ? where id = ?;"
+	updateQuery := "update vt_prepare_stmt_test set data = ? , text_col = ? where id = ?;"
 
 	exec(t, dbo, updateQuery, updateData, updateTextCol, testingID)
 
@@ -227,14 +249,13 @@ func reconnectAndTest(t *testing.T) {
 // TestColumnParameter query database using column
 // parameter.
 func TestColumnParameter(t *testing.T) {
-	defer cluster.PanicHandler(t)
 	dbo := Connect(t)
 	defer dbo.Close()
 
 	id := 1000
 	parameter1 := "param1"
 	message := "TestColumnParameter"
-	insertStmt := "INSERT INTO " + tableName + " (id, msg, keyspace_id) VALUES (?, ?, ?);"
+	insertStmt := "INSERT INTO vt_prepare_stmt_test (id, msg, keyspace_id) VALUES (?, ?, ?);"
 	values := []any{
 		id,
 		message,
@@ -245,7 +266,7 @@ func TestColumnParameter(t *testing.T) {
 	var param, msg string
 	var recID int
 
-	selectStmt := "SELECT COALESCE(?, id), msg FROM " + tableName + " WHERE msg = ? LIMIT ?"
+	selectStmt := "SELECT COALESCE(?, id), msg FROM vt_prepare_stmt_test WHERE msg = ? LIMIT ?"
 
 	results1, err := dbo.Query(selectStmt, parameter1, message, 1)
 	require.Nil(t, err)
@@ -267,7 +288,6 @@ func TestColumnParameter(t *testing.T) {
 // TestWrongTableName query database using invalid
 // tablename and validate error.
 func TestWrongTableName(t *testing.T) {
-	defer cluster.PanicHandler(t)
 	dbo := Connect(t)
 	defer dbo.Close()
 	execWithError(t, dbo, []uint16{1146}, "select * from teseting_table;")
@@ -319,14 +339,10 @@ func getStringToString(x sql.NullString) string {
 }
 
 func TestSelectDBA(t *testing.T) {
-	defer cluster.PanicHandler(t)
 	dbo := Connect(t)
 	defer dbo.Close()
 
-	_, err := dbo.Exec("use uks")
-	require.NoError(t, err)
-
-	_, err = dbo.Exec("CREATE TABLE `a` (`one` int NOT NULL,`two` int NOT NULL,PRIMARY KEY(`one`, `two`)) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4")
+	_, err := dbo.Exec("CREATE TABLE `a` (`one` int NOT NULL,`two` int NOT NULL,PRIMARY KEY(`one`, `two`)) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4")
 	require.NoError(t, err)
 
 	prepare, err := dbo.Prepare(`SELECT
@@ -342,10 +358,10 @@ func TestSelectDBA(t *testing.T) {
 										extra extra,
 										table_name table_name
 									   FROM information_schema.columns
-									   WHERE table_schema = ?
+									   WHERE table_schema = ? and table_name = ?
 									   ORDER BY ordinal_position`)
 	require.NoError(t, err)
-	rows, err := prepare.Query("uks")
+	rows, err := prepare.Query("uks", "a")
 	require.NoError(t, err)
 	defer rows.Close()
 	var rec columns
@@ -381,7 +397,6 @@ func TestSelectDBA(t *testing.T) {
 }
 
 func TestSelectLock(t *testing.T) {
-	defer cluster.PanicHandler(t)
 	dbo := Connect(t)
 	defer dbo.Close()
 
@@ -417,7 +432,6 @@ func TestSelectLock(t *testing.T) {
 }
 
 func TestShowColumns(t *testing.T) {
-	defer cluster.PanicHandler(t)
 	dbo := Connect(t)
 	defer dbo.Close()
 
@@ -438,7 +452,6 @@ func TestShowColumns(t *testing.T) {
 }
 
 func TestBinaryColumn(t *testing.T) {
-	defer cluster.PanicHandler(t)
 	dbo := Connect(t, "interpolateParams=false")
 	defer dbo.Close()
 
@@ -454,6 +467,177 @@ func TestBinaryColumn(t *testing.T) {
                   AND column_info.table_schema = ?
                   -- Exclude views.
                   AND table_info.table_type = 'BASE TABLE'
-              ORDER BY BINARY table_info.table_name`, keyspaceName, keyspaceName)
+              ORDER BY BINARY table_info.table_name`, uks, uks)
 	require.NoError(t, err)
+}
+
+// TestInsertTest inserts a row with empty json array.
+func TestInsertTest(t *testing.T) {
+	dbo := Connect(t, "interpolateParams=false")
+	defer dbo.Close()
+
+	stmt, err := dbo.Prepare(`insert into vt_prepare_stmt_test(id, keyspace_id, json_col) values( null, ?, ?)`)
+	require.NoError(t, err)
+
+	res, err := stmt.Exec(1, "[]")
+	require.NoError(t, err)
+
+	ra, err := res.RowsAffected()
+	require.NoError(t, err)
+
+	assert.Equal(t, int64(1), ra)
+}
+
+// TestSpecializedPlan tests the specialized plan generation for the query.
+func TestSpecializedPlan(t *testing.T) {
+	dbInfo.KeyspaceName = sks
+	dbo := Connect(t, "interpolateParams=false")
+	defer dbo.Close()
+
+	oMap := getVarValue[map[string]any](t, "OptimizedQueryExecutions", clusterInstance.VtgateProcess.GetVars)
+	initExecCount := getVarValue[float64](t, "Passthrough", func() map[string]any {
+		return oMap
+	})
+
+	queries := []struct {
+		query string
+		args  []any
+	}{{
+		query: `select 1 from t1 tbl1, t1 tbl2 where tbl1.id = ? and tbl2.id = ?`,
+		args:  []any{1, 1},
+	}, {
+		query: `select 1 from t1 tbl1, t1 tbl2, t1 tbl3 where tbl1.id = ? and tbl2.id = ? and tbl3.id = ?`,
+		args:  []any{1, 1, 1},
+	}, {
+		query: `select 1 from t1 tbl1, t1 tbl2, t1 tbl3, t1 tbl4 where tbl1.id = ? and tbl2.id = ? and tbl3.id = ? and tbl4.id = ?`,
+		args:  []any{1, 1, 1, 1},
+	}, {
+		query: `SELECT e.id, e.name, s.age, ROW_NUMBER() OVER (PARTITION BY e.age ORDER BY s.name DESC) AS age_rank FROM t1 e, t1 s where e.id = ? and s.id = ?`,
+		args:  []any{1, 1},
+	}}
+
+	for _, q := range queries {
+		stmt, err := dbo.Prepare(q.query)
+		require.NoError(t, err)
+
+		for i := 0; i < 5; i++ {
+			rows, err := stmt.Query(q.args...)
+			require.NoError(t, err)
+			require.NoError(t, rows.Close())
+		}
+		require.NoError(t, stmt.Close())
+	}
+	oMap = getVarValue[map[string]any](t, "OptimizedQueryExecutions", clusterInstance.VtgateProcess.GetVars)
+	finalExecCount := getVarValue[float64](t, "Passthrough", func() map[string]any {
+		return oMap
+	})
+	require.EqualValues(t, 20, finalExecCount-initExecCount)
+
+	randomExec(t, dbo)
+
+	// Validate Join Query specialized plan.
+	p := getPlanWhenReady(t, queries[0].query, 100*time.Millisecond, clusterInstance.VtgateProcess.ReadQueryPlans)
+	require.NotNil(t, p, "plan not found")
+	validateJoinSpecializedPlan(t, p)
+
+	// Validate Window Function Query specialized plan with failing baseline plan.
+	p = getPlanWhenReady(t, queries[3].query, 100*time.Millisecond, clusterInstance.VtgateProcess.ReadQueryPlans)
+	require.NotNil(t, p, "plan not found")
+	validateBaselineErrSpecializedPlan(t, p)
+}
+
+func validateJoinSpecializedPlan(t *testing.T, p map[string]any) {
+	t.Helper()
+	plan, exist := p["Instructions"]
+	require.True(t, exist, "plan Instructions not found")
+
+	pd, err := engine.PrimitiveDescriptionFromMap(plan.(map[string]any))
+	require.NoError(t, err)
+	require.Equal(t, "PlanSwitcher", pd.OperatorType)
+	require.Len(t, pd.Inputs, 2, "Unexpected number of Inputs")
+
+	require.Equal(t, "Baseline", pd.Inputs[0].InputName)
+	require.Equal(t, "Optimized", pd.Inputs[1].InputName)
+	require.Equal(t, "Route", pd.Inputs[1].OperatorType)
+	require.Equal(t, "EqualUnique", pd.Inputs[1].Variant)
+}
+
+func validateBaselineErrSpecializedPlan(t *testing.T, p map[string]any) {
+	t.Helper()
+	plan, exist := p["Instructions"]
+	require.True(t, exist, "plan Instructions not found")
+
+	pm, ok := plan.(map[string]any)
+	require.True(t, ok, "plan is not of type map[string]any")
+	require.EqualValues(t, "PlanSwitcher", pm["OperatorType"])
+	require.EqualValues(t, "VT12001: unsupported: OVER CLAUSE with sharded keyspace", pm["BaselineErr"])
+
+	pd, err := engine.PrimitiveDescriptionFromMap(plan.(map[string]any))
+	require.NoError(t, err)
+	require.Equal(t, "PlanSwitcher", pd.OperatorType)
+	require.Len(t, pd.Inputs, 1, "Only Specialized plan should be available")
+
+	require.Equal(t, "Optimized", pd.Inputs[0].InputName)
+	require.Equal(t, "Route", pd.Inputs[0].OperatorType)
+	require.Equal(t, "EqualUnique", pd.Inputs[0].Variant)
+}
+
+// randomExec to make many plans so that plan cache is populated.
+func randomExec(t *testing.T, dbo *sql.DB) {
+	t.Helper()
+
+	for i := 1; i < 101; i++ {
+		// generate a random query
+		query := fmt.Sprintf("SELECT %d", i)
+		stmt, err := dbo.Prepare(query)
+		require.NoError(t, err)
+
+		rows, err := stmt.Query()
+		require.NoError(t, err)
+		require.NoError(t, rows.Close())
+		time.Sleep(5 * time.Millisecond)
+	}
+}
+
+// getPlanWhenReady polls for the query plan until it is ready or times out.
+func getPlanWhenReady(t *testing.T, sql string, timeout time.Duration, plansFunc func() (map[string]any, error)) map[string]any {
+	t.Helper()
+
+	waitTimeout := time.After(timeout)
+	for {
+		select {
+		case <-waitTimeout:
+			require.Fail(t, fmt.Sprintf("timeout waiting for plan for query: %s", sql))
+			return nil
+		default:
+			p, err := plansFunc()
+			require.NoError(t, err, "failed to retrieve query plans")
+			if len(p) > 0 {
+				val, found := p[sql]
+				if found {
+					planMap, ok := val.(map[string]any)
+					require.True(t, ok, "plan is not of type map[string]any")
+					return planMap
+				}
+			}
+			time.Sleep(200 * time.Millisecond)
+		}
+	}
+}
+
+func getVarValue[T any](t *testing.T, key string, varFunc func() map[string]any) T {
+	t.Helper()
+
+	vars := varFunc()
+	require.NotNil(t, vars)
+
+	value, exists := vars[key]
+	if !exists {
+		return *new(T)
+	}
+	castValue, ok := value.(T)
+	if !ok {
+		t.Errorf("unexpected type, want: %T, got %T", new(T), value)
+	}
+	return castValue
 }

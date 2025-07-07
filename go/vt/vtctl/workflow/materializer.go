@@ -24,10 +24,13 @@ import (
 	"sync"
 	"time"
 
+	"golang.org/x/exp/maps"
+	"golang.org/x/sync/errgroup"
+
 	"vitess.io/vitess/go/ptr"
+	"vitess.io/vitess/go/sqlescape"
 	"vitess.io/vitess/go/sqltypes"
 	"vitess.io/vitess/go/textutil"
-	"vitess.io/vitess/go/vt/concurrency"
 	"vitess.io/vitess/go/vt/key"
 	"vitess.io/vitess/go/vt/log"
 	"vitess.io/vitess/go/vt/mysqlctl/tmutils"
@@ -45,12 +48,17 @@ import (
 	tabletmanagerdatapb "vitess.io/vitess/go/vt/proto/tabletmanagerdata"
 	vschemapb "vitess.io/vitess/go/vt/proto/vschema"
 	vtctldatapb "vitess.io/vitess/go/vt/proto/vtctldata"
+	vtrpcpb "vitess.io/vitess/go/vt/proto/vtrpc"
 )
 
 const (
 	createDDLAsCopy                = "copy"
 	createDDLAsCopyDropConstraint  = "copy:drop_constraint"
 	createDDLAsCopyDropForeignKeys = "copy:drop_foreign_keys"
+	// For automatically created sequence tables, use a standard format
+	// of tableName_seq.
+	autoSequenceTableFormat = "%s_seq"
+	getNonEmptyTableQuery   = "select 1 from %s limit 1"
 )
 
 type materializer struct {
@@ -113,11 +121,9 @@ func (mz *materializer) createWorkflowStreams(req *tabletmanagerdatapb.CreateVRe
 	if err := validateNewWorkflow(mz.ctx, mz.ts, mz.tmc, mz.ms.TargetKeyspace, mz.ms.Workflow); err != nil {
 		return err
 	}
+
 	err := mz.buildMaterializer()
 	if err != nil {
-		return err
-	}
-	if err := mz.deploySchema(); err != nil {
 		return err
 	}
 
@@ -133,7 +139,11 @@ func (mz *materializer) createWorkflowStreams(req *tabletmanagerdatapb.CreateVRe
 	}
 	req.Options = optionsJSON
 
-	return mz.forAllTargets(func(target *topo.ShardInfo) error {
+	if err := mz.deploySchema(); err != nil {
+		return err
+	}
+
+	return forAllShards(mz.targetShards, func(target *topo.ShardInfo) error {
 		targetPrimary, err := mz.ts.GetTablet(mz.ctx, target.PrimaryAlias)
 		if err != nil {
 			return vterrors.Wrapf(err, "GetTablet(%v) failed", target.PrimaryAlias)
@@ -146,15 +156,12 @@ func (mz *materializer) createWorkflowStreams(req *tabletmanagerdatapb.CreateVRe
 		// shard have equal key ranges. This can be done, for example, when doing
 		// shard by shard migrations -- migrating a single shard at a time between
 		// sharded source and sharded target keyspaces.
-		streamKeyRangesEqual := false
-		if len(sourceShards) == 1 && key.KeyRangeEqual(sourceShards[0].KeyRange, target.KeyRange) {
-			streamKeyRangesEqual = true
-		}
+		streamKeyRangesEqual := len(sourceShards) == 1 && key.KeyRangeEqual(sourceShards[0].KeyRange, target.KeyRange)
 
 		// Each tablet needs its own copy of the request as it will have a unique
 		// BinlogSource.
 		tabletReq := req.CloneVT()
-		tabletReq.BinlogSource, err = mz.generateBinlogSources(mz.ctx, target, sourceShards, streamKeyRangesEqual)
+		tabletReq.BinlogSource, err = mz.generateBinlogSources(target, sourceShards, streamKeyRangesEqual)
 		if err != nil {
 			return err
 		}
@@ -168,7 +175,7 @@ func (mz *materializer) getTenantClause() (*sqlparser.Expr, error) {
 	return getTenantClause(mz.ms.WorkflowOptions, mz.targetVSchema, mz.env.Parser())
 }
 
-func (mz *materializer) generateBinlogSources(ctx context.Context, targetShard *topo.ShardInfo, sourceShards []*topo.ShardInfo, keyRangesEqual bool) ([]*binlogdatapb.BinlogSource, error) {
+func (mz *materializer) generateBinlogSources(targetShard *topo.ShardInfo, sourceShards []*topo.ShardInfo, keyRangesEqual bool) ([]*binlogdatapb.BinlogSource, error) {
 	blses := make([]*binlogdatapb.BinlogSource, 0, len(mz.sourceShards))
 	for _, sourceShard := range sourceShards {
 		bls := &binlogdatapb.BinlogSource{
@@ -192,72 +199,76 @@ func (mz *materializer) generateBinlogSources(ctx context.Context, targetShard *
 		}
 
 		for _, ts := range mz.ms.TableSettings {
-			rule := &binlogdatapb.Rule{
-				Match: ts.TargetTable,
-			}
-
-			if ts.SourceExpression == "" {
-				bls.Filter.Rules = append(bls.Filter.Rules, rule)
-				continue
-			}
-
-			// Validate non-empty query.
-			stmt, err := mz.env.Parser().Parse(ts.SourceExpression)
+			rule, err := mz.generateRule(ts, targetShard, tenantClause, keyRangesEqual)
 			if err != nil {
 				return nil, err
 			}
-			sel, ok := stmt.(*sqlparser.Select)
-			if !ok {
-				return nil, fmt.Errorf("unrecognized statement: %s", ts.SourceExpression)
-			}
-			if !keyRangesEqual && mz.targetVSchema.Keyspace.Sharded && mz.targetVSchema.Tables[ts.TargetTable].Type != vindexes.TypeReference {
-				cv, err := vindexes.FindBestColVindex(mz.targetVSchema.Tables[ts.TargetTable])
-				if err != nil {
-					return nil, err
-				}
-				mappedCols := make([]*sqlparser.ColName, 0, len(cv.Columns))
-				for _, col := range cv.Columns {
-					colName, err := matchColInSelect(col, sel)
-					if err != nil {
-						return nil, err
-					}
-					mappedCols = append(mappedCols, colName)
-				}
-				subExprs := make(sqlparser.Exprs, 0, len(mappedCols)+2)
-				for _, mappedCol := range mappedCols {
-					subExprs = append(subExprs, mappedCol)
-				}
-				var vindexName string
-				if mz.workflowType == binlogdatapb.VReplicationWorkflowType_Migrate {
-					// For a Migrate, if the TargetKeyspace name is different from the SourceKeyspace name, we need to use the
-					// SourceKeyspace name to determine the vindex since the TargetKeyspace name is not known to the source.
-					// Note: it is expected that the source and target keyspaces have the same vindex name and data type.
-					keyspace := mz.ms.TargetKeyspace
-					if mz.ms.ExternalCluster != "" {
-						keyspace = mz.ms.SourceKeyspace
-					}
-					vindexName = fmt.Sprintf("%s.%s", keyspace, cv.Name)
-				} else {
-					vindexName = fmt.Sprintf("%s.%s", mz.ms.TargetKeyspace, cv.Name)
-				}
-
-				subExprs = append(subExprs, sqlparser.NewStrLiteral(vindexName))
-				subExprs = append(subExprs, sqlparser.NewStrLiteral(key.KeyRangeString(targetShard.KeyRange)))
-				inKeyRange := &sqlparser.FuncExpr{
-					Name:  sqlparser.NewIdentifierCI("in_keyrange"),
-					Exprs: subExprs,
-				}
-				addFilter(sel, inKeyRange)
-			}
-			if tenantClause != nil {
-				addFilter(sel, *tenantClause)
-			}
-			rule.Filter = sqlparser.String(sel)
 			bls.Filter.Rules = append(bls.Filter.Rules, rule)
 		}
 		blses = append(blses, bls)
 	}
 	return blses, nil
+}
+
+func (mz *materializer) generateRule(ts *vtctldatapb.TableMaterializeSettings, targetShard *topo.ShardInfo, tenantClause *sqlparser.Expr, keyRangesEqual bool) (*binlogdatapb.Rule, error) {
+	rule := &binlogdatapb.Rule{
+		Match: ts.TargetTable,
+	}
+
+	if ts.SourceExpression == "" {
+		return rule, nil
+	}
+
+	// Validate non-empty query.
+	stmt, err := mz.env.Parser().Parse(ts.SourceExpression)
+	if err != nil {
+		return nil, err
+	}
+	sel, ok := stmt.(*sqlparser.Select)
+	if !ok {
+		return nil, fmt.Errorf("unrecognized statement: %s", ts.SourceExpression)
+	}
+	if !keyRangesEqual && mz.targetVSchema.Keyspace.Sharded && mz.targetVSchema.Tables[ts.TargetTable].Type != vindexes.TypeReference {
+		cv, err := vindexes.FindBestColVindex(mz.targetVSchema.Tables[ts.TargetTable])
+		if err != nil {
+			return nil, err
+		}
+		mappedCols := make([]*sqlparser.ColName, 0, len(cv.Columns))
+		for _, col := range cv.Columns {
+			colName, err := matchColInSelect(col, sel)
+			if err != nil {
+				return nil, err
+			}
+			mappedCols = append(mappedCols, colName)
+		}
+		subExprs := make([]sqlparser.Expr, 0, len(mappedCols)+2)
+		for _, mappedCol := range mappedCols {
+			subExprs = append(subExprs, mappedCol)
+		}
+		var vindexName string
+		if mz.workflowType == binlogdatapb.VReplicationWorkflowType_Migrate {
+			// For a Migrate, if the TargetKeyspace name is different from the SourceKeyspace name, we need to use the
+			// SourceKeyspace name to determine the vindex since the TargetKeyspace name is not known to the source.
+			// Note: it is expected that the source and target keyspaces have the same vindex name and data type.
+			keyspace := mz.ms.TargetKeyspace
+			if mz.ms.ExternalCluster != "" {
+				keyspace = mz.ms.SourceKeyspace
+			}
+			vindexName = fmt.Sprintf("%s.%s", keyspace, cv.Name)
+		} else {
+			vindexName = fmt.Sprintf("%s.%s", mz.ms.TargetKeyspace, cv.Name)
+		}
+
+		subExprs = append(subExprs, sqlparser.NewStrLiteral(vindexName))
+		subExprs = append(subExprs, sqlparser.NewStrLiteral(key.KeyRangeString(targetShard.KeyRange)))
+		inKeyRange := sqlparser.NewFuncExpr("in_keyrange", subExprs...)
+		addFilter(sel, inKeyRange)
+	}
+	if tenantClause != nil {
+		addFilter(sel, *tenantClause)
+	}
+	rule.Filter = sqlparser.String(sel)
+	return rule, nil
 }
 
 func (mz *materializer) deploySchema() error {
@@ -272,13 +283,29 @@ func (mz *materializer) deploySchema() error {
 	// to remove them.
 	// We do, however, allow the user to override this behavior and retain them.
 	removeAutoInc := false
+	updatedVSchema := false
+	var targetVSchema *topo.KeyspaceVSchemaInfo
 	if mz.workflowType == binlogdatapb.VReplicationWorkflowType_MoveTables &&
 		(mz.targetVSchema != nil && mz.targetVSchema.Keyspace != nil && mz.targetVSchema.Keyspace.Sharded) &&
-		(mz.ms.GetWorkflowOptions() != nil && mz.ms.GetWorkflowOptions().StripShardedAutoIncrement) {
+		(mz.ms.GetWorkflowOptions() != nil && mz.ms.GetWorkflowOptions().ShardedAutoIncrementHandling != vtctldatapb.ShardedAutoIncrementHandling_LEAVE) {
 		removeAutoInc = true
+		var err error
+		targetVSchema, err = mz.ts.GetVSchema(mz.ctx, mz.ms.TargetKeyspace)
+		if err != nil {
+			return err
+		}
 	}
 
-	return forAllShards(mz.targetShards, func(target *topo.ShardInfo) error {
+	// Check if any table being moved is already non-empty in the target keyspace.
+	// Skip this check for multi-tenant migrations.
+	if !mz.IsMultiTenantMigration() {
+		err := mz.validateEmptyTables()
+		if err != nil {
+			return vterrors.Wrap(err, "failed to validate that all target tables are empty")
+		}
+	}
+
+	err := forAllShards(mz.targetShards, func(target *topo.ShardInfo) error {
 		allTables := []string{"/.*/"}
 
 		hasTargetTable := map[string]bool{}
@@ -304,7 +331,7 @@ func (mz *materializer) deploySchema() error {
 				continue
 			}
 			if ts.CreateDdl == "" {
-				return fmt.Errorf("target table %v does not exist and there is no create ddl defined", ts.TargetTable)
+				return fmt.Errorf("target table %s does not exist and there is no create ddl defined", ts.TargetTable)
 			}
 
 			var err error
@@ -360,7 +387,43 @@ func (mz *materializer) deploySchema() error {
 				}
 
 				if removeAutoInc {
-					ddl, err = stripAutoIncrement(ddl, mz.env.Parser())
+					var replaceFunc func(columnName string) error
+					if mz.ms.GetWorkflowOptions().ShardedAutoIncrementHandling == vtctldatapb.ShardedAutoIncrementHandling_REPLACE {
+						replaceFunc = func(columnName string) error {
+							mu.Lock()
+							defer mu.Unlock()
+							// At this point we've already confirmed that the table exists in the target
+							// vschema.
+							table := targetVSchema.Tables[ts.TargetTable]
+							// Don't override or redo anything that already exists.
+							if table != nil && table.AutoIncrement == nil {
+								tableName, err := sqlescape.UnescapeID(ts.TargetTable)
+								if err != nil {
+									return err
+								}
+								seqTableName, err := sqlescape.EnsureEscaped(fmt.Sprintf(autoSequenceTableFormat, tableName))
+								if err != nil {
+									return err
+								}
+								if mz.ms.GetWorkflowOptions().GlobalKeyspace != "" {
+									seqKeyspace, err := sqlescape.EnsureEscaped(mz.ms.WorkflowOptions.GlobalKeyspace)
+									if err != nil {
+										return err
+									}
+									seqTableName = fmt.Sprintf("%s.%s", seqKeyspace, seqTableName)
+								}
+								// Create a Vitess AutoIncrement definition -- which uses a sequence -- to
+								// replace the MySQL auto_increment definition that we removed.
+								table.AutoIncrement = &vschemapb.AutoIncrement{
+									Column:   columnName,
+									Sequence: seqTableName,
+								}
+								updatedVSchema = true
+							}
+							return nil
+						}
+					}
+					ddl, err = stripAutoIncrement(ddl, mz.env.Parser(), replaceFunc)
 					if err != nil {
 						return err
 					}
@@ -405,6 +468,15 @@ func (mz *materializer) deploySchema() error {
 
 		return nil
 	})
+	if err != nil {
+		return err
+	}
+
+	if updatedVSchema {
+		return mz.ts.SaveVSchema(mz.ctx, targetVSchema)
+	}
+
+	return nil
 }
 
 func (mz *materializer) buildMaterializer() error {
@@ -414,7 +486,7 @@ func (mz *materializer) buildMaterializer() error {
 	if err != nil {
 		return err
 	}
-	targetVSchema, err := vindexes.BuildKeyspaceSchema(vschema, ms.TargetKeyspace, mz.env.Parser())
+	targetVSchema, err := vindexes.BuildKeyspaceSchema(vschema.Keyspace, ms.TargetKeyspace, mz.env.Parser())
 	if err != nil {
 		return err
 	}
@@ -492,13 +564,73 @@ func (mz *materializer) buildMaterializer() error {
 	if err != nil {
 		return fmt.Errorf("failed to get source keyspace vschema: %v", err)
 	}
-	differentPVs = primaryVindexesDiffer(ms, sourceVSchema, vschema)
+	differentPVs = primaryVindexesDiffer(ms, sourceVSchema.Keyspace, vschema.Keyspace)
 
 	mz.targetVSchema = targetVSchema
 	mz.sourceShards = sourceShards
 	mz.targetShards = targetShards
 	mz.isPartial = isPartial
 	mz.primaryVindexesDiffer = differentPVs
+	return nil
+}
+
+// validateEmptyTables checks if all tables are empty across all target shards.
+// It queries each shard's primary tablet and if any non-empty table is found,
+// returns an error containing a list of non-empty tables.
+func (mz *materializer) validateEmptyTables() error {
+	var mu sync.Mutex
+	isNonEmptyTable := map[string]bool{}
+
+	err := forAllShards(mz.targetShards, func(shard *topo.ShardInfo) error {
+		primary := shard.PrimaryAlias
+		if primary == nil {
+			return vterrors.Errorf(vtrpcpb.Code_INTERNAL, "no primary tablet found for shard %s/%s", shard.Keyspace(), shard.ShardName())
+		}
+
+		ti, err := mz.ts.GetTablet(mz.ctx, primary)
+		if err != nil {
+			return err
+		}
+
+		eg, groupCtx := errgroup.WithContext(mz.ctx)
+		eg.SetLimit(20)
+
+		for _, ts := range mz.ms.TableSettings {
+			eg.Go(func() error {
+				table, err := sqlescape.EnsureEscaped(ts.TargetTable)
+				if err != nil {
+					return err
+				}
+				query := fmt.Sprintf(getNonEmptyTableQuery, table)
+				res, err := mz.tmc.ExecuteFetchAsAllPrivs(groupCtx, ti.Tablet, &tabletmanagerdatapb.ExecuteFetchAsAllPrivsRequest{
+					Query:   []byte(query),
+					MaxRows: 1,
+				})
+				// Ignore table not found error
+				if err != nil && !IsTableDidNotExistError(err) {
+					return err
+				}
+				if res != nil && len(res.Rows) > 0 {
+					mu.Lock()
+					isNonEmptyTable[ts.TargetTable] = true
+					mu.Unlock()
+				}
+				return nil
+			})
+		}
+		if err = eg.Wait(); err != nil {
+			return err
+		}
+		return nil
+	})
+	if err != nil {
+		return err
+	}
+
+	nonEmptyTables := maps.Keys(isNonEmptyTable)
+	if len(nonEmptyTables) > 0 {
+		return vterrors.Errorf(vtrpcpb.Code_FAILED_PRECONDITION, "non-empty tables found in target keyspace(%s): %s", mz.ms.TargetKeyspace, strings.Join(nonEmptyTables, ", "))
+	}
 	return nil
 }
 
@@ -521,29 +653,12 @@ func (mz *materializer) startStreams(ctx context.Context) error {
 	})
 }
 
-func (mz *materializer) forAllTargets(f func(*topo.ShardInfo) error) error {
-	var wg sync.WaitGroup
-	allErrors := &concurrency.AllErrorRecorder{}
-	for _, target := range mz.targetShards {
-		wg.Add(1)
-		go func(target *topo.ShardInfo) {
-			defer wg.Done()
-
-			if err := f(target); err != nil {
-				allErrors.RecordError(err)
-			}
-		}(target)
-	}
-	wg.Wait()
-	return allErrors.AggrError(vterrors.Aggregate)
-}
-
 // checkTZConversion is a light-weight consistency check to validate that, if a source time zone is specified to MoveTables,
 // that the current primary has the time zone loaded in order to run the convert_tz() function used by VReplication to do the
 // datetime conversions. We only check the current primaries on each shard and note here that it is possible a new primary
 // gets elected: in this case user will either see errors during vreplication or vdiff will report mismatches.
 func (mz *materializer) checkTZConversion(ctx context.Context, tz string) error {
-	err := mz.forAllTargets(func(target *topo.ShardInfo) error {
+	err := forAllShards(mz.targetShards, func(target *topo.ShardInfo) error {
 		targetPrimary, err := mz.ts.GetTablet(ctx, target.PrimaryAlias)
 		if err != nil {
 			return vterrors.Wrapf(err, "GetTablet(%v) failed", target.PrimaryAlias)
@@ -686,4 +801,42 @@ func (mz *materializer) IsMultiTenantMigration() bool {
 		return true
 	}
 	return false
+}
+
+// Add tables to _vt.copy_state table.
+func (mz *materializer) insertTablesInCopyStateTable(ctx context.Context, streamsByTargetShard map[string][]*tabletmanagerdatapb.ReadVReplicationWorkflowResponse_Stream) error {
+	var mu sync.Mutex
+	return forAllShards(mz.targetShards, func(si *topo.ShardInfo) error {
+		tablet, err := mz.ts.GetTablet(ctx, si.PrimaryAlias)
+		if err != nil {
+			return err
+		}
+
+		var streams []*tabletmanagerdatapb.ReadVReplicationWorkflowResponse_Stream
+		func() {
+			mu.Lock()
+			defer mu.Unlock()
+			streams = streamsByTargetShard[tablet.Shard]
+		}()
+		if len(streams) == 0 {
+			return vterrors.Errorf(vtrpcpb.Code_INTERNAL, "failed to read workflow %s on shard %s/%s", mz.ms.Workflow, tablet.Keyspace, tablet.Shard)
+		}
+
+		var buf strings.Builder
+		buf.WriteString("insert into _vt.copy_state(vrepl_id, table_name) values ")
+		prefix := ""
+		for _, stream := range streams {
+			for _, ts := range mz.ms.TableSettings {
+				fmt.Fprintf(&buf, "%s(%d, %s)", prefix, stream.Id, encodeString(ts.TargetTable))
+				prefix = ", "
+			}
+		}
+		_, err = mz.tmc.ExecuteFetchAsAllPrivs(ctx, tablet.Tablet, &tabletmanagerdatapb.ExecuteFetchAsAllPrivsRequest{
+			Query: []byte(buf.String()),
+		})
+		if err != nil {
+			return vterrors.Wrapf(err, "failed to insert tables copy state for workflow %s on shard %s/%s", mz.ms.Workflow, tablet.Keyspace, tablet.Shard)
+		}
+		return nil
+	})
 }

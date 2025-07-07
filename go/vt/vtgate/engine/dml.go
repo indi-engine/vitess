@@ -19,8 +19,6 @@ package engine
 import (
 	"context"
 	"fmt"
-	"sort"
-	"strings"
 
 	"vitess.io/vitess/go/sqltypes"
 	"vitess.io/vitess/go/vt/key"
@@ -65,6 +63,8 @@ type DML struct {
 
 	PreventAutoCommit bool
 
+	FetchLastInsertID bool
+
 	// RoutingParameters parameters required for query routing.
 	*RoutingParameters
 }
@@ -75,7 +75,7 @@ func NewDML() *DML {
 }
 
 func (dml *DML) execUnsharded(ctx context.Context, primitive Primitive, vcursor VCursor, bindVars map[string]*querypb.BindVariable, rss []*srvtopo.ResolvedShard) (*sqltypes.Result, error) {
-	return execShard(ctx, primitive, vcursor, dml.Query, bindVars, rss[0], true /* rollbackOnError */, !dml.PreventAutoCommit /* canAutocommit */)
+	return execShard(ctx, primitive, vcursor, dml.Query, bindVars, rss[0], true /* rollbackOnError */, !dml.PreventAutoCommit /* canAutocommit */, dml.FetchLastInsertID)
 }
 
 func (dml *DML) execMultiDestination(ctx context.Context, primitive Primitive, vcursor VCursor, bindVars map[string]*querypb.BindVariable, rss []*srvtopo.ResolvedShard, dmlSpecialFunc func(context.Context, VCursor,
@@ -94,31 +94,7 @@ func (dml *DML) execMultiDestination(ctx context.Context, primitive Primitive, v
 			BindVariables: bvs[i],
 		}
 	}
-	return execMultiShard(ctx, primitive, vcursor, rss, queries, dml.MultiShardAutocommit)
-}
-
-// RouteType returns a description of the query routing type used by the primitive
-func (dml *DML) RouteType() string {
-	return dml.Opcode.String()
-}
-
-// GetKeyspaceName specifies the Keyspace that this primitive routes to.
-func (dml *DML) GetKeyspaceName() string {
-	return dml.Keyspace.Name
-}
-
-// GetTableName specifies the table that this primitive routes to.
-func (dml *DML) GetTableName() string {
-	sort.Strings(dml.TableNames)
-	var tableNames []string
-	var previousTbl string
-	for _, name := range dml.TableNames {
-		if name != previousTbl {
-			tableNames = append(tableNames, name)
-			previousTbl = name
-		}
-	}
-	return strings.Join(tableNames, ", ")
+	return dml.execMultiShard(ctx, primitive, vcursor, rss, queries)
 }
 
 func allowOnlyPrimary(rss ...*srvtopo.ResolvedShard) error {
@@ -130,14 +106,14 @@ func allowOnlyPrimary(rss ...*srvtopo.ResolvedShard) error {
 	return nil
 }
 
-func execMultiShard(ctx context.Context, primitive Primitive, vcursor VCursor, rss []*srvtopo.ResolvedShard, queries []*querypb.BoundQuery, multiShardAutoCommit bool) (*sqltypes.Result, error) {
-	autocommit := (len(rss) == 1 || multiShardAutoCommit) && vcursor.AutocommitApproval()
-	result, errs := vcursor.ExecuteMultiShard(ctx, primitive, rss, queries, true /* rollbackOnError */, autocommit)
+func (dml *DML) execMultiShard(ctx context.Context, primitive Primitive, vcursor VCursor, rss []*srvtopo.ResolvedShard, queries []*querypb.BoundQuery) (*sqltypes.Result, error) {
+	autocommit := (len(rss) == 1 || dml.MultiShardAutocommit) && vcursor.AutocommitApproval()
+	result, errs := vcursor.ExecuteMultiShard(ctx, primitive, rss, queries, true /*rollbackOnError*/, autocommit, dml.FetchLastInsertID)
 	return result, vterrors.Aggregate(errs)
 }
 
 func resolveKeyspaceID(ctx context.Context, vcursor VCursor, vindex vindexes.Vindex, vindexKey []sqltypes.Value) ([]byte, error) {
-	var destinations []key.Destination
+	var destinations []key.ShardDestination
 	var err error
 	switch vdx := vindex.(type) {
 	case vindexes.MultiColumn:

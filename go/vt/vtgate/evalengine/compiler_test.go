@@ -25,9 +25,11 @@ import (
 	"time"
 
 	"github.com/olekukonko/tablewriter"
+	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
 	"vitess.io/vitess/go/mysql/collations"
+	"vitess.io/vitess/go/mysql/collations/colldata"
 	"vitess.io/vitess/go/sqltypes"
 	querypb "vitess.io/vitess/go/vt/proto/query"
 	"vitess.io/vitess/go/vt/sqlparser"
@@ -94,7 +96,18 @@ func (s *Tracker) String() string {
 	return s.buf.String()
 }
 
+func TestOneCase(t *testing.T) {
+	query := ``
+	if query == "" {
+		t.Skip("no query to test")
+	}
+	venv := vtenv.NewTestEnv()
+	env := evalengine.EmptyExpressionEnv(venv)
+	testCompilerCase(t, query, venv, nil, env)
+}
+
 func TestCompilerReference(t *testing.T) {
+	// This test runs a lot of queries and compares the results of the evalengine in eval mode to the results of the compiler.
 	now := time.Now()
 	evalengine.SystemTime = func() time.Time { return now }
 	defer func() { evalengine.SystemTime = time.Now }()
@@ -106,54 +119,13 @@ func TestCompilerReference(t *testing.T) {
 			var supported, total int
 			env := evalengine.EmptyExpressionEnv(venv)
 
-			tc.Run(func(query string, row []sqltypes.Value) {
+			tc.Run(func(query string, row []sqltypes.Value, _ bool) {
 				env.Row = row
-
-				stmt, err := venv.Parser().ParseExpr(query)
-				if err != nil {
-					// no need to test un-parseable queries
-					return
-				}
-
-				fields := evalengine.FieldResolver(tc.Schema)
-				cfg := &evalengine.Config{
-					ResolveColumn:     fields.Column,
-					ResolveType:       fields.Type,
-					Collation:         collations.CollationUtf8mb4ID,
-					Environment:       venv,
-					NoConstantFolding: true,
-				}
-
-				converted, err := evalengine.Translate(stmt, cfg)
-				if err != nil {
-					return
-				}
-
-				expected, evalErr := env.EvaluateAST(converted)
 				total++
-
-				res, vmErr := env.Evaluate(converted)
-				if vmErr != nil {
-					switch {
-					case evalErr == nil:
-						t.Errorf("failed evaluation from compiler:\nSQL:  %s\nError: %s", query, vmErr)
-					case evalErr.Error() != vmErr.Error():
-						t.Errorf("error mismatch:\nSQL:  %s\nError eval: %s\nError comp: %s", query, evalErr, vmErr)
-					default:
-						supported++
-					}
-					return
+				testCompilerCase(t, query, venv, tc.Schema, env)
+				if !t.Failed() {
+					supported++
 				}
-
-				eval := expected.String()
-				comp := res.String()
-
-				if eval != comp {
-					t.Errorf("bad evaluation from compiler:\nSQL:  %s\nEval: %s\nComp: %s", query, eval, comp)
-					return
-				}
-
-				supported++
 			})
 
 			track.Add(tc.Name(), supported, total)
@@ -161,6 +133,52 @@ func TestCompilerReference(t *testing.T) {
 	}
 
 	t.Logf("\n%s", track.String())
+}
+
+func testCompilerCase(t *testing.T, query string, venv *vtenv.Environment, schema []*querypb.Field, env *evalengine.ExpressionEnv) {
+	stmt, err := venv.Parser().ParseExpr(query)
+	if err != nil {
+		// no need to test un-parseable queries
+		return
+	}
+
+	fields := evalengine.FieldResolver(schema)
+	cfg := &evalengine.Config{
+		ResolveColumn:     fields.Column,
+		ResolveType:       fields.Type,
+		Collation:         collations.CollationUtf8mb4ID,
+		Environment:       venv,
+		NoConstantFolding: true,
+	}
+
+	converted, err := evalengine.Translate(stmt, cfg)
+	if err != nil {
+		return
+	}
+
+	var expected evalengine.EvalResult
+	var evalErr error
+	assert.NotPanics(t, func() {
+		expected, evalErr = env.EvaluateAST(converted)
+	})
+	var res evalengine.EvalResult
+	var vmErr error
+	assert.NotPanics(t, func() {
+		res, vmErr = env.Evaluate(converted)
+	})
+	switch {
+	case vmErr == nil && evalErr == nil:
+		eval := expected.String()
+		comp := res.String()
+		assert.Equalf(t, eval, comp, "bad evaluation from compiler:\nSQL:  %s\nEval: %s\nComp: %s", query, eval, comp)
+		assert.Equalf(t, expected.Collation(), res.Collation(), "bad collation from compiler:\nSQL:  %s\nEval: %s\nComp: %s", query, colldata.Lookup(expected.Collation()).Name(), colldata.Lookup(res.Collation()).Name())
+	case vmErr == nil:
+		t.Errorf("failed evaluation from evalengine:\nSQL:  %s\nError: %s", query, evalErr)
+	case evalErr == nil:
+		t.Errorf("failed evaluation from compiler:\nSQL:  %s\nError: %s", query, vmErr)
+	case evalErr.Error() != vmErr.Error():
+		t.Errorf("error mismatch:\nSQL:  %s\nError eval: %s\nError comp: %s", query, evalErr, vmErr)
+	}
 }
 
 func TestCompilerSingle(t *testing.T) {
@@ -723,6 +741,66 @@ func TestCompilerSingle(t *testing.T) {
 			expression: `cast(_utf32 0x0000FF as binary)`,
 			result:     `VARBINARY("\x00\x00\x00\xff")`,
 		},
+		{
+			expression: `DATE_FORMAT(timestamp '2024-12-30 10:34:58', "%u")`,
+			result:     `VARCHAR("53")`,
+		},
+		{
+			expression: `WEEK(timestamp '2024-12-30 10:34:58', 0)`,
+			result:     `INT64(52)`,
+		},
+		{
+			expression: `WEEK(timestamp '2024-12-30 10:34:58', 1)`,
+			result:     `INT64(53)`,
+		},
+		{
+			expression: `WEEK(timestamp '2024-01-01 10:34:58', 0)`,
+			result:     `INT64(0)`,
+		},
+		{
+			expression: `WEEK(timestamp '2024-01-01 10:34:58', 1)`,
+			result:     `INT64(1)`,
+		},
+		{
+			expression: `column0 + 1`,
+			values:     []sqltypes.Value{sqltypes.MakeTrusted(sqltypes.Enum, []byte("foo"))},
+			// Returns 0, as unknown enums evaluate here to -1. We have this test to
+			// exercise the path to push enums onto the stack.
+			result: `FLOAT64(0)`,
+		},
+		{
+			expression: `column0 + 1`,
+			values:     []sqltypes.Value{sqltypes.MakeTrusted(sqltypes.Set, []byte("foo"))},
+			// Returns 1, as unknown sets evaluate here to 0. We have this test to
+			// exercise the path to push sets onto the stack.
+			result: `FLOAT64(1)`,
+		},
+		{
+			expression: `GREATEST(NULL, '2023-10-24')`,
+			result:     `NULL`,
+		},
+		{
+			expression: `GREATEST(NULL, 1)`,
+			result:     `NULL`,
+		},
+		{
+			expression: `GREATEST(NULL, 1.0)`,
+			result:     `NULL`,
+		},
+		{
+			expression: `GREATEST(NULL, 1.0e0)`,
+			result:     `NULL`,
+		},
+		{
+			expression: `GREATEST(column0, 1.0e0)`,
+			values:     []sqltypes.Value{sqltypes.MakeTrusted(sqltypes.Enum, []byte("foo"))},
+			// Enum and set are treated as strings in this case.
+			result: `VARCHAR("foo")`,
+		},
+		{
+			expression: `GREATEST(JSON_OBJECT(), JSON_ARRAY())`,
+			result:     `VARCHAR("{}")`,
+		},
 	}
 
 	tz, _ := time.LoadLocation("Europe/Madrid")
@@ -863,6 +941,99 @@ func TestBindVarLiteral(t *testing.T) {
 				}
 			}
 		})
+	}
+}
+
+type testVcursor struct {
+	lastInsertID *uint64
+	env          *vtenv.Environment
+}
+
+func (t *testVcursor) TimeZone() *time.Location {
+	return time.UTC
+}
+
+func (t *testVcursor) GetKeyspace() string {
+	return "apa"
+}
+
+func (t *testVcursor) SQLMode() string {
+	return "oltp"
+}
+
+func (t *testVcursor) Environment() *vtenv.Environment {
+	return t.env
+}
+
+func (t *testVcursor) SetLastInsertID(id uint64) {
+	t.lastInsertID = &id
+}
+
+var _ evalengine.VCursor = (*testVcursor)(nil)
+
+func TestLastInsertID(t *testing.T) {
+	var testCases = []struct {
+		expression string
+		result     uint64
+		missing    bool
+	}{
+		{
+			expression: `last_insert_id(1)`,
+			result:     1,
+		}, {
+			expression: `12`,
+			missing:    true,
+		}, {
+			expression: `last_insert_id(666)`,
+			result:     666,
+		}, {
+			expression: `last_insert_id(null)`,
+			result:     0,
+		},
+	}
+
+	venv := vtenv.NewTestEnv()
+	for _, tc := range testCases {
+		t.Run(tc.expression, func(t *testing.T) {
+			expr, err := venv.Parser().ParseExpr(tc.expression)
+			require.NoError(t, err)
+
+			cfg := &evalengine.Config{
+				Collation:         collations.CollationUtf8mb4ID,
+				NoConstantFolding: true,
+				NoCompilation:     false,
+				Environment:       venv,
+			}
+			t.Run("eval", func(t *testing.T) {
+				cfg.NoCompilation = true
+				runTest(t, expr, cfg, tc)
+			})
+			t.Run("compiled", func(t *testing.T) {
+				cfg.NoCompilation = false
+				runTest(t, expr, cfg, tc)
+			})
+		})
+	}
+}
+
+func runTest(t *testing.T, expr sqlparser.Expr, cfg *evalengine.Config, tc struct {
+	expression string
+	result     uint64
+	missing    bool
+}) {
+	converted, err := evalengine.Translate(expr, cfg)
+	require.NoError(t, err)
+
+	vc := &testVcursor{env: vtenv.NewTestEnv()}
+	env := evalengine.NewExpressionEnv(context.Background(), nil, vc)
+
+	_, err = env.Evaluate(converted)
+	require.NoError(t, err)
+	if tc.missing {
+		require.Nil(t, vc.lastInsertID)
+	} else {
+		require.NotNil(t, vc.lastInsertID)
+		require.Equal(t, tc.result, *vc.lastInsertID)
 	}
 }
 

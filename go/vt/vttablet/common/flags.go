@@ -21,7 +21,9 @@ import (
 
 	"github.com/spf13/pflag"
 
+	"vitess.io/vitess/go/mysql"
 	"vitess.io/vitess/go/vt/servenv"
+	"vitess.io/vitess/go/vt/utils"
 )
 
 const (
@@ -32,8 +34,7 @@ const (
 )
 
 var (
-	// Default flags: currently VReplicationExperimentalFlagVPlayerBatching is not enabled by default.
-	vreplicationExperimentalFlags   = VReplicationExperimentalFlagOptimizeInserts | VReplicationExperimentalFlagAllowNoBlobBinlogRowImage
+	vreplicationExperimentalFlags   = VReplicationExperimentalFlagOptimizeInserts | VReplicationExperimentalFlagAllowNoBlobBinlogRowImage | VReplicationExperimentalFlagVPlayerBatching
 	vreplicationNetReadTimeout      = 300
 	vreplicationNetWriteTimeout     = 600
 	vreplicationCopyPhaseDuration   = 1 * time.Hour
@@ -56,6 +57,9 @@ var (
 	VStreamerBinlogRotationThreshold = int64(64 * 1024 * 1024) // 64MiB
 	VStreamerDefaultPacketSize       = 250000
 	VStreamerUseDynamicPacketSize    = true
+
+	// Enable the /debug/vrlog HTTP endpoint.
+	vreplicationEnableHttpLog = false
 )
 
 func GetVReplicationNetReadTimeout() int {
@@ -71,18 +75,18 @@ func init() {
 }
 
 func registerFlags(fs *pflag.FlagSet) {
-	fs.Int64Var(&vreplicationExperimentalFlags, "vreplication_experimental_flags", vreplicationExperimentalFlags,
+	utils.SetFlagInt64Var(fs, &vreplicationExperimentalFlags, "vreplication-experimental-flags", vreplicationExperimentalFlags,
 		"(Bitmask) of experimental features in vreplication to enable")
-	fs.IntVar(&vreplicationNetReadTimeout, "vreplication_net_read_timeout", vreplicationNetReadTimeout, "Session value of net_read_timeout for vreplication, in seconds")
-	fs.IntVar(&vreplicationNetWriteTimeout, "vreplication_net_write_timeout", vreplicationNetWriteTimeout, "Session value of net_write_timeout for vreplication, in seconds")
-	fs.DurationVar(&vreplicationCopyPhaseDuration, "vreplication_copy_phase_duration", vreplicationCopyPhaseDuration, "Duration for each copy phase loop (before running the next catchup: default 1h)")
-	fs.DurationVar(&vreplicationRetryDelay, "vreplication_retry_delay", vreplicationRetryDelay, "delay before retrying a failed workflow event in the replication phase")
-	fs.DurationVar(&vreplicationMaxTimeToRetryError, "vreplication_max_time_to_retry_on_error", vreplicationMaxTimeToRetryError, "stop automatically retrying when we've had consecutive failures with the same error for this long after the first occurrence")
+	utils.SetFlagIntVar(fs, &vreplicationNetReadTimeout, "vreplication-net-read-timeout", vreplicationNetReadTimeout, "Session value of net_read_timeout for vreplication, in seconds")
+	utils.SetFlagIntVar(fs, &vreplicationNetWriteTimeout, "vreplication-net-write-timeout", vreplicationNetWriteTimeout, "Session value of net_write_timeout for vreplication, in seconds")
+	utils.SetFlagDurationVar(fs, &vreplicationCopyPhaseDuration, "vreplication-copy-phase-duration", vreplicationCopyPhaseDuration, "Duration for each copy phase loop (before running the next catchup: default 1h)")
+	utils.SetFlagDurationVar(fs, &vreplicationRetryDelay, "vreplication-retry-delay", vreplicationRetryDelay, "delay before retrying a failed workflow event in the replication phase")
+	utils.SetFlagDurationVar(fs, &vreplicationMaxTimeToRetryError, "vreplication-max-time-to-retry-on-error", vreplicationMaxTimeToRetryError, "stop automatically retrying when we've had consecutive failures with the same error for this long after the first occurrence")
 
 	fs.IntVar(&vreplicationRelayLogMaxSize, "relay_log_max_size", vreplicationRelayLogMaxSize, "Maximum buffer size (in bytes) for vreplication target buffering. If single rows are larger than this, a single row is buffered at a time.")
 	fs.IntVar(&vreplicationRelayLogMaxItems, "relay_log_max_items", vreplicationRelayLogMaxItems, "Maximum number of rows for vreplication target buffering.")
 
-	fs.DurationVar(&vreplicationReplicaLagTolerance, "vreplication_replica_lag_tolerance", vreplicationReplicaLagTolerance, "Replica lag threshold duration: once lag is below this we switch from copy phase to the replication (streaming) phase")
+	utils.SetFlagDurationVar(fs, &vreplicationReplicaLagTolerance, "vreplication-replica-lag-tolerance", vreplicationReplicaLagTolerance, "Replica lag threshold duration: once lag is below this we switch from copy phase to the replication (streaming) phase")
 
 	// vreplicationHeartbeatUpdateInterval determines how often the time_updated column is updated if there are no
 	// real events on the source and the source vstream is only sending heartbeats for this long. Keep this low if you
@@ -90,8 +94,12 @@ func registerFlags(fs *pflag.FlagSet) {
 	// 	 * you have too many streams the extra write qps or cpu load due to these updates are unacceptable
 	//	 * you have too many streams and/or a large source field (lot of participating tables) which generates
 	//     unacceptable increase in your binlog size
-	fs.IntVar(&vreplicationHeartbeatUpdateInterval, "vreplication_heartbeat_update_interval", vreplicationHeartbeatUpdateInterval, "Frequency (in seconds, default 1, max 60) at which the time_updated column of a vreplication stream when idling")
-	fs.BoolVar(&vreplicationStoreCompressedGTID, "vreplication_store_compressed_gtid", vreplicationStoreCompressedGTID, "Store compressed gtids in the pos column of the sidecar database's vreplication table")
+	utils.SetFlagIntVar(fs, &vreplicationHeartbeatUpdateInterval, "vreplication-heartbeat-update-interval", vreplicationHeartbeatUpdateInterval, "Frequency (in seconds, default 1, max 60) at which the time_updated column of a vreplication stream when idling")
+	utils.SetFlagBoolVar(fs, &vreplicationStoreCompressedGTID, "vreplication-store-compressed-gtid", vreplicationStoreCompressedGTID, "Store compressed gtids in the pos column of the sidecar database's vreplication table")
 
 	fs.IntVar(&vreplicationParallelInsertWorkers, "vreplication-parallel-insert-workers", vreplicationParallelInsertWorkers, "Number of parallel insertion workers to use during copy phase. Set <= 1 to disable parallelism, or > 1 to enable concurrent insertion during copy phase.")
+
+	fs.Uint64Var(&mysql.ZstdInMemoryDecompressorMaxSize, "binlog-in-memory-decompressor-max-size", mysql.ZstdInMemoryDecompressorMaxSize, "This value sets the uncompressed transaction payload size at which we switch from in-memory buffer based decompression to the slower streaming mode.")
+
+	fs.BoolVar(&vreplicationEnableHttpLog, "vreplication-enable-http-log", vreplicationEnableHttpLog, "Enable the /debug/vrlog HTTP endpoint, which will produce a log of the events replicated on primary tablets in the target keyspace by all VReplication workflows that are in the running/replicating phase.")
 }

@@ -29,6 +29,7 @@ import (
 	"vitess.io/vitess/go/vt/sqlparser"
 	"vitess.io/vitess/go/vt/vtenv"
 	"vitess.io/vitess/go/vt/vterrors"
+	"vitess.io/vitess/go/vt/vtgate/planbuilder/operators/predicates"
 )
 
 var ErrTranslateExprNotSupported = "expr cannot be translated, not supported"
@@ -309,10 +310,6 @@ func (ast *astCompiler) translateBinaryExpr(binary *sqlparser.BinaryExpr) (IR, e
 		return &BitwiseExpr{BinaryExpr: binaryExpr, Op: &opBitShl{}}, nil
 	case sqlparser.ShiftRightOp:
 		return &BitwiseExpr{BinaryExpr: binaryExpr, Op: &opBitShr{}}, nil
-	case sqlparser.JSONExtractOp:
-		return builtinJSONExtractRewrite(left, right)
-	case sqlparser.JSONUnquoteExtractOp:
-		return builtinJSONExtractUnquoteRewrite(left, right)
 	default:
 		return nil, translateExprNotSupported(binary)
 	}
@@ -552,6 +549,8 @@ func (ast *astCompiler) translateExpr(e sqlparser.Expr) (IR, error) {
 		return ast.translateCaseExpr(node)
 	case *sqlparser.BetweenExpr:
 		return ast.translateBetweenExpr(node)
+	case *predicates.JoinPredicate:
+		return ast.translateExpr(node.Current())
 	default:
 		return nil, translateExprNotSupported(e)
 	}

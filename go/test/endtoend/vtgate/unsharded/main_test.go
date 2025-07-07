@@ -34,10 +34,12 @@ import (
 	"vitess.io/vitess/go/mysql"
 	"vitess.io/vitess/go/sqltypes"
 	"vitess.io/vitess/go/test/endtoend/cluster"
+	vtutils "vitess.io/vitess/go/vt/utils"
 )
 
 var (
 	clusterInstance *cluster.LocalProcessCluster
+	vtParams        mysql.ConnParams
 	cell            = "zone1"
 	hostname        = "localhost"
 	KeyspaceName    = "customer"
@@ -56,7 +58,43 @@ CREATE TABLE t1 (
 CREATE TABLE allDefaults (
   id BIGINT NOT NULL AUTO_INCREMENT PRIMARY KEY,
   name VARCHAR(255)
-) ENGINE=Innodb;`
+) ENGINE=Innodb;
+
+CREATE PROCEDURE sp_insert()
+BEGIN
+	insert into allDefaults () values ();
+END;
+
+CREATE PROCEDURE sp_delete()
+BEGIN
+	delete from allDefaults;
+END;
+
+CREATE PROCEDURE sp_multi_dml()
+BEGIN
+	insert into allDefaults () values ();
+	delete from allDefaults;
+END;
+
+CREATE PROCEDURE sp_variable()
+BEGIN
+	insert into allDefaults () values ();
+	SELECT min(id) INTO @myvar FROM allDefaults;
+	DELETE FROM allDefaults WHERE id = @myvar;
+END;
+
+CREATE PROCEDURE sp_select()
+BEGIN
+	SELECT * FROM allDefaults;
+END;
+
+CREATE PROCEDURE sp_all()
+BEGIN
+	insert into allDefaults () values ();
+    select * from allDefaults;
+	delete from allDefaults;
+END;`
+
 	VSchema = `
 {
     "sharded": false,
@@ -98,41 +136,6 @@ CREATE TABLE allDefaults (
 `
 
 	createProcSQL = []string{`
-CREATE PROCEDURE sp_insert()
-BEGIN
-	insert into allDefaults () values ();
-END;
-`, `
-CREATE PROCEDURE sp_delete()
-BEGIN
-	delete from allDefaults;
-END;
-`, `
-CREATE PROCEDURE sp_multi_dml()
-BEGIN
-	insert into allDefaults () values ();
-	delete from allDefaults;
-END;
-`, `
-CREATE PROCEDURE sp_variable()
-BEGIN
-	insert into allDefaults () values ();
-	SELECT min(id) INTO @myvar FROM allDefaults;
-	DELETE FROM allDefaults WHERE id = @myvar;
-END;
-`, `
-CREATE PROCEDURE sp_select()
-BEGIN
-	SELECT * FROM allDefaults;
-END;
-`, `
-CREATE PROCEDURE sp_all()
-BEGIN
-	insert into allDefaults () values ();
-    select * from allDefaults;
-	delete from allDefaults;
-END;
-`, `
 CREATE PROCEDURE in_parameter(IN val int)
 BEGIN
 	insert into allDefaults(id) values(val);
@@ -143,11 +146,19 @@ BEGIN
 	insert into allDefaults(id) values (128);
 	select 128 into val from dual;
 END;
-`}
+`,
+		`CREATE DEFINER=current_user() PROCEDURE with_definer(OUT val int)
+BEGIN
+	insert into allDefaults(id) values (128);
+	select 128 into val from dual;
+END;
+`,
+		`CREATE PROCEDURE p1 (in x BIGINT) BEGIN declare y DECIMAL(14,2); set y = 4.2; END`,
+		`CREATE PROCEDURE p2 (in x BIGINT) BEGIN START TRANSACTION; SELECT 128 from dual; COMMIT; END`,
+	}
 )
 
 func TestMain(m *testing.M) {
-	defer cluster.PanicHandler(nil)
 	flag.Parse()
 
 	exitCode := func() int {
@@ -172,14 +183,26 @@ func TestMain(m *testing.M) {
 		}
 
 		// Start vtgate
-		clusterInstance.VtGateExtraArgs = []string{"--warn_sharded_only=true"}
+		clusterInstance.VtGateExtraArgs = []string{vtutils.GetFlagVariantForTests("--warn-sharded-only") + "=true"}
 		if err := clusterInstance.StartVtgate(); err != nil {
 			log.Fatal(err.Error())
 			return 1
 		}
 
-		primaryTablet := clusterInstance.Keyspaces[0].Shards[0].PrimaryTablet().VttabletProcess
-		if err := primaryTablet.QueryTabletMultiple(createProcSQL, KeyspaceName, true); err != nil {
+		// Also check we can create procedures through the vtgate.
+		vtParams = mysql.ConnParams{
+			Host: "localhost",
+			Port: clusterInstance.VtgateMySQLPort,
+		}
+		conn, err := mysql.Connect(context.Background(), &vtParams)
+		if err != nil {
+			log.Fatal(err.Error())
+			return 1
+		}
+		defer conn.Close()
+
+		err = runCreateProcedures(conn)
+		if err != nil {
 			log.Fatal(err.Error())
 			return 1
 		}
@@ -189,15 +212,20 @@ func TestMain(m *testing.M) {
 	os.Exit(exitCode)
 }
 
+func runCreateProcedures(conn *mysql.Conn) error {
+	for _, sql := range createProcSQL {
+		_, err := conn.ExecuteFetch(sql, 1000, true)
+		if err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
 func TestSelectIntoAndLoadFrom(t *testing.T) {
 	// Test is skipped because it requires secure-file-priv variable to be set to not NULL or empty.
 	t.Skip()
-	defer cluster.PanicHandler(t)
 	ctx := context.Background()
-	vtParams := mysql.ConnParams{
-		Host: "localhost",
-		Port: clusterInstance.VtgateMySQLPort,
-	}
 	conn, err := mysql.Connect(ctx, &vtParams)
 	require.Nil(t, err)
 	defer conn.Close()
@@ -227,12 +255,7 @@ func TestSelectIntoAndLoadFrom(t *testing.T) {
 }
 
 func TestEmptyStatement(t *testing.T) {
-	defer cluster.PanicHandler(t)
 	ctx := context.Background()
-	vtParams := mysql.ConnParams{
-		Host: "localhost",
-		Port: clusterInstance.VtgateMySQLPort,
-	}
 	conn, err := mysql.Connect(ctx, &vtParams)
 	require.Nil(t, err)
 	defer conn.Close()
@@ -244,12 +267,7 @@ func TestEmptyStatement(t *testing.T) {
 }
 
 func TestTopoDownServingQuery(t *testing.T) {
-	defer cluster.PanicHandler(t)
 	ctx := context.Background()
-	vtParams := mysql.ConnParams{
-		Host: "localhost",
-		Port: clusterInstance.VtgateMySQLPort,
-	}
 	conn, err := mysql.Connect(ctx, &vtParams)
 	require.Nil(t, err)
 	defer conn.Close()
@@ -264,12 +282,7 @@ func TestTopoDownServingQuery(t *testing.T) {
 }
 
 func TestInsertAllDefaults(t *testing.T) {
-	defer cluster.PanicHandler(t)
 	ctx := context.Background()
-	vtParams := mysql.ConnParams{
-		Host: "localhost",
-		Port: clusterInstance.VtgateMySQLPort,
-	}
 	conn, err := mysql.Connect(ctx, &vtParams)
 	require.NoError(t, err)
 	defer conn.Close()
@@ -279,12 +292,7 @@ func TestInsertAllDefaults(t *testing.T) {
 }
 
 func TestDDLUnsharded(t *testing.T) {
-	defer cluster.PanicHandler(t)
 	ctx := context.Background()
-	vtParams := mysql.ConnParams{
-		Host: "localhost",
-		Port: clusterInstance.VtgateMySQLPort,
-	}
 	conn, err := mysql.Connect(ctx, &vtParams)
 	require.NoError(t, err)
 	defer conn.Close()
@@ -300,7 +308,6 @@ func TestDDLUnsharded(t *testing.T) {
 }
 
 func TestCallProcedure(t *testing.T) {
-	defer cluster.PanicHandler(t)
 	ctx := context.Background()
 	vtParams := mysql.ConnParams{
 		Host:   "localhost",
@@ -347,12 +354,7 @@ func TestCallProcedure(t *testing.T) {
 }
 
 func TestTempTable(t *testing.T) {
-	defer cluster.PanicHandler(t)
 	ctx := context.Background()
-	vtParams := mysql.ConnParams{
-		Host: "localhost",
-		Port: clusterInstance.VtgateMySQLPort,
-	}
 	conn1, err := mysql.Connect(ctx, &vtParams)
 	require.NoError(t, err)
 	defer conn1.Close()
@@ -372,12 +374,7 @@ func TestTempTable(t *testing.T) {
 }
 
 func TestReservedConnDML(t *testing.T) {
-	defer cluster.PanicHandler(t)
 	ctx := context.Background()
-	vtParams := mysql.ConnParams{
-		Host: "localhost",
-		Port: clusterInstance.VtgateMySQLPort,
-	}
 	conn, err := mysql.Connect(ctx, &vtParams)
 	require.NoError(t, err)
 	defer conn.Close()
@@ -395,12 +392,7 @@ func TestReservedConnDML(t *testing.T) {
 }
 
 func TestNumericPrecisionScale(t *testing.T) {
-	defer cluster.PanicHandler(t)
 	ctx := context.Background()
-	vtParams := mysql.ConnParams{
-		Host: "localhost",
-		Port: clusterInstance.VtgateMySQLPort,
-	}
 	conn, err := mysql.Connect(ctx, &vtParams)
 	require.NoError(t, err)
 	defer conn.Close()
@@ -434,10 +426,6 @@ func TestNumericPrecisionScale(t *testing.T) {
 }
 
 func TestDeleteAlias(t *testing.T) {
-	vtParams := mysql.ConnParams{
-		Host: "localhost",
-		Port: clusterInstance.VtgateMySQLPort,
-	}
 	conn, err := mysql.Connect(context.Background(), &vtParams)
 	require.NoError(t, err)
 	defer conn.Close()
@@ -447,10 +435,6 @@ func TestDeleteAlias(t *testing.T) {
 }
 
 func TestFloatValueDefault(t *testing.T) {
-	vtParams := mysql.ConnParams{
-		Host: "localhost",
-		Port: clusterInstance.VtgateMySQLPort,
-	}
 	conn, err := mysql.Connect(context.Background(), &vtParams)
 	require.NoError(t, err)
 	defer conn.Close()

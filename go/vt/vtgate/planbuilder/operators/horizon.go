@@ -45,7 +45,7 @@ type Horizon struct {
 	// QP contains the QueryProjection for this op
 	QP *QueryProjection
 
-	Query sqlparser.SelectStatement
+	Query sqlparser.TableStatement
 
 	// Columns needed to feed other plans
 	Columns       []*sqlparser.ColName
@@ -54,7 +54,7 @@ type Horizon struct {
 	Truncate bool
 }
 
-func newHorizon(src Operator, query sqlparser.SelectStatement) *Horizon {
+func newHorizon(src Operator, query sqlparser.TableStatement) *Horizon {
 	return &Horizon{
 		unaryOperator: newUnaryOp(src),
 		Query:         query,
@@ -95,7 +95,7 @@ func (h *Horizon) AddPredicate(ctx *plancontext.PlanningContext, expr sqlparser.
 		panic(err)
 	}
 
-	newExpr := ctx.RewriteDerivedTableExpression(expr, tableInfo)
+	newExpr := semantics.RewriteDerivedTableExpression(expr, tableInfo)
 	if ctx.ContainsAggr(newExpr) {
 		return newFilter(h, expr)
 	}
@@ -119,7 +119,18 @@ func (h *Horizon) AddColumn(ctx *plancontext.PlanningContext, reuse bool, _ bool
 }
 
 func (h *Horizon) AddWSColumn(ctx *plancontext.PlanningContext, offset int, underRoute bool) int {
-	panic(errNoNewColumns)
+	cols := h.GetColumns(ctx)
+	if offset >= len(cols) {
+		panic(errNoNewColumns)
+	}
+
+	sel, ok := h.Query.(*sqlparser.Select)
+	if !ok {
+		panic(errNoNewColumns)
+	}
+	wsOffset := len(cols)
+	sel.AddSelectExpr(aeWrap(weightStringFor(cols[offset].Expr)))
+	return wsOffset
 }
 
 var errNoNewColumns = vterrors.VT13001("can't add new columns to Horizon")
@@ -148,7 +159,7 @@ func (h *Horizon) FindCol(ctx *plancontext.PlanningContext, expr sqlparser.Expr,
 		return -1
 	}
 
-	for idx, se := range sqlparser.GetFirstSelect(h.Query).SelectExprs {
+	for idx, se := range getFirstSelect(h.Query).GetColumns() {
 		ae, ok := se.(*sqlparser.AliasedExpr)
 		if !ok {
 			panic(vterrors.VT09015())
@@ -173,8 +184,8 @@ func (h *Horizon) GetColumns(ctx *plancontext.PlanningContext) (exprs []*sqlpars
 	return exprs
 }
 
-func (h *Horizon) GetSelectExprs(*plancontext.PlanningContext) sqlparser.SelectExprs {
-	return sqlparser.GetFirstSelect(h.Query).SelectExprs
+func (h *Horizon) GetSelectExprs(*plancontext.PlanningContext) []sqlparser.SelectExpr {
+	return getFirstSelect(h.Query).GetColumns()
 }
 
 func (h *Horizon) GetOrdering(ctx *plancontext.PlanningContext) []OrderBy {
@@ -185,7 +196,7 @@ func (h *Horizon) GetOrdering(ctx *plancontext.PlanningContext) []OrderBy {
 }
 
 // TODO: REMOVE
-func (h *Horizon) selectStatement() sqlparser.SelectStatement {
+func (h *Horizon) selectStatement() sqlparser.TableStatement {
 	return h.Query
 }
 

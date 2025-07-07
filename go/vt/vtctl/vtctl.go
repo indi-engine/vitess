@@ -100,6 +100,7 @@ import (
 	"vitess.io/vitess/go/constants/sidecar"
 	"vitess.io/vitess/go/mysql/collations"
 	"vitess.io/vitess/go/ptr"
+	"vitess.io/vitess/go/vt/vtctl/reparentutil/policy"
 
 	"vitess.io/vitess/go/cmd/vtctldclient/cli"
 	"vitess.io/vitess/go/flagutil"
@@ -173,7 +174,7 @@ var commands = []commandGroup{
 			{
 				name:       "InitTablet",
 				method:     commandInitTablet,
-				params:     "[--allow_update] [--allow_different_shard] [--allow_master_override] [--parent] [--db_name_override=<db name>] [--hostname=<hostname>] [--mysql_port=<port>] [--port=<port>] [--grpc_port=<port>] [--tags=tag1:value1,tag2:value2] --keyspace=<keyspace> --shard=<shard> <tablet alias> <tablet type>",
+				params:     "[--allow_update] [--allow_different_shard] [--allow_master_override] [--parent] [--db_name_override=<db name>] [--hostname=<hostname>] [--mysql-port=<port>] [--port=<port>] [--grpc-port=<port>] [--tags=tag1:value1,tag2:value2] --keyspace=<keyspace> --shard=<shard> <tablet alias> <tablet type>",
 				help:       "Initializes a tablet in the topology.",
 				deprecated: true,
 			},
@@ -587,13 +588,13 @@ var commands = []commandGroup{
 				name:   "ValidateSchemaKeyspace",
 				method: commandValidateSchemaKeyspace,
 				params: "[--exclude_tables=''] [--include-views] [--skip-no-primary] [--include-vschema] <keyspace name>",
-				help:   "Validates that the schema on the primary tablet for shard 0 matches the schema on all of the other tablets in the keyspace.",
+				help:   "Validates that the schema on the primary tablet for the first shard matches the schema on all of the other tablets in the keyspace.",
 			},
 			{
 				name:   "ApplySchema",
 				method: commandApplySchema,
-				params: "[--wait_replicas_timeout=10s] [--ddl_strategy=<ddl_strategy>] [--uuid_list=<comma_separated_uuids>] [--migration_context=<unique-request-context>] {--sql=<sql> || --sql-file=<filename>} [--batch-size=<n>] <keyspace>",
-				help:   "Applies the schema change to the specified keyspace on every primary, running in parallel on all shards. The changes are then propagated to replicas via replication. -ddl_strategy is used to instruct migrations via vreplication, gh-ost or pt-osc with optional parameters. -migration_context allows the user to specify a custom request context for online DDL migrations.",
+				params: "[--wait_replicas_timeout=10s] [--ddl-strategy=<ddl_strategy>] [--uuid_list=<comma_separated_uuids>] [--migration_context=<unique-request-context>] {--sql=<sql> || --sql-file=<filename>} [--batch-size=<n>] <keyspace>",
+				help:   "Applies the schema change to the specified keyspace on every primary, running in parallel on all shards. The changes are then propagated to replicas via replication. -ddl-strategy is used to instruct migrations via vreplication, mysql or direct with optional parameters. -migration_context allows the user to specify a custom request context for online DDL migrations.",
 			},
 			{
 				name:   "CopySchemaShard",
@@ -707,7 +708,7 @@ var commands = []commandGroup{
 			{
 				name:   "UpdateThrottlerConfig",
 				method: commandUpdateThrottlerConfig,
-				params: "[--enable|--disable] [--threshold=<float64>] [--custom-query=<query>] [--check-as-check-self|--check-as-check-shard] [--throttle-app|unthrottle-app=<name>] [--throttle-app-ratio=<float, range [0..1]>] [--throttle-app-duration=<duration>] [--throttle-app-exempt] <keyspace>",
+				params: "[--enable|--disable] [--threshold=<float64>] [--custom-query=<query>] [--throttle-app|unthrottle-app=<name>] [--throttle-app-ratio=<float, range [0..1]>] [--throttle-app-duration=<duration>] [--throttle-app-exempt] <keyspace>",
 				help:   "Update the table throttler configuration for all cells and tablets of a given keyspace",
 			},
 			{
@@ -917,9 +918,9 @@ func commandInitTablet(ctx context.Context, wr *wrangler.Wrangler, subFlags *pfl
 	createShardAndKeyspace := subFlags.Bool("parent", false, "Creates the parent shard and keyspace if they don't yet exist")
 	hostname := subFlags.String("hostname", "", "The server on which the tablet is running")
 	mysqlHost := subFlags.String("mysql_host", "", "The mysql host for the mysql server")
-	mysqlPort := subFlags.Int("mysql_port", 0, "The mysql port for the mysql server")
+	mysqlPort := subFlags.Int("mysql-port", 0, "The mysql port for the mysql server")
 	port := subFlags.Int("port", 0, "The main port for the vttablet process")
-	grpcPort := subFlags.Int("grpc_port", 0, "The gRPC port for the vttablet process")
+	grpcPort := subFlags.Int("grpc-port", 0, "The gRPC port for the vttablet process")
 	keyspace := subFlags.String("keyspace", "", "The keyspace to which this tablet belongs")
 	shard := subFlags.String("shard", "", "The shard to which this tablet belongs")
 
@@ -1818,7 +1819,7 @@ func commandCreateKeyspace(ctx context.Context, wr *wrangler.Wrangler, subFlags 
 	keyspaceType := subFlags.String("keyspace_type", "", "Specifies the type of the keyspace")
 	baseKeyspace := subFlags.String("base_keyspace", "", "Specifies the base keyspace for a snapshot keyspace")
 	timestampStr := subFlags.String("snapshot_time", "", "Specifies the snapshot time for this keyspace")
-	durabilityPolicy := subFlags.String("durability-policy", "none", "Type of durability to enforce for this keyspace. Default is none. Possible values include 'semi_sync' and others as dictated by registered plugins.")
+	durabilityPolicy := subFlags.String("durability-policy", policy.DurabilityNone, "Type of durability to enforce for this keyspace. Default is none. Possible values include 'semi_sync' and others as dictated by registered plugins.")
 	sidecarDBName := subFlags.String("sidecar-db-name", sidecar.DefaultName, "(Experimental) Name of the Vitess sidecar database that tablets in this keyspace will use for internal metadata.")
 	if err := subFlags.Parse(args); err != nil {
 		return err
@@ -1840,7 +1841,7 @@ func commandCreateKeyspace(ctx context.Context, wr *wrangler.Wrangler, subFlags 
 
 	var snapshotTime *vttime.Time
 	if ktype == topodatapb.KeyspaceType_SNAPSHOT {
-		if *durabilityPolicy != "none" {
+		if *durabilityPolicy != policy.DurabilityNone {
 			return vterrors.New(vtrpcpb.Code_INVALID_ARGUMENT, "durability-policy cannot be specified while creating a snapshot keyspace")
 		}
 		if *baseKeyspace == "" {
@@ -1885,31 +1886,35 @@ func commandCreateKeyspace(ctx context.Context, wr *wrangler.Wrangler, subFlags 
 	}
 
 	if ktype == topodatapb.KeyspaceType_SNAPSHOT {
-		// copy vschema from base keyspace
-		vs, err := wr.TopoServer().GetVSchema(ctx, *baseKeyspace)
+		// Copy vschema from the base keyspace.
+		bksvs, err := wr.TopoServer().GetVSchema(ctx, *baseKeyspace)
+		ksvs := &topo.KeyspaceVSchemaInfo{
+			Name: keyspace,
+		}
 		if err != nil {
 			wr.Logger().Infof("error from GetVSchema for base_keyspace: %v, %v", *baseKeyspace, err)
 			if topo.IsErrType(err, topo.NoNode) {
-				vs = &vschemapb.Keyspace{
-					Sharded:                false,
-					Tables:                 make(map[string]*vschemapb.Table),
-					Vindexes:               make(map[string]*vschemapb.Vindex),
-					RequireExplicitRouting: true,
+				// Create an empty vschema for the keyspace.
+				ksvs.Keyspace = &vschemapb.Keyspace{
+					Sharded:  false,
+					Tables:   make(map[string]*vschemapb.Table),
+					Vindexes: make(map[string]*vschemapb.Vindex),
 				}
 			} else {
 				return err
 			}
-		} else {
-			// SNAPSHOT keyspaces are excluded from global routing.
-			vs.RequireExplicitRouting = true
 		}
-		if err := wr.TopoServer().SaveVSchema(ctx, keyspace, vs); err != nil {
-			wr.Logger().Infof("error from SaveVSchema %v:%v", vs, err)
+		// Copy the vschema from the base keyspace to the new one.
+		ksvs.Keyspace = bksvs.Keyspace.CloneVT()
+		// SNAPSHOT keyspaces are excluded from global routing.
+		ksvs.RequireExplicitRouting = true
+		if err := wr.TopoServer().SaveVSchema(ctx, ksvs); err != nil {
+			wr.Logger().Infof("error from SaveVSchema %v:%v", ksvs, err)
 			return err
 		}
 	}
 
-	return wr.TopoServer().RebuildSrvVSchema(ctx, []string{} /* cells */)
+	return wr.TopoServer().RebuildSrvVSchema(ctx, nil /* cells */)
 }
 
 func commandDeleteKeyspace(ctx context.Context, wr *wrangler.Wrangler, subFlags *pflag.FlagSet, args []string) error {
@@ -2110,7 +2115,7 @@ func commandVReplicationWorkflow(ctx context.Context, wr *wrangler.Wrangler, sub
 	// MoveTables and Reshard params
 	sourceShards := subFlags.String("source_shards", "", "Source shards")
 	*sourceShards = strings.TrimSpace(*sourceShards)
-	deferNonPKeys := subFlags.Bool("defer-secondary-keys", false, "Defer secondary index creation for a table until after it has been copied.")
+	deferNonPKeys := subFlags.Bool("defer-secondary-keys", true, "Defer secondary index creation for a table until after it has been copied.")
 
 	// Reshard params
 	targetShards := subFlags.String("target_shards", "", "Reshard only. Target shards")
@@ -2913,7 +2918,7 @@ func commandValidateSchemaKeyspace(ctx context.Context, wr *wrangler.Wrangler, s
 func commandApplySchema(ctx context.Context, wr *wrangler.Wrangler, subFlags *pflag.FlagSet, args []string) error {
 	sql := subFlags.String("sql", "", "A list of semicolon-delimited SQL commands")
 	sqlFile := subFlags.String("sql-file", "", "Identifies the file that contains the SQL commands")
-	ddlStrategy := subFlags.String("ddl_strategy", string(schema.DDLStrategyDirect), "Online DDL strategy, compatible with @@ddl_strategy session variable (examples: 'gh-ost', 'pt-osc', 'gh-ost --max-load=Threads_running=100'")
+	ddlStrategy := subFlags.String("ddl-strategy", string(schema.DDLStrategyDirect), "Online DDL strategy, compatible with @@ddl_strategy session variable (examples: 'direct', 'mysql', 'vitess --postpone-completion'")
 	uuidList := subFlags.String("uuid_list", "", "Optional: comma delimited explicit UUIDs for migration. If given, must match number of DDL changes")
 	migrationContext := subFlags.String("migration_context", "", "For Online DDL, optionally supply a custom unique string used as context for the migration(s) in this command. By default a unique context is auto-generated by Vitess")
 	requestContext := subFlags.String("request_context", "", "synonym for --migration_context")
@@ -3343,7 +3348,7 @@ func commandApplyVSchema(ctx context.Context, wr *wrangler.Wrangler, subFlags *p
 	}
 	keyspace := subFlags.Arg(0)
 
-	var vs *vschemapb.Keyspace
+	var ksvs *topo.KeyspaceVSchemaInfo
 	var err error
 
 	sqlMode := (*sql != "") != (*sqlFile != "")
@@ -3375,20 +3380,10 @@ func commandApplyVSchema(ctx context.Context, wr *wrangler.Wrangler, subFlags *p
 			return fmt.Errorf("error parsing vschema statement `%s`: not a ddl statement", *sql)
 		}
 
-		vs, err = wr.TopoServer().GetVSchema(ctx, keyspace)
-		if err != nil {
-			if topo.IsErrType(err, topo.NoNode) {
-				vs = &vschemapb.Keyspace{}
-			} else {
-				return err
-			}
-		}
-
-		vs, err = topotools.ApplyVSchemaDDL(keyspace, vs, ddl)
+		ksvs, err = topotools.ApplyVSchemaDDL(ctx, keyspace, wr.TopoServer(), ddl)
 		if err != nil {
 			return err
 		}
-
 	} else {
 		// json mode
 		var schema []byte
@@ -3402,14 +3397,17 @@ func commandApplyVSchema(ctx context.Context, wr *wrangler.Wrangler, subFlags *p
 			schema = []byte(*vschema)
 		}
 
-		vs = &vschemapb.Keyspace{}
-		err := json2.UnmarshalPB(schema, vs)
+		ksvs = &topo.KeyspaceVSchemaInfo{
+			Name:     keyspace,
+			Keyspace: &vschemapb.Keyspace{},
+		}
+		err := json2.UnmarshalPB(schema, ksvs.Keyspace)
 		if err != nil {
 			return err
 		}
 	}
 
-	b, err := json2.MarshalIndentPB(vs, "  ")
+	b, err := json2.MarshalIndentPB(ksvs.Keyspace, "  ")
 	if err != nil {
 		wr.Logger().Errorf2(err, "Failed to marshal VSchema for display")
 	} else {
@@ -3417,7 +3415,7 @@ func commandApplyVSchema(ctx context.Context, wr *wrangler.Wrangler, subFlags *p
 	}
 
 	// Validate the VSchema.
-	ksVs, err := vindexes.BuildKeyspace(vs, wr.SQLParser())
+	ksVs, err := vindexes.BuildKeyspace(ksvs.Keyspace, wr.SQLParser())
 	if err != nil {
 		return err
 	}
@@ -3449,11 +3447,11 @@ func commandApplyVSchema(ctx context.Context, wr *wrangler.Wrangler, subFlags *p
 		return err
 	}
 
-	if _, err := vindexes.BuildKeyspace(vs, wr.SQLParser()); err != nil {
+	if _, err := vindexes.BuildKeyspace(ksvs.Keyspace, wr.SQLParser()); err != nil {
 		return err
 	}
 
-	if err := wr.TopoServer().SaveVSchema(ctx, keyspace, vs); err != nil {
+	if err := wr.TopoServer().SaveVSchema(ctx, ksvs); err != nil {
 		return err
 	}
 
@@ -3509,7 +3507,7 @@ func commandApplyRoutingRules(ctx context.Context, wr *wrangler.Wrangler, subFla
 		if *dryRun {
 			msg.WriteString("=== DRY RUN ===\n")
 		}
-		msg.WriteString(fmt.Sprintf("New RoutingRules object:\n%s\nIf this is not what you expected, check the input data (as JSON parsing will skip unexpected fields).\n", b))
+		fmt.Fprintf(msg, "New RoutingRules object:\n%s\nIf this is not what you expected, check the input data (as JSON parsing will skip unexpected fields).\n", b)
 		if *dryRun {
 			msg.WriteString("=== (END) DRY RUN ===\n")
 		}
@@ -3600,8 +3598,6 @@ func commandUpdateThrottlerConfig(ctx context.Context, wr *wrangler.Wrangler, su
 	disable := subFlags.Bool("disable", false, "Disable the throttler")
 	threshold := subFlags.Float64("threshold", 0, "threshold for the either default check (replication lag seconds) or custom check")
 	customQuery := subFlags.String("custom-query", "", "custom throttler check query")
-	checkAsCheckSelf := subFlags.Bool("check-as-check-self", false, "/throttler/check requests behave as is /throttler/check-self was called")
-	checkAsCheckShard := subFlags.Bool("check-as-check-shard", false, "use standard behavior for /throttler/check requests")
 	unthrottledApp := subFlags.String("unthrottle-app", "", "an app name to unthrottle")
 	throttledApp := subFlags.String("throttle-app", "", "an app name to throttle")
 	throttledAppRatio := subFlags.Float64("throttle-app-ratio", throttle.DefaultThrottleRatio, "ratio to throttle app (app specififed in --throttled-app)")
@@ -3616,9 +3612,6 @@ func commandUpdateThrottlerConfig(ctx context.Context, wr *wrangler.Wrangler, su
 	}
 	if *enable && *disable {
 		return fmt.Errorf("--enable and --disable are mutually exclusive")
-	}
-	if *checkAsCheckSelf && *checkAsCheckShard {
-		return fmt.Errorf("--check-as-check-self and --check-as-check-shard are mutually exclusive")
 	}
 
 	if *throttledApp != "" && *unthrottledApp != "" {
@@ -3637,14 +3630,12 @@ func commandUpdateThrottlerConfig(ctx context.Context, wr *wrangler.Wrangler, su
 	keyspace := subFlags.Arg(0)
 
 	req := &vtctldatapb.UpdateThrottlerConfigRequest{
-		Keyspace:          keyspace,
-		Enable:            *enable,
-		Disable:           *disable,
-		CustomQuery:       *customQuery,
-		CustomQuerySet:    customQuerySet,
-		Threshold:         *threshold,
-		CheckAsCheckSelf:  *checkAsCheckSelf,
-		CheckAsCheckShard: *checkAsCheckShard,
+		Keyspace:       keyspace,
+		Enable:         *enable,
+		Disable:        *disable,
+		CustomQuery:    *customQuery,
+		CustomQuerySet: customQuerySet,
+		Threshold:      *threshold,
 	}
 	if *throttledApp != "" {
 		req.ThrottledApp = &topodatapb.ThrottledAppRule{

@@ -31,7 +31,6 @@ import (
 
 // TestEnsureDB tests that vttablet creates the db as needed
 func TestEnsureDB(t *testing.T) {
-	defer cluster.PanicHandler(t)
 
 	// Create new tablet
 	tablet := clusterInstance.NewVttabletInstance("replica", 0, "")
@@ -67,7 +66,6 @@ func TestEnsureDB(t *testing.T) {
 
 // TestResetReplicationParameters tests that the RPC ResetReplicationParameters works as intended.
 func TestResetReplicationParameters(t *testing.T) {
-	defer cluster.PanicHandler(t)
 
 	// Create new tablet
 	tablet := clusterInstance.NewVttabletInstance("replica", 0, "")
@@ -83,7 +81,7 @@ func TestResetReplicationParameters(t *testing.T) {
 	require.NoError(t, err)
 
 	// Set a replication source on the tablet and start replication
-	err = tablet.VttabletProcess.QueryTabletMultiple([]string{"stop replica", "change replication source to source_host = 'localhost', source_port = 123", "start replica"}, keyspaceName, false)
+	err = tablet.VttabletProcess.QueryTabletMultiple([]string{"stop replica", "change replication source to source_host = 'localhost', source_port = 123, get_source_public_key = 1", "start replica"}, keyspaceName, false)
 	require.NoError(t, err)
 
 	// Check the replica status.

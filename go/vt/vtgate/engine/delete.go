@@ -20,7 +20,6 @@ import (
 	"context"
 	"fmt"
 
-	topodatapb "vitess.io/vitess/go/vt/proto/topodata"
 	"vitess.io/vitess/go/vt/sqlparser"
 
 	"vitess.io/vitess/go/sqltypes"
@@ -34,10 +33,10 @@ var _ Primitive = (*Delete)(nil)
 
 // Delete represents the instructions to perform a delete.
 type Delete struct {
-	*DML
-
-	// Delete does not take inputs
 	noInputs
+	noFields
+
+	*DML
 }
 
 // TryExecute performs a non-streaming exec.
@@ -52,6 +51,8 @@ func (del *Delete) TryExecute(ctx context.Context, vcursor VCursor, bindVars map
 	}
 
 	switch del.Opcode {
+	case None:
+		return &sqltypes.Result{}, nil
 	case Unsharded:
 		return del.execUnsharded(ctx, del, vcursor, bindVars, rss)
 	case Equal, IN, Scatter, ByDestination, SubShard, EqualUnique, MultiEqual:
@@ -71,23 +72,18 @@ func (del *Delete) TryStreamExecute(ctx context.Context, vcursor VCursor, bindVa
 	return callback(res)
 }
 
-// GetFields fetches the field info.
-func (del *Delete) GetFields(context.Context, VCursor, map[string]*querypb.BindVariable) (*sqltypes.Result, error) {
-	return nil, fmt.Errorf("BUG: unreachable code for %q", del.Query)
-}
-
 // deleteVindexEntries performs an delete if table owns vindex.
 // Note: the commit order may be different from the DML order because it's possible
 // for DMLs to reuse existing transactions.
 func (del *Delete) deleteVindexEntries(ctx context.Context, vcursor VCursor, bindVars map[string]*querypb.BindVariable, rss []*srvtopo.ResolvedShard) error {
-	if del.OwnedVindexQuery == "" {
+	if !del.isVindexModified() {
 		return nil
 	}
 	queries := make([]*querypb.BoundQuery, len(rss))
 	for i := range rss {
 		queries[i] = &querypb.BoundQuery{Sql: del.OwnedVindexQuery, BindVariables: bindVars}
 	}
-	subQueryResults, errors := vcursor.ExecuteMultiShard(ctx, del, rss, queries, false /* rollbackOnError */, false /* canAutocommit */)
+	subQueryResults, errors := vcursor.ExecuteMultiShard(ctx, del, rss, queries, false /*rollbackOnError*/, false /*canAutocommit*/, del.FetchLastInsertID)
 	for _, err := range errors {
 		if err != nil {
 			return err
@@ -120,10 +116,13 @@ func (del *Delete) deleteVindexEntries(ctx context.Context, vcursor VCursor, bin
 	return nil
 }
 
+func (del *Delete) isVindexModified() bool {
+	return del.OwnedVindexQuery != ""
+}
+
 func (del *Delete) description() PrimitiveDescription {
 	other := map[string]any{
 		"Query":                del.Query,
-		"Table":                del.GetTableName(),
 		"OwnedVindexQuery":     del.OwnedVindexQuery,
 		"MultiShardAutocommit": del.MultiShardAutocommit,
 		"QueryTimeout":         del.QueryTimeout,
@@ -131,13 +130,15 @@ func (del *Delete) description() PrimitiveDescription {
 	}
 
 	addFieldsIfNotEmpty(del.DML, other)
+	if del.FetchLastInsertID {
+		other["FetchLastInsertID"] = del.FetchLastInsertID
+	}
 
 	return PrimitiveDescription{
-		OperatorType:     "Delete",
-		Keyspace:         del.Keyspace,
-		Variant:          del.Opcode.String(),
-		TargetTabletType: topodatapb.TabletType_PRIMARY,
-		Other:            other,
+		OperatorType: "Delete",
+		Keyspace:     del.Keyspace,
+		Variant:      del.Opcode.String(),
+		Other:        other,
 	}
 }
 

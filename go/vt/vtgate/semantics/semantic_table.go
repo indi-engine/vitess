@@ -39,7 +39,7 @@ type (
 		Name() (sqlparser.TableName, error)
 
 		// GetVindexTable returns the vschema version of this TableInfo
-		GetVindexTable() *vindexes.Table
+		GetVindexTable() *vindexes.BaseTable
 
 		// IsInfSchema returns true if this table is information_schema
 		IsInfSchema() bool
@@ -80,13 +80,14 @@ type (
 
 	// QuerySignature is used to identify shortcuts in the planning process
 	QuerySignature struct {
-		Aggregation  bool
-		DML          bool
-		Distinct     bool
-		HashJoin     bool
-		SubQueries   bool
-		Union        bool
-		RecursiveCTE bool
+		Aggregation     bool
+		DML             bool
+		Distinct        bool
+		HashJoin        bool
+		SubQueries      bool
+		Union           bool
+		RecursiveCTE    bool
+		LastInsertIDArg bool // LastInsertIDArg is true if the query has a LAST_INSERT_ID(x) with an argument
 	}
 
 	// MirrorInfo stores information used to produce mirror
@@ -121,6 +122,10 @@ type (
 		// MySQL engine to handle errors appropriately.
 		NotUnshardedErr error
 
+		// If there are constructs in this query that we know we only support if we can push them down
+		// unbroken to mysql, this field will contain an error that is produced when we fail to do so.
+		NotSingleShardErr error
+
 		// Recursive contains dependencies from the expression to the actual tables
 		// in the query (excluding derived tables). For columns in derived tables,
 		// this map holds the accumulated dependencies for the column expression.
@@ -129,17 +134,16 @@ type (
 		// It doesn't recurse inside derived tables to find the original dependencies.
 		Direct ExprDependencies
 
-		// Targets contains the TableSet of each table getting modified by the update/delete statement.
-		Targets TableSet
+		// DMLTargets contains the TableSet of each table getting modified by the update/delete statement.
+		DMLTargets TableSet
 
-		// ColumnEqualities is used for transitive closures (e.g., if a == b and b == c, then a == c).
-		ColumnEqualities map[columnName][]sqlparser.Expr
+		ExprEqualities *TransitiveClosures
 
 		// ExpandedColumns is a map of all the added columns for a given table.
 		// The columns were added because of the use of `*` in the query
 		ExpandedColumns map[sqlparser.TableName][]*sqlparser.ColName
 
-		columns map[*sqlparser.Union]sqlparser.SelectExprs
+		columns map[*sqlparser.Union][]sqlparser.SelectExpr
 
 		comparator *sqlparser.Comparator
 
@@ -157,14 +161,9 @@ type (
 		collEnv                   *collations.Environment
 	}
 
-	columnName struct {
-		Table      TableSet
-		ColumnName string
-	}
-
 	// SchemaInformation is used to provide table information from Vschema.
 	SchemaInformation interface {
-		FindTableOrVindex(tablename sqlparser.TableName) (*vindexes.Table, vindexes.Vindex, string, topodatapb.TabletType, key.Destination, error)
+		FindTableOrVindex(tablename sqlparser.TableName) (*vindexes.BaseTable, vindexes.Vindex, string, topodatapb.TabletType, key.ShardDestination, error)
 		ConnCollation() collations.ID
 		Environment() *vtenv.Environment
 		// ForeignKeyMode returns the foreign_key flag value
@@ -189,20 +188,22 @@ var ErrNotSingleTable = vterrors.VT13001("should only be used for single tables"
 
 // CopyDependencies copies the dependencies from one expression into the other
 func (st *SemTable) CopyDependencies(from, to sqlparser.Expr) {
-	if ValidAsMapKey(to) {
-		st.Recursive[to] = st.RecursiveDeps(from)
-		st.Direct[to] = st.DirectDeps(from)
-		if ValidAsMapKey(from) {
-			if typ, found := st.ExprTypes[from]; found {
-				st.ExprTypes[to] = typ
-			}
+	if ValidAsMapKey(to) && ValidAsMapKey(from) {
+		if ts, ok := st.Recursive[from]; ok {
+			st.Recursive[to] = ts
+		}
+		if ts, ok := st.Direct[from]; ok {
+			st.Direct[to] = ts
+		}
+		if typ, found := st.ExprTypes[from]; found {
+			st.ExprTypes[to] = typ
 		}
 	}
 }
 
 // GetChildForeignKeysForTargets gets the child foreign keys as a list for all the target tables.
 func (st *SemTable) GetChildForeignKeysForTargets() (fks []vindexes.ChildFKInfo) {
-	for _, ts := range st.Targets.Constituents() {
+	for _, ts := range st.DMLTargets.Constituents() {
 		fks = append(fks, st.childForeignKeysInvolved[ts]...)
 	}
 	return fks
@@ -210,7 +211,7 @@ func (st *SemTable) GetChildForeignKeysForTargets() (fks []vindexes.ChildFKInfo)
 
 // GetChildForeignKeysForTableSet gets the child foreign keys as a listfor the TableSet.
 func (st *SemTable) GetChildForeignKeysForTableSet(target TableSet) (fks []vindexes.ChildFKInfo) {
-	for _, ts := range st.Targets.Constituents() {
+	for _, ts := range st.DMLTargets.Constituents() {
 		if target.IsSolvedBy(ts) {
 			fks = append(fks, st.childForeignKeysInvolved[ts]...)
 		}
@@ -238,7 +239,7 @@ func (st *SemTable) GetChildForeignKeysList() []vindexes.ChildFKInfo {
 
 // GetParentForeignKeysForTargets gets the parent foreign keys as a list for all the target tables.
 func (st *SemTable) GetParentForeignKeysForTargets() (fks []vindexes.ParentFKInfo) {
-	for _, ts := range st.Targets.Constituents() {
+	for _, ts := range st.DMLTargets.Constituents() {
 		fks = append(fks, st.parentForeignKeysInvolved[ts]...)
 	}
 	return fks
@@ -246,7 +247,7 @@ func (st *SemTable) GetParentForeignKeysForTargets() (fks []vindexes.ParentFKInf
 
 // GetParentForeignKeysForTableSet gets the parent foreign keys as a list for the TableSet.
 func (st *SemTable) GetParentForeignKeysForTableSet(target TableSet) (fks []vindexes.ParentFKInfo) {
-	for _, ts := range st.Targets.Constituents() {
+	for _, ts := range st.DMLTargets.Constituents() {
 		if target.IsSolvedBy(ts) {
 			fks = append(fks, st.parentForeignKeysInvolved[ts]...)
 		}
@@ -435,7 +436,7 @@ func (st *SemTable) HasNonLiteralForeignKeyUpdate(updExprs sqlparser.UpdateExprs
 }
 
 // isShardScoped checks if the foreign key constraint is shard-scoped or not. It uses the vindex information to make this call.
-func isShardScoped(pTable *vindexes.Table, cTable *vindexes.Table, pCols sqlparser.Columns, cCols sqlparser.Columns) bool {
+func isShardScoped(pTable *vindexes.BaseTable, cTable *vindexes.BaseTable, pCols sqlparser.Columns, cCols sqlparser.Columns) bool {
 	if !pTable.Keyspace.Sharded {
 		return true
 	}
@@ -492,10 +493,10 @@ func (st *SemTable) ForeignKeysPresent() bool {
 	return false
 }
 
-func (st *SemTable) SelectExprs(sel sqlparser.SelectStatement) sqlparser.SelectExprs {
+func (st *SemTable) SelectExprs(sel sqlparser.TableStatement) []sqlparser.SelectExpr {
 	switch sel := sel.(type) {
 	case *sqlparser.Select:
-		return sel.SelectExprs
+		return sel.GetColumns()
 	case *sqlparser.Union:
 		exprs, found := st.columns[sel]
 		if found {
@@ -511,8 +512,9 @@ func (st *SemTable) SelectExprs(sel sqlparser.SelectStatement) sqlparser.SelectE
 	panic(fmt.Sprintf("BUG: unexpected select statement type %T", sel))
 }
 
-func getColumnNames(exprs sqlparser.SelectExprs) (expanded bool, selectExprs sqlparser.SelectExprs) {
-	expanded = true
+func getColumnNames(exprs []sqlparser.SelectExpr) (bool, []sqlparser.SelectExpr) {
+	var selectExprs []sqlparser.SelectExpr
+	expanded := true
 	for _, col := range exprs {
 		switch col := col.(type) {
 		case *sqlparser.AliasedExpr:
@@ -523,7 +525,7 @@ func getColumnNames(exprs sqlparser.SelectExprs) (expanded bool, selectExprs sql
 			expanded = false
 		}
 	}
-	return
+	return expanded, selectExprs
 }
 
 // CopySemanticInfo copies all semantic information we have about this SQLNode so that it also applies to the `to` node
@@ -567,11 +569,11 @@ func (st *SemTable) Cloned(from, to sqlparser.SQLNode) {
 // EmptySemTable creates a new empty SemTable
 func EmptySemTable() *SemTable {
 	return &SemTable{
-		Recursive:        map[sqlparser.Expr]TableSet{},
-		Direct:           map[sqlparser.Expr]TableSet{},
-		ColumnEqualities: map[columnName][]sqlparser.Expr{},
-		columns:          map[*sqlparser.Union]sqlparser.SelectExprs{},
-		ExprTypes:        make(map[sqlparser.Expr]evalengine.Type),
+		Recursive:      map[sqlparser.Expr]TableSet{},
+		Direct:         map[sqlparser.Expr]TableSet{},
+		ExprEqualities: NewTransitiveClosures(),
+		columns:        map[*sqlparser.Union][]sqlparser.SelectExpr{},
+		ExprTypes:      make(map[sqlparser.Expr]evalengine.Type),
 	}
 }
 
@@ -626,30 +628,6 @@ func (st *SemTable) DirectDeps(expr sqlparser.Expr) TableSet {
 	return st.Direct.dependencies(expr)
 }
 
-// AddColumnEquality adds a relation of the given colName to the ColumnEqualities map
-func (st *SemTable) AddColumnEquality(colName *sqlparser.ColName, expr sqlparser.Expr) {
-	ts := st.Direct.dependencies(colName)
-	columnName := columnName{
-		Table:      ts,
-		ColumnName: colName.Name.String(),
-	}
-	elem := st.ColumnEqualities[columnName]
-	elem = append(elem, expr)
-	st.ColumnEqualities[columnName] = elem
-}
-
-// GetExprAndEqualities returns a slice containing the given expression, and it's known equalities if any
-func (st *SemTable) GetExprAndEqualities(expr sqlparser.Expr) []sqlparser.Expr {
-	result := []sqlparser.Expr{expr}
-	switch expr := expr.(type) {
-	case *sqlparser.ColName:
-		table := st.DirectDeps(expr)
-		k := columnName{Table: table, ColumnName: expr.Name.String()}
-		result = append(result, st.ColumnEqualities[k]...)
-	}
-	return result
-}
-
 // TableInfoForExpr returns the table info of the table that this expression depends on.
 // Careful: this only works for expressions that have a single table dependency
 func (st *SemTable) TableInfoForExpr(expr sqlparser.Expr) (TableInfo, error) {
@@ -657,9 +635,9 @@ func (st *SemTable) TableInfoForExpr(expr sqlparser.Expr) (TableInfo, error) {
 }
 
 // AddExprs adds new select exprs to the SemTable.
-func (st *SemTable) AddExprs(tbl *sqlparser.AliasedTableExpr, cols sqlparser.SelectExprs) {
+func (st *SemTable) AddExprs(tbl *sqlparser.AliasedTableExpr, cols *sqlparser.SelectExprs) {
 	tableSet := st.TableSetFor(tbl)
-	for _, col := range cols {
+	for _, col := range cols.Exprs {
 		st.Recursive[col.(*sqlparser.AliasedExpr).Expr] = tableSet
 	}
 }
@@ -713,7 +691,9 @@ func (d ExprDependencies) dependencies(expr sqlparser.Expr) (deps TableSet) {
 		}
 
 		set, found := d[expr]
-		deps = deps.Merge(set)
+		if found {
+			deps = deps.Merge(set)
+		}
 
 		// if we found a cached value, there is no need to continue down to visit children
 		return !found, nil
@@ -756,16 +736,16 @@ func (st *SemTable) CopyExprInfo(src, dest sqlparser.Expr) {
 var columnNotSupportedErr = vterrors.Errorf(vtrpcpb.Code_UNIMPLEMENTED, "column access not supported here")
 
 // ColumnLookup implements the TranslationLookup interface
-func (st *SemTable) ColumnLookup(col *sqlparser.ColName) (int, error) {
+func (st *SemTable) ColumnLookup(*sqlparser.ColName) (int, error) {
 	return 0, columnNotSupportedErr
 }
 
 // SingleUnshardedKeyspace returns the single keyspace if all tables in the query are in the same, unsharded keyspace
-func (st *SemTable) SingleUnshardedKeyspace() (ks *vindexes.Keyspace, tables []*vindexes.Table) {
+func (st *SemTable) SingleUnshardedKeyspace() (ks *vindexes.Keyspace, tables []*vindexes.BaseTable) {
 	return singleUnshardedKeyspace(st.Tables)
 }
 
-func singleUnshardedKeyspace(tableInfos []TableInfo) (ks *vindexes.Keyspace, tables []*vindexes.Table) {
+func singleUnshardedKeyspace(tableInfos []TableInfo) (ks *vindexes.Keyspace, tables []*vindexes.BaseTable) {
 	validKS := func(this *vindexes.Keyspace) bool {
 		if this == nil || this.Sharded {
 			return false
@@ -782,7 +762,7 @@ func singleUnshardedKeyspace(tableInfos []TableInfo) (ks *vindexes.Keyspace, tab
 
 	for _, table := range tableInfos {
 		sc := table.canShortCut()
-		var vtbl *vindexes.Table
+		var vtbl *vindexes.BaseTable
 
 		switch sc {
 		case dependsOnKeyspace:
@@ -970,7 +950,7 @@ func (st *SemTable) UpdateChildFKExpr(origUpdExpr *sqlparser.UpdateExpr, newExpr
 
 // GetTargetTableSetForTableName returns the TableSet for the given table name from the target tables.
 func (st *SemTable) GetTargetTableSetForTableName(name sqlparser.TableName) (TableSet, error) {
-	for _, target := range st.Targets.Constituents() {
+	for _, target := range st.DMLTargets.Constituents() {
 		tbl, err := st.Tables[target.TableOffset()].Name()
 		if err != nil {
 			return "", err
@@ -1011,6 +991,21 @@ func canTakeSelectUnshardedShortcut(tableInfos []TableInfo) (*vindexes.Keyspace,
 
 func (st *SemTable) GetMirrorInfo() MirrorInfo {
 	return mirrorInfo(st.Tables)
+}
+
+func (st *SemTable) ShouldFetchLastInsertID() bool {
+	if st == nil {
+		return false
+	}
+	return st.QuerySignature.LastInsertIDArg
+}
+
+func (st *SemTable) AddExprEquality(a, b sqlparser.Expr) {
+	st.ExprEqualities.Add(a, b, st.EqualsExprWithDeps)
+}
+
+func (st *SemTable) ForeachExprEquality(e sqlparser.Expr, f func(expr sqlparser.Expr) error) error {
+	return st.ExprEqualities.Foreach(e, st.EqualsExprWithDeps, f)
 }
 
 // mirrorInfo looks through all tables with mirror rules defined, and returns a

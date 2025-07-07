@@ -28,8 +28,9 @@ import (
 	"testing"
 	"time"
 
+	"math/rand/v2"
+
 	"github.com/stretchr/testify/require"
-	"golang.org/x/exp/rand"
 
 	"vitess.io/vitess/go/mysql"
 	"vitess.io/vitess/go/syscallutil"
@@ -42,11 +43,115 @@ import (
 	"vitess.io/vitess/go/vt/schema"
 )
 
+var (
+	// idVals are the primary key values to use while creating insert queries that ensures all the three shards get an insert.
+	idVals = [3]int{
+		4, // 4 maps to 0x20 and ends up in the first shard (-40)
+		6, // 6 maps to 0x60 and ends up in the second shard (40-80)
+		9, // 9 maps to 0x90 and ends up in the third shard (80-)
+	}
+)
+
+func TestSettings(t *testing.T) {
+	testcases := []struct {
+		name            string
+		commitDelayTime string
+		queries         []string
+		verifyFunc      func(t *testing.T, vtParams *mysql.ConnParams)
+	}{
+		{
+			name:            "No settings changes",
+			commitDelayTime: "5",
+			queries:         append([]string{"begin"}, getMultiShardInsertQueries()...),
+			verifyFunc: func(t *testing.T, vtParams *mysql.ConnParams) {
+				// There is nothing to verify.
+			},
+		},
+		{
+			name:            "Settings changes before begin",
+			commitDelayTime: "5",
+			queries: append(
+				append([]string{`set @@time_zone="+10:30"`, "begin"}, getMultiShardInsertQueries()...),
+				"insert into twopc_settings(id, col) values(9, now())"),
+			verifyFunc: func(t *testing.T, vtParams *mysql.ConnParams) {
+				// We can check that the time_zone setting was taken into account by checking the diff with the time by using a different time_zone.
+				ctx := context.Background()
+				conn, err := mysql.Connect(ctx, vtParams)
+				require.NoError(t, err)
+				defer conn.Close()
+				utils.Exec(t, conn, `set @@time_zone="+7:00"`)
+				utils.AssertMatches(t, conn, `select HOUR(TIMEDIFF((select col from twopc_settings where id = 9),now()))`, `[[INT64(3)]]`)
+			},
+		},
+		{
+			name:            "Settings changes during transaction",
+			commitDelayTime: "5",
+			queries: append(
+				append([]string{"begin"}, getMultiShardInsertQueries()...),
+				`set @@time_zone="+10:30"`,
+				"insert into twopc_settings(id, col) values(9, now())"),
+			verifyFunc: func(t *testing.T, vtParams *mysql.ConnParams) {
+				// We can check that the time_zone setting was taken into account by checking the diff with the time by using a different time_zone.
+				ctx := context.Background()
+				conn, err := mysql.Connect(ctx, vtParams)
+				require.NoError(t, err)
+				defer conn.Close()
+				utils.Exec(t, conn, `set @@time_zone="+7:00"`)
+				utils.AssertMatches(t, conn, `select HOUR(TIMEDIFF((select col from twopc_settings where id = 9),now()))`, `[[INT64(3)]]`)
+			},
+		},
+		{
+			name:            "Settings changes before begin and during transaction",
+			commitDelayTime: "5",
+			queries: append(
+				append([]string{`set @@time_zone="+10:30"`, "begin"}, getMultiShardInsertQueries()...),
+				"insert into twopc_settings(id, col) values(9, now())",
+				`set @@time_zone="+7:00"`,
+				"insert into twopc_settings(id, col) values(25, now())"),
+			verifyFunc: func(t *testing.T, vtParams *mysql.ConnParams) {
+				// We can check that the time_zone setting was taken into account by checking the diff with the time by using a different time_zone.
+				ctx := context.Background()
+				conn, err := mysql.Connect(ctx, vtParams)
+				require.NoError(t, err)
+				defer conn.Close()
+				utils.AssertMatches(t, conn, `select HOUR(TIMEDIFF((select col from twopc_settings where id = 9),(select col from twopc_settings where id = 25)))`, `[[INT64(3)]]`)
+			},
+		},
+	}
+
+	for _, tt := range testcases {
+		t.Run(tt.name, func(t *testing.T) {
+			// Reparent all the shards to first tablet being the primary.
+			reparentToFirstTablet(t)
+			// cleanup all the old data.
+			conn, closer := start(t)
+			defer closer()
+			defer twopcutil.DeleteFile(twopcutil.DebugDelayCommitShard)
+			defer twopcutil.DeleteFile(twopcutil.DebugDelayCommitTime)
+			var wg sync.WaitGroup
+			twopcutil.RunMultiShardCommitWithDelay(t, conn, tt.commitDelayTime, &wg, tt.queries)
+			// Allow enough time for the commit to have started.
+			time.Sleep(1 * time.Second)
+			// Run the vttablet restart to ensure that the transaction needs to be redone.
+			err := vttabletRestartShard3(t)
+			require.NoError(t, err)
+			// Wait for the commit to have returned. We don't actually check for an error in the commit because the user might receive an error.
+			// But since we are waiting in CommitPrepared, the decision to commit the transaction should have already been taken.
+			wg.Wait()
+			// Wair for the data in the table to see that the transaction was committed.
+			twopcutil.WaitForResults(t, &vtParams, "select id, col from twopc_t1 where col = 4 order by id", `[[INT64(4) INT64(4)] [INT64(6) INT64(4)] [INT64(9) INT64(4)]]`, 30*time.Second)
+			tt.verifyFunc(t, &vtParams)
+		})
+	}
+
+}
+
 // TestDisruptions tests that atomic transactions persevere through various disruptions.
 func TestDisruptions(t *testing.T) {
 	testcases := []struct {
 		disruptionName  string
 		commitDelayTime string
+		setupFunc       func(t *testing.T)
 		disruption      func(t *testing.T) error
 		resetFunc       func(t *testing.T)
 	}{
@@ -56,6 +161,13 @@ func TestDisruptions(t *testing.T) {
 			disruption: func(t *testing.T) error {
 				return nil
 			},
+		},
+		{
+			disruptionName:  "Resharding",
+			commitDelayTime: "20",
+			setupFunc:       createShard,
+			disruption:      mergeShards,
+			resetFunc:       splitShardsBack,
 		},
 		{
 			disruptionName:  "PlannedReparentShard",
@@ -98,33 +210,16 @@ func TestDisruptions(t *testing.T) {
 		t.Run(fmt.Sprintf("%s-%ss delay", tt.disruptionName, tt.commitDelayTime), func(t *testing.T) {
 			// Reparent all the shards to first tablet being the primary.
 			reparentToFirstTablet(t)
+			if tt.setupFunc != nil {
+				tt.setupFunc(t)
+			}
 			// cleanup all the old data.
 			conn, closer := start(t)
 			defer closer()
-			// Start an atomic transaction.
-			utils.Exec(t, conn, "begin")
-			// Insert rows such that they go to all the three shards. Given that we have sharded the table `twopc_t1` on reverse_bits
-			// it is very easy to figure out what value will end up in which shard.
-			idVals := []int{4, 6, 9}
-			for _, val := range idVals {
-				utils.Exec(t, conn, fmt.Sprintf("insert into twopc_t1(id, col) values(%d, 4)", val))
-			}
-			// We want to delay the commit on one of the shards to simulate slow commits on a shard.
-			twopcutil.WriteTestCommunicationFile(t, twopcutil.DebugDelayCommitShard, "80-")
 			defer twopcutil.DeleteFile(twopcutil.DebugDelayCommitShard)
-			twopcutil.WriteTestCommunicationFile(t, twopcutil.DebugDelayCommitTime, tt.commitDelayTime)
 			defer twopcutil.DeleteFile(twopcutil.DebugDelayCommitTime)
-			// We will execute a commit in a go routine, because we know it will take some time to complete.
-			// While the commit is ongoing, we would like to run the disruption.
 			var wg sync.WaitGroup
-			wg.Add(1)
-			go func() {
-				defer wg.Done()
-				_, err := utils.ExecAllowError(t, conn, "commit")
-				if err != nil {
-					log.Errorf("Error in commit - %v", err)
-				}
-			}()
+			twopcutil.RunMultiShardCommitWithDelay(t, conn, tt.commitDelayTime, &wg, append([]string{"begin"}, getMultiShardInsertQueries()...))
 			// Allow enough time for the commit to have started.
 			time.Sleep(1 * time.Second)
 			writeCtx, writeCancel := context.WithCancel(context.Background())
@@ -156,6 +251,34 @@ func TestDisruptions(t *testing.T) {
 	}
 }
 
+// getMultiShardInsertQueries gets the queries that will cause one insert on all the shards.
+func getMultiShardInsertQueries() []string {
+	var queries []string
+	// Insert rows such that they go to all the three shards. Given that we have sharded the table `twopc_t1` on reverse_bits
+	// it is very easy to figure out what value will end up in which shard.
+	for _, val := range idVals {
+		queries = append(queries, fmt.Sprintf("insert into twopc_t1(id, col) values(%d, 4)", val))
+	}
+	return queries
+}
+
+func mergeShards(t *testing.T) error {
+	return twopcutil.RunReshard(t, clusterInstance, "TestDisruptions", keyspaceName, "40-80,80-", "40-")
+}
+
+func splitShardsBack(t *testing.T) {
+	t.Helper()
+	twopcutil.AddShards(t, clusterInstance, keyspaceName, []string{"40-80", "80-"})
+	err := twopcutil.RunReshard(t, clusterInstance, "TestDisruptions", keyspaceName, "40-", "40-80,80-")
+	require.NoError(t, err)
+}
+
+// createShard creates a new shard in the keyspace that we'll use for Resharding.
+func createShard(t *testing.T) {
+	t.Helper()
+	twopcutil.AddShards(t, clusterInstance, keyspaceName, []string{"40-"})
+}
+
 // threadToWrite is a helper function to write to the database in a loop.
 func threadToWrite(t *testing.T, ctx context.Context, id int) {
 	for {
@@ -168,7 +291,7 @@ func threadToWrite(t *testing.T, ctx context.Context, id int) {
 		if err != nil {
 			continue
 		}
-		_, _ = utils.ExecAllowError(t, conn, fmt.Sprintf("insert into twopc_t1(id, col) values(%d, %d)", id, rand.Intn(10000)))
+		_, _ = utils.ExecAllowError(t, conn, fmt.Sprintf("insert into twopc_t1(id, col) values(%d, %d)", id, rand.IntN(10000)))
 		conn.Close()
 	}
 }
@@ -206,7 +329,9 @@ func ersShard3(t *testing.T) error {
 func vttabletRestartShard3(t *testing.T) error {
 	shard := clusterInstance.Keyspaces[0].Shards[2]
 	tablet := shard.Vttablets[0]
-	return tablet.RestartOnlyTablet()
+	_ = tablet.VttabletProcess.TearDownWithTimeout(2 * time.Second)
+	tablet.VttabletProcess.ServingStatus = "SERVING"
+	return tablet.VttabletProcess.Setup()
 }
 
 // mysqlRestartShard3 restarts MySQL on the first tablet of the third shard.

@@ -19,13 +19,12 @@ limitations under the License.
 package txserializer
 
 import (
+	"context"
 	"fmt"
 	"net/http"
 	"strings"
 	"sync"
 	"time"
-
-	"context"
 
 	"vitess.io/vitess/go/acl"
 	"vitess.io/vitess/go/stats"
@@ -87,9 +86,10 @@ type TxSerializer struct {
 	logQueueExceededDryRun       *logutil.ThrottledLogger
 	logGlobalQueueExceededDryRun *logutil.ThrottledLogger
 
-	mu         sync.Mutex
-	queues     map[string]*queue
-	globalSize int
+	mu            sync.Mutex
+	queues        map[string]*queue
+	globalSize    int
+	redactUIQuery bool
 }
 
 // New returns a TxSerializer object.
@@ -130,6 +130,7 @@ func New(env tabletenv.Env) *TxSerializer {
 		logQueueExceededDryRun:       logutil.NewThrottledLogger("HotRowProtection QueueExceeded DryRun", 5*time.Second),
 		logGlobalQueueExceededDryRun: logutil.NewThrottledLogger("HotRowProtection GlobalQueueExceeded DryRun", 5*time.Second),
 		queues:                       make(map[string]*queue),
+		redactUIQuery:                streamlog.NewQueryLogConfigForTest().RedactDebugUIQueries,
 	}
 
 }
@@ -328,7 +329,7 @@ func (txs *TxSerializer) Pending(key string) int {
 
 // ServeHTTP lists the most recent, cached queries and their count.
 func (txs *TxSerializer) ServeHTTP(response http.ResponseWriter, request *http.Request) {
-	if streamlog.GetRedactDebugUIQueries() {
+	if txs.redactUIQuery {
 		response.Write([]byte(`
 	<!DOCTYPE html>
 	<html>
@@ -351,9 +352,9 @@ func (txs *TxSerializer) ServeHTTP(response http.ResponseWriter, request *http.R
 		response.Write([]byte("empty\n"))
 		return
 	}
-	response.Write([]byte(fmt.Sprintf("Length: %d\n", len(items))))
+	fmt.Fprintf(response, "Length: %d\n", len(items))
 	for _, v := range items {
-		response.Write([]byte(fmt.Sprintf("%v: %s\n", v.Count, v.Query)))
+		fmt.Fprintf(response, "%v: %s\n", v.Count, v.Query)
 	}
 }
 

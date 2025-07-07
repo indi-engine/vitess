@@ -109,7 +109,7 @@ func (fhc *FakeHealthCheck) GetTabletHealth(kst KeyspaceShardTabletType, alias *
 }
 
 // Subscribe returns the channel in the struct. Subscribe should only be called in one place for this fake health check
-func (fhc *FakeHealthCheck) Subscribe() chan *TabletHealth {
+func (fhc *FakeHealthCheck) Subscribe(string) chan *TabletHealth {
 	return fhc.ch
 }
 
@@ -172,12 +172,27 @@ func (fhc *FakeHealthCheck) SetTabletType(tablet *topodatapb.Tablet, tabletType 
 	item.ts.Target.TabletType = tabletType
 }
 
+// SetPrimaryTimestamp sets the primary timestamp for the given tablet
+func (fhc *FakeHealthCheck) SetPrimaryTimestamp(tablet *topodatapb.Tablet, timestamp int64) {
+	if fhc.ch == nil {
+		return
+	}
+	fhc.mu.Lock()
+	defer fhc.mu.Unlock()
+	key := TabletToMapKey(tablet)
+	item, isPresent := fhc.items[key]
+	if !isPresent {
+		return
+	}
+	item.ts.PrimaryTermStartTime = timestamp
+}
+
 // Unsubscribe is not implemented.
 func (fhc *FakeHealthCheck) Unsubscribe(c chan *TabletHealth) {
 }
 
 // GetLoadTabletsTrigger is not implemented.
-func (fhc *FakeHealthCheck) GetLoadTabletsTrigger() chan struct{} {
+func (fhc *FakeHealthCheck) GetLoadTabletsTrigger() chan topo.KeyspaceShard {
 	return nil
 }
 

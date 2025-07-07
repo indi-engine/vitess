@@ -25,6 +25,7 @@ import (
 	"vitess.io/vitess/go/vt/schema"
 	"vitess.io/vitess/go/vt/sqlparser"
 	"vitess.io/vitess/go/vt/vterrors"
+	"vitess.io/vitess/go/vt/vtgate/dynamicconfig"
 	"vitess.io/vitess/go/vt/vtgate/vindexes"
 )
 
@@ -42,8 +43,7 @@ type DDL struct {
 	NormalDDL *Send
 	OnlineDDL *OnlineDDL
 
-	DirectDDLEnabled bool
-	OnlineDDLEnabled bool
+	Config dynamicconfig.DDL
 
 	CreateTempTable bool
 }
@@ -62,25 +62,13 @@ func (ddl *DDL) description() PrimitiveDescription {
 	}
 }
 
-// RouteType implements the Primitive interface
-func (ddl *DDL) RouteType() string {
-	return "DDL"
-}
-
-// GetKeyspaceName implements the Primitive interface
-func (ddl *DDL) GetKeyspaceName() string {
-	return ddl.Keyspace.Name
-}
-
-// GetTableName implements the Primitive interface
-func (ddl *DDL) GetTableName() string {
-	return ddl.DDL.GetTable().Name.String()
-}
-
 // IsOnlineSchemaDDL returns true if the query is an online schema change DDL
 func (ddl *DDL) isOnlineSchemaDDL() bool {
 	switch ddl.DDL.GetAction() {
 	case sqlparser.CreateDDLAction, sqlparser.DropDDLAction, sqlparser.AlterDDLAction:
+		if ddl.OnlineDDL == nil || ddl.OnlineDDL.DDLStrategySetting == nil {
+			return false
+		}
 		return !ddl.OnlineDDL.DDLStrategySetting.Strategy.IsDirect()
 	}
 	return false
@@ -107,12 +95,12 @@ func (ddl *DDL) TryExecute(ctx context.Context, vcursor VCursor, bindVars map[st
 
 	switch {
 	case ddl.isOnlineSchemaDDL():
-		if !ddl.OnlineDDLEnabled {
+		if !ddl.Config.OnlineEnabled() {
 			return nil, schema.ErrOnlineDDLDisabled
 		}
 		return vcursor.ExecutePrimitive(ctx, ddl.OnlineDDL, bindVars, wantfields)
 	default: // non online-ddl
-		if !ddl.DirectDDLEnabled {
+		if !ddl.Config.DirectEnabled() {
 			return nil, schema.ErrDirectDDLDisabled
 		}
 		return vcursor.ExecutePrimitive(ctx, ddl.NormalDDL, bindVars, wantfields)

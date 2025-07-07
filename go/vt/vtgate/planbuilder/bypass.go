@@ -26,11 +26,11 @@ import (
 )
 
 func buildPlanForBypass(stmt sqlparser.Statement, _ *sqlparser.ReservedVars, vschema plancontext.VSchema) (*planResult, error) {
-	keyspace, err := vschema.DefaultKeyspace()
+	keyspace, err := vschema.SelectedKeyspace()
 	if err != nil {
 		return nil, err
 	}
-	switch dest := vschema.Destination().(type) {
+	switch dest := vschema.ShardDestination().(type) {
 	case key.DestinationExactKeyRange:
 		if _, ok := stmt.(*sqlparser.Insert); ok {
 			return nil, vterrors.VT03023(vschema.TargetString())
@@ -56,9 +56,11 @@ func buildPlanForBypass(stmt sqlparser.Statement, _ *sqlparser.ReservedVars, vsc
 		}
 	}
 
+	sqlparser.RemoveSpecificKeyspace(stmt, keyspace.Name)
+
 	send := &engine.Send{
 		Keyspace:             keyspace,
-		TargetDestination:    vschema.Destination(),
+		TargetDestination:    vschema.ShardDestination(),
 		Query:                sqlparser.String(stmt),
 		IsDML:                sqlparser.IsDMLStatement(stmt),
 		SingleShardOnly:      false,

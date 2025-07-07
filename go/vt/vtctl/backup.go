@@ -74,6 +74,7 @@ func commandBackup(ctx context.Context, wr *wrangler.Wrangler, subFlags *pflag.F
 	allowPrimary := subFlags.Bool("allow_primary", false, "Allows backups to be taken on primary. Warning!! If you are using the builtin backup engine, this will shutdown your primary mysql for as long as it takes to create a backup.")
 	incrementalFromPos := subFlags.String("incremental_from_pos", "", "Position, or name of backup from which to create an incremental backup. Default: empty. If given, then this backup becomes an incremental backup from given position or given backup. If value is 'auto', this backup will be taken from the last successful backup position.")
 	upgradeSafe := subFlags.Bool("upgrade-safe", false, "Whether to use innodb_fast_shutdown=0 for the backup so it is safe to use for MySQL upgrades.")
+	mysqlShutdownTimeout := subFlags.Duration("mysql-shutdown-timeout", mysqlctl.DefaultShutdownTimeout, "Timeout to use when MySQL is being shut down.")
 
 	if err := subFlags.Parse(args); err != nil {
 		return err
@@ -88,11 +89,12 @@ func commandBackup(ctx context.Context, wr *wrangler.Wrangler, subFlags *pflag.F
 	}
 
 	return wr.VtctldServer().Backup(&vtctldatapb.BackupRequest{
-		TabletAlias:        tabletAlias,
-		Concurrency:        *concurrency,
-		AllowPrimary:       *allowPrimary,
-		IncrementalFromPos: *incrementalFromPos,
-		UpgradeSafe:        *upgradeSafe,
+		TabletAlias:          tabletAlias,
+		Concurrency:          *concurrency,
+		AllowPrimary:         *allowPrimary,
+		IncrementalFromPos:   *incrementalFromPos,
+		UpgradeSafe:          *upgradeSafe,
+		MysqlShutdownTimeout: protoutil.DurationToProto(*mysqlShutdownTimeout),
 	}, &backupEventStreamLogger{logger: wr.Logger(), ctx: ctx})
 }
 
@@ -116,6 +118,7 @@ func commandBackupShard(ctx context.Context, wr *wrangler.Wrangler, subFlags *pf
 	allowPrimary := subFlags.Bool("allow_primary", false, "Whether to use primary tablet for backup. Warning!! If you are using the builtin backup engine, this will shutdown your primary mysql for as long as it takes to create a backup.")
 	incrementalFromPos := subFlags.String("incremental_from_pos", "", "Position, or name of backup from which to create an incremental backup. Default: empty. If given, then this backup becomes an incremental backup from given position or given backup. If value is 'auto', this backup will be taken from the last successful backup position.")
 	upgradeSafe := subFlags.Bool("upgrade-safe", false, "Whether to use innodb_fast_shutdown=0 for the backup so it is safe to use for MySQL upgrades.")
+	mysqlShutdownTimeout := subFlags.Duration("mysql-shutdown-timeout", mysqlctl.DefaultShutdownTimeout, "Timeout to use when MySQL is being shut down.")
 
 	if err := subFlags.Parse(args); err != nil {
 		return err
@@ -130,12 +133,13 @@ func commandBackupShard(ctx context.Context, wr *wrangler.Wrangler, subFlags *pf
 	}
 
 	return wr.VtctldServer().BackupShard(&vtctldatapb.BackupShardRequest{
-		Keyspace:           keyspace,
-		Shard:              shard,
-		Concurrency:        *concurrency,
-		AllowPrimary:       *allowPrimary,
-		IncrementalFromPos: *incrementalFromPos,
-		UpgradeSafe:        *upgradeSafe,
+		Keyspace:             keyspace,
+		Shard:                shard,
+		Concurrency:          *concurrency,
+		AllowPrimary:         *allowPrimary,
+		IncrementalFromPos:   *incrementalFromPos,
+		UpgradeSafe:          *upgradeSafe,
+		MysqlShutdownTimeout: protoutil.DurationToProto(*mysqlShutdownTimeout),
 	}, &backupEventStreamLogger{logger: wr.Logger(), ctx: ctx})
 }
 
@@ -209,6 +213,7 @@ func commandRestoreFromBackup(ctx context.Context, wr *wrangler.Wrangler, subFla
 	backupTimestampStr := subFlags.String("backup_timestamp", "", "Use the backup taken at or before this timestamp rather than using the latest backup.")
 	restoreToPos := subFlags.String("restore_to_pos", "", "Run a point in time recovery that ends with the given position. This will attempt to use one full backup followed by zero or more incremental backups")
 	restoreToTimestampStr := subFlags.String("restore_to_timestamp", "", "Run a point in time recovery that restores up to, and excluding, given timestamp in RFC3339 format (`2006-01-02T15:04:05Z07:00`). This will attempt to use one full backup followed by zero or more incremental backups")
+
 	dryRun := subFlags.Bool("dry_run", false, "Only validate restore steps, do not actually restore data")
 	if err := subFlags.Parse(args); err != nil {
 		return err

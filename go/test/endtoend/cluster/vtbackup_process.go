@@ -26,17 +26,19 @@ import (
 	"time"
 
 	"vitess.io/vitess/go/vt/log"
+	"vitess.io/vitess/go/vt/utils"
 )
 
 // VtbackupProcess is a generic handle for a running Vtbackup.
 // It can be spawned manually
 type VtbackupProcess struct {
-	Name      string
-	Binary    string
-	CommonArg VtctlProcess
+	VtProcess
 	LogDir    string
 	MysqlPort int
 	Directory string
+
+	BackupStorageImplementation string
+	FileBackupStorageRoot       string
 
 	Cell        string
 	Keyspace    string
@@ -54,23 +56,36 @@ type VtbackupProcess struct {
 
 // Setup starts vtbackup process with required arguements
 func (vtbackup *VtbackupProcess) Setup() (err error) {
-	vtbackup.proc = exec.Command(
-		vtbackup.Binary,
-		"--topo_implementation", vtbackup.CommonArg.TopoImplementation,
-		"--topo_global_server_address", vtbackup.CommonArg.TopoGlobalAddress,
-		"--topo_global_root", vtbackup.CommonArg.TopoGlobalRoot,
-		"--log_dir", vtbackup.LogDir,
+
+	flags := map[string]string{
+		"--topo-implementation":        vtbackup.TopoImplementation,
+		"--topo-global-server-address": vtbackup.TopoGlobalAddress,
+		"--topo-global-root":           vtbackup.TopoGlobalRoot,
+		"--log_dir":                    vtbackup.LogDir,
 
 		//initDBfile is required to run vtbackup
-		"--mysql_port", fmt.Sprintf("%d", vtbackup.MysqlPort),
-		"--init_db_sql_file", vtbackup.initDBfile,
-		"--init_keyspace", vtbackup.Keyspace,
-		"--init_shard", vtbackup.Shard,
+		"--mysql-port":       fmt.Sprintf("%d", vtbackup.MysqlPort),
+		"--init_db_sql_file": vtbackup.initDBfile,
+		"--init-keyspace":    vtbackup.Keyspace,
+		"--init-shard":       vtbackup.Shard,
 
 		//Backup Arguments are not optional
-		"--backup_storage_implementation", "file",
-		"--file_backup_storage_root", path.Join(os.Getenv("VTDATAROOT"), "tmp", "backupstorage"),
-	)
+		"--backup-storage-implementation": vtbackup.BackupStorageImplementation,
+		"--file_backup_storage_root":      vtbackup.FileBackupStorageRoot,
+	}
+
+	utils.SetFlagVariantsForTests(flags, "--topo-implementation", vtbackup.TopoImplementation)
+	utils.SetFlagVariantsForTests(flags, "--topo-global-server-address", vtbackup.TopoGlobalAddress)
+	utils.SetFlagVariantsForTests(flags, "--topo-global-root", vtbackup.TopoGlobalRoot)
+	utils.SetFlagVariantsForTests(flags, "--mysql-port", fmt.Sprintf("%d", vtbackup.MysqlPort))
+	utils.SetFlagVariantsForTests(flags, "--init-keyspace", vtbackup.Keyspace)
+	utils.SetFlagVariantsForTests(flags, "--init-shard", vtbackup.Shard)
+	utils.SetFlagVariantsForTests(flags, "--backup-storage-implementation", vtbackup.BackupStorageImplementation)
+
+	vtbackup.proc = exec.Command(vtbackup.Binary)
+	for k, v := range flags {
+		vtbackup.proc.Args = append(vtbackup.proc.Args, k, v)
+	}
 
 	if vtbackup.initialBackup {
 		vtbackup.proc.Args = append(vtbackup.proc.Args, "--initial_backup")
@@ -129,20 +144,20 @@ func (vtbackup *VtbackupProcess) TearDown() error {
 // The process must be manually started by calling Setup()
 func VtbackupProcessInstance(tabletUID int, mysqlPort int, newInitDBFile string, keyspace string, shard string,
 	cell string, hostname string, tmpDirectory string, topoPort int, initialBackup bool) *VtbackupProcess {
-	vtctl := VtctlProcessInstance(topoPort, hostname)
+	base := VtProcessInstance("vtbackup", "vtbackup", topoPort, hostname)
 	vtbackup := &VtbackupProcess{
-		Name:          "vtbackup",
-		Binary:        "vtbackup",
-		CommonArg:     *vtctl,
-		LogDir:        tmpDirectory,
-		Directory:     os.Getenv("VTDATAROOT"),
-		TabletAlias:   fmt.Sprintf("%s-%010d", cell, tabletUID),
-		initDBfile:    newInitDBFile,
-		Keyspace:      keyspace,
-		Shard:         shard,
-		Cell:          cell,
-		MysqlPort:     mysqlPort,
-		initialBackup: initialBackup,
+		VtProcess:                   base,
+		LogDir:                      tmpDirectory,
+		Directory:                   os.Getenv("VTDATAROOT"),
+		BackupStorageImplementation: "file",
+		FileBackupStorageRoot:       path.Join(os.Getenv("VTDATAROOT"), "/backups"),
+		TabletAlias:                 fmt.Sprintf("%s-%010d", cell, tabletUID),
+		initDBfile:                  newInitDBFile,
+		Keyspace:                    keyspace,
+		Shard:                       shard,
+		Cell:                        cell,
+		MysqlPort:                   mysqlPort,
+		initialBackup:               initialBackup,
 	}
 	return vtbackup
 }

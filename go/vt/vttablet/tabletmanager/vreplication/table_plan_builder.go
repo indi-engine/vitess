@@ -80,10 +80,11 @@ type colExpr struct {
 	// references contains all the column names referenced in the expression.
 	references map[string]bool
 
-	isGrouped  bool
-	isPK       bool
-	dataType   string
-	columnType string
+	isGrouped   bool
+	isPK        bool
+	isGenerated bool
+	dataType    string
+	columnType  string
 }
 
 // operation is the opcode for the colExpr.
@@ -233,10 +234,10 @@ func buildTablePlan(tableName string, rule *binlogdatapb.Rule, colInfos []*Colum
 		Match: fromTable,
 	}
 
-	if expr, ok := sel.SelectExprs[0].(*sqlparser.StarExpr); ok {
+	if expr, ok := sel.SelectExprs.Exprs[0].(*sqlparser.StarExpr); ok {
 		// If it's a "select *", we return a partial plan, and complete
 		// it when we get back field info from the stream.
-		if len(sel.SelectExprs) != 1 {
+		if len(sel.SelectExprs.Exprs) != 1 {
 			return nil, planError(fmt.Errorf("unsupported mix of '*' and columns"), sqlparser.String(sel))
 		}
 		if !expr.TableName.IsEmpty() {
@@ -271,7 +272,7 @@ func buildTablePlan(tableName string, rule *binlogdatapb.Rule, colInfos []*Colum
 		workflowConfig: workflowConfig,
 	}
 
-	if err := tpb.analyzeExprs(sel.SelectExprs); err != nil {
+	if err := tpb.analyzeExprs(sel.SelectExprs.Exprs); err != nil {
 		return nil, planError(err, sqlparser.String(sel))
 	}
 	// It's possible that the target table does not materialize all
@@ -308,11 +309,9 @@ func buildTablePlan(tableName string, rule *binlogdatapb.Rule, colInfos []*Colum
 
 	// if there are no columns being selected the select expression can be empty, so we "select 1" so we have a valid
 	// select to get a row back
-	if len(tpb.sendSelect.SelectExprs) == 0 {
-		tpb.sendSelect.SelectExprs = sqlparser.SelectExprs([]sqlparser.SelectExpr{
-			&sqlparser.AliasedExpr{
-				Expr: sqlparser.NewIntLiteral("1"),
-			},
+	if tpb.sendSelect.SelectExprs == nil || len(tpb.sendSelect.SelectExprs.Exprs) == 0 {
+		tpb.sendSelect.AddSelectExpr(&sqlparser.AliasedExpr{
+			Expr: sqlparser.NewIntLiteral("1"),
 		})
 	}
 	commentsList := []string{}
@@ -360,7 +359,7 @@ func (tpb *tablePlanBuilder) generate() *TablePlan {
 	fieldsToSkip := make(map[string]bool)
 	for _, colInfo := range tpb.colInfos {
 		if colInfo.IsGenerated {
-			fieldsToSkip[colInfo.Name] = true
+			fieldsToSkip[strings.ToLower(colInfo.Name)] = true
 		}
 	}
 	return &TablePlan{
@@ -412,7 +411,7 @@ func analyzeSelectFrom(query string, parser *sqlparser.Parser) (sel *sqlparser.S
 	return sel, fromTable.String(), nil
 }
 
-func (tpb *tablePlanBuilder) analyzeExprs(selExprs sqlparser.SelectExprs) error {
+func (tpb *tablePlanBuilder) analyzeExprs(selExprs []sqlparser.SelectExpr) error {
 	for _, selExpr := range selExprs {
 		cexpr, err := tpb.analyzeExpr(selExpr)
 		if err != nil {
@@ -467,7 +466,7 @@ func (tpb *tablePlanBuilder) analyzeExpr(selExpr sqlparser.SelectExpr) (*colExpr
 		}
 		cexpr.expr = expr
 		cexpr.operation = opExpr
-		tpb.sendSelect.SelectExprs = append(tpb.sendSelect.SelectExprs, &sqlparser.AliasedExpr{Expr: selExpr, As: as})
+		tpb.sendSelect.AddSelectExpr(&sqlparser.AliasedExpr{Expr: selExpr, As: as})
 		cexpr.references[as.String()] = true
 		return cexpr, nil
 	}
@@ -477,7 +476,8 @@ func (tpb *tablePlanBuilder) analyzeExpr(selExpr sqlparser.SelectExpr) (*colExpr
 			if len(expr.Exprs) != 0 {
 				return nil, fmt.Errorf("unsupported multiple keyspace_id expressions: %v", sqlparser.String(expr))
 			}
-			tpb.sendSelect.SelectExprs = append(tpb.sendSelect.SelectExprs, &sqlparser.AliasedExpr{Expr: aliased.Expr})
+
+			tpb.sendSelect.AddSelectExpr(&sqlparser.AliasedExpr{Expr: aliased.Expr})
 			// The vstreamer responds with "keyspace_id" as the field name for this request.
 			cexpr.expr = &sqlparser.ColName{Name: sqlparser.NewIdentifierCI("keyspace_id")}
 			return cexpr, nil
@@ -537,7 +537,7 @@ func (tpb *tablePlanBuilder) analyzeExpr(selExpr sqlparser.SelectExpr) (*colExpr
 // addCol adds the specified column to the send query
 // if it's not already present.
 func (tpb *tablePlanBuilder) addCol(ident sqlparser.IdentifierCI) {
-	tpb.sendSelect.SelectExprs = append(tpb.sendSelect.SelectExprs, &sqlparser.AliasedExpr{
+	tpb.sendSelect.AddSelectExpr(&sqlparser.AliasedExpr{
 		Expr: &sqlparser.ColName{Name: ident},
 	})
 }
@@ -694,7 +694,7 @@ func (tpb *tablePlanBuilder) generateInsertPart(buf *sqlparser.TrackedBuffer) *s
 	}
 	separator := ""
 	for _, cexpr := range tpb.colExprs {
-		if tpb.isColumnGenerated(cexpr.colName) {
+		if cexpr.isGenerated {
 			continue
 		}
 		buf.Myprintf("%s%v", separator, cexpr.colName)
@@ -708,7 +708,7 @@ func (tpb *tablePlanBuilder) generateValuesPart(buf *sqlparser.TrackedBuffer, bv
 	bvf.mode = bvAfter
 	separator := "("
 	for _, cexpr := range tpb.colExprs {
-		if tpb.isColumnGenerated(cexpr.colName) {
+		if cexpr.isGenerated {
 			continue
 		}
 		buf.Myprintf("%s", separator)
@@ -745,7 +745,7 @@ func (tpb *tablePlanBuilder) generateSelectPart(buf *sqlparser.TrackedBuffer, bv
 	buf.WriteString(" select ")
 	separator := ""
 	for _, cexpr := range tpb.colExprs {
-		if tpb.isColumnGenerated(cexpr.colName) {
+		if cexpr.isGenerated {
 			continue
 		}
 		buf.Myprintf("%s", separator)
@@ -781,7 +781,7 @@ func (tpb *tablePlanBuilder) generateOnDupPart(buf *sqlparser.TrackedBuffer) *sq
 		if cexpr.isGrouped || cexpr.isPK {
 			continue
 		}
-		if tpb.isColumnGenerated(cexpr.colName) {
+		if cexpr.isGenerated {
 			continue
 		}
 		buf.Myprintf("%s%v=", separator, cexpr.colName)
@@ -812,10 +812,7 @@ func (tpb *tablePlanBuilder) generateUpdateStatement() *sqlparser.ParsedQuery {
 		if cexpr.isPK {
 			tpb.pkIndices[i] = true
 		}
-		if cexpr.isGrouped || cexpr.isPK {
-			continue
-		}
-		if tpb.isColumnGenerated(cexpr.colName) {
+		if cexpr.isGrouped || cexpr.isPK || cexpr.isGenerated {
 			continue
 		}
 		buf.Myprintf("%s%v=", separator, cexpr.colName)
@@ -959,15 +956,6 @@ func (tpb *tablePlanBuilder) generatePKConstraint(buf *sqlparser.TrackedBuffer, 
 		buf.WriteString(charSetCollations[i].collation)
 	}
 	buf.WriteString(")")
-}
-
-func (tpb *tablePlanBuilder) isColumnGenerated(col sqlparser.IdentifierCI) bool {
-	for _, colInfo := range tpb.colInfos {
-		if col.EqualString(colInfo.Name) && colInfo.IsGenerated {
-			return true
-		}
-	}
-	return false
 }
 
 // bindvarFormatter is a dual mode formatter. Its behavior

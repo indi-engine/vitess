@@ -142,6 +142,30 @@ func (node *VStream) FormatFast(buf *TrackedBuffer) {
 }
 
 // FormatFast formats the node.
+func (node *ValuesStatement) FormatFast(buf *TrackedBuffer) {
+	if node.With != nil {
+		node.With.FormatFast(buf)
+	}
+	buf.WriteString("values ")
+	node.Comments.FormatFast(buf)
+	if node.ListArg != "" {
+		node.ListArg.FormatFast(buf)
+	} else {
+		for i, row := range node.Rows {
+			buf.WriteString("row")
+			row.FormatFast(buf)
+			if i < len(node.Rows)-1 {
+				buf.WriteString(", ")
+			}
+		}
+	}
+
+	node.Order.FormatFast(buf)
+	node.Limit.FormatFast(buf)
+
+}
+
+// FormatFast formats the node.
 func (node *Stream) FormatFast(buf *TrackedBuffer) {
 	buf.WriteString("stream ")
 	node.Comments.FormatFast(buf)
@@ -432,6 +456,10 @@ func (node *AlterMigration) FormatFast(buf *TrackedBuffer) {
 		alterType = "complete"
 	case CompleteAllMigrationType:
 		alterType = "complete all"
+	case PostponeCompleteMigrationType:
+		alterType = "postpone complete"
+	case PostponeCompleteAllMigrationType:
+		alterType = "postpone complete all"
 	case CancelMigrationType:
 		alterType = "cancel"
 	case CancelAllMigrationType:
@@ -448,9 +476,16 @@ func (node *AlterMigration) FormatFast(buf *TrackedBuffer) {
 		alterType = "force_cutover"
 	case ForceCutOverAllMigrationType:
 		alterType = "force_cutover all"
+	case SetCutOverThresholdMigrationType:
+		alterType = "cutover_threshold"
 	}
 	buf.WriteByte(' ')
 	buf.WriteString(alterType)
+	if node.Threshold != "" {
+		buf.WriteString(" '")
+		buf.WriteString(node.Threshold)
+		buf.WriteByte('\'')
+	}
 	if node.Expire != "" {
 		buf.WriteString(" expire '")
 		buf.WriteString(node.Expire)
@@ -465,6 +500,193 @@ func (node *AlterMigration) FormatFast(buf *TrackedBuffer) {
 		buf.WriteString(node.Shards)
 		buf.WriteByte('\'')
 	}
+}
+
+// FormatFast formats the node.
+func (node *CreateProcedure) FormatFast(buf *TrackedBuffer) {
+	buf.WriteString("create ")
+	node.Comments.FormatFast(buf)
+	if node.Definer != nil {
+		buf.WriteString("definer = ")
+		node.Definer.FormatFast(buf)
+		buf.WriteByte(' ')
+	}
+	buf.WriteString("procedure ")
+	if node.IfNotExists {
+		buf.WriteString("if not exists ")
+	}
+	node.Name.FormatFast(buf)
+	buf.WriteString(" (")
+	prefix := ""
+	for _, param := range node.Params {
+		buf.WriteString(prefix)
+		param.FormatFast(buf)
+		prefix = ", "
+	}
+	buf.WriteString(") ")
+	node.Body.FormatFast(buf)
+}
+
+// FormatFast formats the node.
+func (node *DropProcedure) FormatFast(buf *TrackedBuffer) {
+	exists := ""
+	if node.IfExists {
+		exists = "if exists "
+	}
+	buf.WriteString(DropStr)
+	buf.WriteByte(' ')
+	node.Comments.FormatFast(buf)
+	buf.WriteString("procedure ")
+	buf.WriteString(exists)
+	node.Name.FormatFast(buf)
+}
+
+// FormatFast formats the node.
+func (pp *ProcParameter) FormatFast(buf *TrackedBuffer) {
+	buf.WriteString(pp.Mode.ToString())
+	buf.WriteByte(' ')
+	pp.Name.FormatFast(buf)
+	buf.WriteByte(' ')
+	pp.Type.FormatFast(buf)
+}
+
+// FormatFast formats the node.
+func (s *SingleStatement) FormatFast(buf *TrackedBuffer) {
+	s.Statement.FormatFast(buf)
+	buf.WriteByte(';')
+}
+
+// FormatFast formats the node.
+func (bes *BeginEndStatement) FormatFast(buf *TrackedBuffer) {
+	buf.WriteString("begin")
+	bes.Statements.FormatFast(buf)
+	buf.WriteString(" end;")
+}
+
+// FormatFast formats the node.
+func (cs *CompoundStatements) FormatFast(buf *TrackedBuffer) {
+	if cs == nil {
+		return
+	}
+	for _, stmt := range cs.Statements {
+		buf.WriteByte(' ')
+		stmt.FormatFast(buf)
+	}
+}
+
+// FormatFast formats the node.
+func (is *IfStatement) FormatFast(buf *TrackedBuffer) {
+	buf.WriteString("if ")
+	is.SearchCondition.FormatFast(buf)
+	buf.WriteString(" then")
+	is.ThenStatements.FormatFast(buf)
+
+	for _, elifBlock := range is.ElseIfBlocks {
+		buf.WriteByte(' ')
+		elifBlock.FormatFast(buf)
+	}
+	if is.ElseStatements != nil {
+		buf.WriteString(" else")
+		is.ElseStatements.FormatFast(buf)
+	}
+	buf.WriteString(" end if;")
+}
+
+// FormatFast formats the node.
+func (eib *ElseIfBlock) FormatFast(buf *TrackedBuffer) {
+	buf.WriteString("elseif ")
+	eib.SearchCondition.FormatFast(buf)
+	buf.WriteString(" then")
+	eib.ThenStatements.FormatFast(buf)
+}
+
+// FormatFast formats the node.
+func (dv *DeclareVar) FormatFast(buf *TrackedBuffer) {
+	buf.WriteString("declare")
+	prefix := " "
+	for _, varName := range dv.VarNames {
+		buf.WriteString(prefix)
+		varName.FormatFast(buf)
+		prefix = ", "
+	}
+	buf.WriteByte(' ')
+	dv.Type.FormatFast(buf)
+	buf.WriteByte(';')
+}
+
+// FormatFast formats the node.
+func (dh *DeclareHandler) FormatFast(buf *TrackedBuffer) {
+	buf.WriteString("declare ")
+	buf.WriteString(dh.Action.ToString())
+	buf.WriteString(" handler for")
+	prefix := " "
+	for _, condition := range dh.Conditions {
+		buf.WriteString(prefix)
+		condition.FormatFast(buf)
+		prefix = ", "
+	}
+	buf.WriteByte(' ')
+	dh.Statement.FormatFast(buf)
+}
+
+// FormatFast formats the node.
+func (dc *DeclareCondition) FormatFast(buf *TrackedBuffer) {
+	buf.WriteString("declare ")
+	dc.Name.FormatFast(buf)
+	buf.WriteString(" condition for ")
+	dc.Condition.FormatFast(buf)
+	buf.WriteByte(';')
+}
+
+// FormatFast formats the node.
+func (s *Signal) FormatFast(buf *TrackedBuffer) {
+	buf.WriteString("signal ")
+	s.Condition.FormatFast(buf)
+	prefix := " set "
+	for _, sv := range s.SetValues {
+		buf.WriteString(prefix)
+		sv.FormatFast(buf)
+		prefix = ", "
+	}
+	buf.WriteString(";")
+}
+
+// FormatFast formats the node.
+func (s *SignalSet) FormatFast(buf *TrackedBuffer) {
+	buf.WriteString(s.ConditionName.ToString())
+	buf.WriteString(" = ")
+	s.Value.FormatFast(buf)
+}
+
+// FormatFast formats the node.
+func (hcss *HandlerConditionSQLState) FormatFast(buf *TrackedBuffer) {
+	buf.WriteString("sqlstate ")
+	hcss.SQLStateValue.FormatFast(buf)
+}
+
+// FormatFast formats the node.
+func (hcn *HandlerConditionNamed) FormatFast(buf *TrackedBuffer) {
+	hcn.Name.FormatFast(buf)
+}
+
+// FormatFast formats the node.
+func (hcec *HandlerConditionErrorCode) FormatFast(buf *TrackedBuffer) {
+	buf.WriteString(fmt.Sprintf("%d", hcec.ErrorCode))
+}
+
+// FormatFast formats the node.
+func (hcse *HandlerConditionSQLException) FormatFast(buf *TrackedBuffer) {
+	buf.WriteString("sqlexception")
+}
+
+// FormatFast formats the node.
+func (hcsw *HandlerConditionSQLWarning) FormatFast(buf *TrackedBuffer) {
+	buf.WriteString("sqlwarning")
+}
+
+// FormatFast formats the node.
+func (hcnf *HandlerConditionNotFound) FormatFast(buf *TrackedBuffer) {
+	buf.WriteString("not found")
 }
 
 // FormatFast formats the node.
@@ -1018,10 +1240,11 @@ func (ct *ColumnType) FormatFast(buf *TrackedBuffer) {
 			ct.Options.As.FormatFast(buf)
 			buf.WriteByte(')')
 
-			if ct.Options.Storage == VirtualStorage {
+			switch ct.Options.Storage {
+			case VirtualStorage:
 				buf.WriteByte(' ')
 				buf.WriteString(keywordStrings[VIRTUAL])
-			} else if ct.Options.Storage == StoredStorage {
+			case StoredStorage:
 				buf.WriteByte(' ')
 				buf.WriteString(keywordStrings[STORED])
 			}
@@ -1341,7 +1564,7 @@ func (node *Commit) FormatFast(buf *TrackedBuffer) {
 
 // FormatFast formats the node.
 func (node *Begin) FormatFast(buf *TrackedBuffer) {
-	if node.TxAccessModes == nil {
+	if node.Type == BeginStmt {
 		buf.WriteString("begin")
 		return
 	}
@@ -1456,7 +1679,7 @@ func (node *CallProc) FormatFast(buf *TrackedBuffer) {
 	buf.WriteString("call ")
 	node.Name.FormatFast(buf)
 	buf.WriteByte('(')
-	node.Params.FormatFast(buf)
+	buf.formatExprs(node.Params)
 	buf.WriteByte(')')
 }
 
@@ -1487,9 +1710,9 @@ func (node *ParsedComments) FormatFast(buf *TrackedBuffer) {
 }
 
 // FormatFast formats the node.
-func (node SelectExprs) FormatFast(buf *TrackedBuffer) {
+func (node *SelectExprs) FormatFast(buf *TrackedBuffer) {
 	var prefix string
-	for _, n := range node {
+	for _, n := range node.Exprs {
 		buf.WriteString(prefix)
 		n.FormatFast(buf)
 		prefix = ", "
@@ -1673,9 +1896,9 @@ func (node *Where) FormatFast(buf *TrackedBuffer) {
 }
 
 // FormatFast formats the node.
-func (node Exprs) FormatFast(buf *TrackedBuffer) {
+func (node *Exprs) FormatFast(buf *TrackedBuffer) {
 	var prefix string
-	for _, n := range node {
+	for _, n := range node.Exprs {
 		buf.WriteString(prefix)
 		n.FormatFast(buf)
 		prefix = ", "
@@ -1714,9 +1937,10 @@ func (node *ComparisonExpr) FormatFast(buf *TrackedBuffer) {
 	buf.printExpr(node, node.Left, true)
 	buf.WriteByte(' ')
 	buf.WriteString(node.Operator.ToString())
-	if node.Modifier == All {
+	switch node.Modifier {
+	case All:
 		buf.WriteString(" all")
-	} else if node.Modifier == Any {
+	case Any:
 		buf.WriteString(" any")
 	}
 	buf.WriteByte(' ')
@@ -1768,7 +1992,7 @@ func (node *AssignmentExpr) FormatFast(buf *TrackedBuffer) {
 func (node *Literal) FormatFast(buf *TrackedBuffer) {
 	switch node.Type {
 	case StrVal:
-		sqltypes.MakeTrusted(sqltypes.VarBinary, node.Bytes()).EncodeSQL(buf)
+		sqltypes.MakeTrusted(sqltypes.VarChar, node.Bytes()).EncodeSQL(buf)
 	case IntVal, FloatVal, DecimalVal, HexNum, BitNum:
 		buf.WriteString(node.Val)
 	case HexVal:
@@ -1905,9 +2129,14 @@ func (node *ColName) FormatFast(buf *TrackedBuffer) {
 
 // FormatFast formats the node.
 func (node ValTuple) FormatFast(buf *TrackedBuffer) {
-	buf.WriteByte('(')
-	Exprs(node).FormatFast(buf)
-	buf.WriteByte(')')
+	var prefix string
+	buf.WriteString("(")
+	for _, n := range node {
+		buf.WriteString(prefix)
+		buf.printExpr(node, n, true)
+		prefix = ", "
+	}
+	buf.WriteString(")")
 }
 
 // FormatFast formats the node.
@@ -2192,7 +2421,7 @@ func (node *FuncExpr) FormatFast(buf *TrackedBuffer) {
 		buf.WriteString(funcName)
 	}
 	buf.WriteByte('(')
-	node.Exprs.FormatFast(buf)
+	buf.formatExprs(node.Exprs)
 	buf.WriteByte(')')
 }
 
@@ -2201,11 +2430,11 @@ func (node *GroupConcatExpr) FormatFast(buf *TrackedBuffer) {
 	if node.Distinct {
 		buf.WriteString("group_concat(")
 		buf.WriteString(DistinctStr)
-		node.Exprs.FormatFast(buf)
+		buf.formatExprs(node.Exprs)
 		node.OrderBy.FormatFast(buf)
 	} else {
 		buf.WriteString("group_concat(")
-		node.Exprs.FormatFast(buf)
+		buf.formatExprs(node.Exprs)
 		node.OrderBy.FormatFast(buf)
 	}
 	if node.Separator != "" {
@@ -2271,7 +2500,7 @@ func (node *WindowSpecification) FormatFast(buf *TrackedBuffer) {
 	}
 	if node.PartitionClause != nil {
 		buf.WriteString(" partition by ")
-		node.PartitionClause.FormatFast(buf)
+		buf.formatExprs(node.PartitionClause)
 	}
 	if node.OrderClause != nil {
 		node.OrderClause.FormatFast(buf)
@@ -2488,7 +2717,7 @@ func (node *IntervalFuncExpr) FormatFast(buf *TrackedBuffer) {
 	buf.WriteString("interval(")
 	buf.printExpr(node, node.Expr, true)
 	buf.WriteString(", ")
-	node.Exprs.FormatFast(buf)
+	buf.formatExprs(node.Exprs)
 	buf.WriteByte(')')
 }
 
@@ -2514,7 +2743,7 @@ func (node *LocateExpr) FormatFast(buf *TrackedBuffer) {
 // FormatFast formats the node.
 func (node *CharExpr) FormatFast(buf *TrackedBuffer) {
 	buf.WriteString("char(")
-	node.Exprs.FormatFast(buf)
+	buf.formatExprs(node.Exprs)
 	if node.Charset != "" {
 		buf.WriteString(" using ")
 		buf.WriteString(node.Charset)
@@ -2862,6 +3091,16 @@ func (node *ShowOther) FormatFast(buf *TrackedBuffer) {
 // FormatFast formats the node.
 func (node *SelectInto) FormatFast(buf *TrackedBuffer) {
 	if node == nil {
+		return
+	}
+	if node.Type == IntoVariables {
+		buf.WriteString(" into")
+		prefix := " "
+		for _, intoVar := range node.VarList {
+			buf.WriteString(prefix)
+			intoVar.FormatFast(buf)
+			prefix = ", "
+		}
 		return
 	}
 	buf.WriteString(node.Type.ToString())
@@ -3729,7 +3968,7 @@ func (node *Count) FormatFast(buf *TrackedBuffer) {
 	if node.Distinct {
 		buf.WriteString(DistinctStr)
 	}
-	node.Args.FormatFast(buf)
+	buf.formatExprs(node.Args)
 	buf.WriteByte(')')
 	if node.OverClause != nil {
 		buf.WriteByte(' ')
@@ -3953,14 +4192,14 @@ func (node *PointExpr) FormatFast(buf *TrackedBuffer) {
 // FormatFast formats the node.
 func (node *LineStringExpr) FormatFast(buf *TrackedBuffer) {
 	buf.WriteString("linestring(")
-	node.PointParams.FormatFast(buf)
+	buf.formatExprs(node.PointParams)
 	buf.WriteByte(')')
 }
 
 // FormatFast formats the node.
 func (node *PolygonExpr) FormatFast(buf *TrackedBuffer) {
 	buf.WriteString("polygon(")
-	node.LinestringParams.FormatFast(buf)
+	buf.formatExprs(node.LinestringParams)
 	buf.WriteByte(')')
 }
 
@@ -3980,21 +4219,21 @@ func (node *PurgeBinaryLogs) FormatFast(buf *TrackedBuffer) {
 
 func (node *MultiPolygonExpr) FormatFast(buf *TrackedBuffer) {
 	buf.WriteString("multipolygon(")
-	node.PolygonParams.FormatFast(buf)
+	buf.formatExprs(node.PolygonParams)
 	buf.WriteByte(')')
 }
 
 // FormatFast formats the node.
 func (node *MultiPointExpr) FormatFast(buf *TrackedBuffer) {
 	buf.WriteString("multipoint(")
-	node.PointParams.FormatFast(buf)
+	buf.formatExprs(node.PointParams)
 	buf.WriteByte(')')
 }
 
 // FormatFast formats the node.
 func (node *MultiLinestringExpr) FormatFast(buf *TrackedBuffer) {
 	buf.WriteString("multilinestring(")
-	node.LinestringParams.FormatFast(buf)
+	buf.formatExprs(node.LinestringParams)
 	buf.WriteByte(')')
 }
 

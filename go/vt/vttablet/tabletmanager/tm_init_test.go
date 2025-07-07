@@ -39,6 +39,7 @@ import (
 	"vitess.io/vitess/go/vt/topo"
 	"vitess.io/vitess/go/vt/topo/memorytopo"
 	"vitess.io/vitess/go/vt/topotools"
+	"vitess.io/vitess/go/vt/vttablet/tabletmanager/semisyncmonitor"
 	"vitess.io/vitess/go/vt/vttablet/tabletserver/tabletenv"
 	"vitess.io/vitess/go/vt/vttablet/tabletservermock"
 	"vitess.io/vitess/go/vt/vttest"
@@ -106,12 +107,12 @@ func TestStartBuildTabletFromInput(t *testing.T) {
 	initKeyspace = ""
 	initShard = "0"
 	_, err = BuildTabletFromInput(alias, port, grpcport, nil, collations.MySQL8())
-	assert.Contains(t, err.Error(), "init_keyspace and init_shard must be specified")
+	assert.Contains(t, err.Error(), "init-keyspace and init-shard must be specified")
 
 	initKeyspace = "test_keyspace"
 	initShard = ""
 	_, err = BuildTabletFromInput(alias, port, grpcport, nil, collations.MySQL8())
-	assert.Contains(t, err.Error(), "init_keyspace and init_shard must be specified")
+	assert.Contains(t, err.Error(), "init-keyspace and init-shard must be specified")
 
 	initShard = "x-y"
 	_, err = BuildTabletFromInput(alias, port, grpcport, nil, collations.MySQL8())
@@ -124,7 +125,7 @@ func TestStartBuildTabletFromInput(t *testing.T) {
 
 	initTabletType = "primary"
 	_, err = BuildTabletFromInput(alias, port, grpcport, nil, collations.MySQL8())
-	assert.Contains(t, err.Error(), "invalid init_tablet_type PRIMARY")
+	assert.Contains(t, err.Error(), "invalid init-tablet-type PRIMARY")
 }
 
 func TestBuildTabletFromInputWithBuildTags(t *testing.T) {
@@ -173,7 +174,7 @@ func TestStartCreateKeyspaceShard(t *testing.T) {
 	statsTabletTypeCount.ResetAll()
 	cell := "cell1"
 	ts := memorytopo.NewServer(ctx, cell)
-	tm := newTestTM(t, ts, 1, "ks", "0")
+	tm := newTestTM(t, ts, 1, "ks", "0", nil)
 	defer tm.Stop()
 
 	assert.Equal(t, "replica", statsTabletType.Get())
@@ -193,7 +194,7 @@ func TestStartCreateKeyspaceShard(t *testing.T) {
 	// keyspace-shard already created.
 	_, err = ts.GetOrCreateShard(ctx, "ks1", "0")
 	require.NoError(t, err)
-	tm = newTestTM(t, ts, 2, "ks1", "0")
+	tm = newTestTM(t, ts, 2, "ks1", "0", nil)
 	defer tm.Stop()
 	_, err = ts.GetShard(ctx, "ks1", "0")
 	require.NoError(t, err)
@@ -207,7 +208,7 @@ func TestStartCreateKeyspaceShard(t *testing.T) {
 	require.NoError(t, err)
 	err = topotools.RebuildKeyspace(ctx, logutil.NewConsoleLogger(), ts, "ks2", []string{cell}, false)
 	require.NoError(t, err)
-	tm = newTestTM(t, ts, 3, "ks2", "0")
+	tm = newTestTM(t, ts, 3, "ks2", "0", nil)
 	defer tm.Stop()
 	_, err = ts.GetShard(ctx, "ks2", "0")
 	require.NoError(t, err)
@@ -224,7 +225,7 @@ func TestStartCreateKeyspaceShard(t *testing.T) {
 	require.NoError(t, err)
 	err = ts.RebuildSrvVSchema(ctx, []string{cell})
 	require.NoError(t, err)
-	tm = newTestTM(t, ts, 4, "ks3", "0")
+	tm = newTestTM(t, ts, 4, "ks3", "0", nil)
 	defer tm.Stop()
 	_, err = ts.GetShard(ctx, "ks3", "0")
 	require.NoError(t, err)
@@ -235,7 +236,7 @@ func TestStartCreateKeyspaceShard(t *testing.T) {
 	assert.Equal(t, wantVSchema, srvVSchema.Keyspaces["ks3"])
 
 	// Multi-shard
-	tm1 := newTestTM(t, ts, 5, "ks4", "-80")
+	tm1 := newTestTM(t, ts, 5, "ks4", "-80", nil)
 	defer tm1.Stop()
 
 	// Wait a bit and make sure that srvKeyspace is still not created.
@@ -243,7 +244,7 @@ func TestStartCreateKeyspaceShard(t *testing.T) {
 	_, err = ts.GetSrvKeyspace(context.Background(), cell, "ks4")
 	require.True(t, topo.IsErrType(err, topo.NoNode), err)
 
-	tm2 := newTestTM(t, ts, 6, "ks4", "80-")
+	tm2 := newTestTM(t, ts, 6, "ks4", "80-", nil)
 	defer tm2.Stop()
 	// Now that we've started the tablet for the other shard, srvKeyspace will succeed.
 	ensureSrvKeyspace(t, ctx, ts, cell, "ks4")
@@ -264,7 +265,7 @@ func TestCheckPrimaryShip(t *testing.T) {
 
 	// 1. Initialize the tablet as REPLICA.
 	// This will create the respective topology records.
-	tm := newTestTM(t, ts, 1, "ks", "0")
+	tm := newTestTM(t, ts, 1, "ks", "0", nil)
 	tablet := tm.Tablet()
 	ensureSrvKeyspace(t, ctx, ts, cell, "ks")
 	ti, err := ts.GetTablet(ctx, alias)
@@ -398,7 +399,7 @@ func TestStartCheckMysql(t *testing.T) {
 	defer cancel()
 	cell := "cell1"
 	ts := memorytopo.NewServer(ctx, cell)
-	tablet := newTestTablet(t, 1, "ks", "0")
+	tablet := newTestTablet(t, 1, "ks", "0", nil)
 	cp := mysql.ConnParams{
 		Host: "foo",
 		Port: 1,
@@ -429,7 +430,7 @@ func TestStartFindMysqlPort(t *testing.T) {
 	defer cancel()
 	cell := "cell1"
 	ts := memorytopo.NewServer(ctx, cell)
-	tablet := newTestTablet(t, 1, "ks", "0")
+	tablet := newTestTablet(t, 1, "ks", "0", nil)
 	fmd := newTestMysqlDaemon(t, -1)
 	tm := &TabletManager{
 		BatchCtx:            context.Background(),
@@ -472,7 +473,7 @@ func TestStartFixesReplicationData(t *testing.T) {
 	defer cancel()
 	cell := "cell1"
 	ts := memorytopo.NewServer(ctx, cell, "cell2")
-	tm := newTestTM(t, ts, 1, "ks", "0")
+	tm := newTestTM(t, ts, 1, "ks", "0", nil)
 	defer tm.Stop()
 	tabletAlias := tm.tabletAlias
 
@@ -505,14 +506,14 @@ func TestStartDoesNotUpdateReplicationDataForTabletInWrongShard(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	ts := memorytopo.NewServer(ctx, "cell1", "cell2")
-	tm := newTestTM(t, ts, 1, "ks", "0")
+	tm := newTestTM(t, ts, 1, "ks", "0", nil)
 	tm.Stop()
 
 	tabletAliases, err := ts.FindAllTabletAliasesInShard(ctx, "ks", "0")
 	require.NoError(t, err)
 	assert.Equal(t, uint32(1), tabletAliases[0].Uid)
 
-	tablet := newTestTablet(t, 1, "ks", "-d0")
+	tablet := newTestTablet(t, 1, "ks", "-d0", nil)
 	require.NoError(t, err)
 	err = tm.Start(tablet, nil)
 	assert.Contains(t, err.Error(), "existing tablet keyspace and shard ks/0 differ")
@@ -537,7 +538,7 @@ func TestCheckTabletTypeResets(t *testing.T) {
 
 	// 1. Initialize the tablet as REPLICA.
 	// This will create the respective topology records.
-	tm := newTestTM(t, ts, 1, "ks", "0")
+	tm := newTestTM(t, ts, 1, "ks", "0", nil)
 	tablet := tm.Tablet()
 	ensureSrvKeyspace(t, ctx, ts, cell, "ks")
 	ti, err := ts.GetTablet(ctx, alias)
@@ -648,6 +649,27 @@ func TestGetBuildTags(t *testing.T) {
 	}
 }
 
+func TestStartExportStats(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	ts := memorytopo.NewServer(ctx, "cell1")
+	_ = newTestTM(t, ts, 1, "ks", "0", map[string]string{
+		"test": t.Name(),
+	})
+
+	assert.Equal(t, "ks", statsKeyspace.Get())
+	assert.Equal(t, "0", statsShard.Get())
+	assert.Equal(t, "replica", statsTabletType.Get())
+	assert.Equal(t, map[string]int64{
+		"replica": 1,
+	}, statsTabletTypeCount.Counts())
+	assert.Equal(t, "cell1-0000000001", statsAlias.Get())
+	assert.Equal(t, map[string]int64{
+		"test." + t.Name(): 1,
+	}, statsTabletTags.Counts())
+}
+
 func newTestMysqlDaemon(t *testing.T, port int32) *mysqlctl.FakeMysqlDaemon {
 	t.Helper()
 
@@ -662,15 +684,25 @@ func newTestMysqlDaemon(t *testing.T, port int32) *mysqlctl.FakeMysqlDaemon {
 	return mysqld
 }
 
-func newTestTM(t *testing.T, ts *topo.Server, uid int, keyspace, shard string) *TabletManager {
+var (
+	exporter = servenv.NewExporter("TestTabletManager", "")
+)
+
+func newTestTM(t *testing.T, ts *topo.Server, uid int, keyspace, shard string, tags map[string]string) *TabletManager {
+	// reset stats
+	statsTabletTags.ResetAll()
+	statsTabletTypeCount.ResetAll()
+
 	t.Helper()
 	ctx := context.Background()
-	tablet := newTestTablet(t, uid, keyspace, shard)
+	tablet := newTestTablet(t, uid, keyspace, shard, tags)
+	fakeDb := newTestMysqlDaemon(t, 1)
 	tm := &TabletManager{
 		BatchCtx:            ctx,
 		TopoServer:          ts,
-		MysqlDaemon:         newTestMysqlDaemon(t, 1),
+		MysqlDaemon:         fakeDb,
 		DBConfigs:           &dbconfigs.DBConfigs{},
+		SemiSyncMonitor:     semisyncmonitor.CreateTestSemiSyncMonitor(fakeDb.DB(), exporter),
 		QueryServiceControl: tabletservermock.NewController(),
 	}
 	err := tm.Start(tablet, nil)
@@ -701,7 +733,7 @@ func newTestTM(t *testing.T, ts *topo.Server, uid int, keyspace, shard string) *
 	}
 }
 
-func newTestTablet(t *testing.T, uid int, keyspace, shard string) *topodatapb.Tablet {
+func newTestTablet(t *testing.T, uid int, keyspace, shard string, tags map[string]string) *topodatapb.Tablet {
 	shard, keyRange, err := topo.ValidateShardName(shard)
 	require.NoError(t, err)
 	return &topodatapb.Tablet{
@@ -718,6 +750,7 @@ func newTestTablet(t *testing.T, uid int, keyspace, shard string) *topodatapb.Ta
 		Shard:    shard,
 		KeyRange: keyRange,
 		Type:     topodatapb.TabletType_REPLICA,
+		Tags:     tags,
 	}
 }
 

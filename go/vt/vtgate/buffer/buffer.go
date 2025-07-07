@@ -94,6 +94,18 @@ func CausedByFailover(err error) bool {
 	return isFailover
 }
 
+// isErrorDueToReparenting is a stronger check than CausedByFailover, meant to return
+// if the failure is caused because of a reparent.
+func isErrorDueToReparenting(err error) bool {
+	if vterrors.Code(err) != vtrpcpb.Code_CLUSTER_EVENT {
+		return false
+	}
+	if strings.Contains(err.Error(), ClusterEventReshardingInProgress) {
+		return false
+	}
+	return true
+}
+
 // for debugging purposes
 func getReason(err error) string {
 	for _, ce := range ClusterEvents {
@@ -135,7 +147,7 @@ type Buffer struct {
 	config *Config
 
 	// bufferSizeSema limits how many requests can be buffered
-	// ("-buffer_size") and is shared by all shardBuffer instances.
+	// ("-buffer-size") and is shared by all shardBuffer instances.
 	bufferSizeSema *semaphore.Weighted
 	bufferSize     int
 
@@ -144,7 +156,7 @@ type Buffer struct {
 	// - 1. Requests which may buffer (RLock, can be run in parallel)
 	// - 2. Request which starts buffering (based on the seen error)
 	// - 3. HealthCheck subscriber ("StatsUpdate") which stops buffering
-	// - 4. Timer which may stop buffering after -buffer_max_failover_duration
+	// - 4. Timer which may stop buffering after -buffer-max-failover-duration
 	mu sync.RWMutex
 	// buffers holds a shardBuffer object per shard, even if no failover is in
 	// progress.
@@ -175,7 +187,7 @@ func (b *Buffer) GetConfig() *Config {
 // It returns an error if buffering failed (e.g. buffer full).
 // If it does not return an error, it may return a RetryDoneFunc which must be
 // called after the request was retried.
-func (b *Buffer) WaitForFailoverEnd(ctx context.Context, keyspace, shard string, err error) (RetryDoneFunc, error) {
+func (b *Buffer) WaitForFailoverEnd(ctx context.Context, keyspace, shard string, kev *discovery.KeyspaceEventWatcher, err error) (RetryDoneFunc, error) {
 	// If an err is given, it must be related to a failover.
 	// We never buffer requests with other errors.
 	if err != nil && !CausedByFailover(err) {
@@ -192,10 +204,11 @@ func (b *Buffer) WaitForFailoverEnd(ctx context.Context, keyspace, shard string,
 		requestsSkipped.Add([]string{keyspace, shard, skippedDisabled}, 1)
 		return nil, nil
 	}
-	return sb.waitForFailoverEnd(ctx, keyspace, shard, err)
+	return sb.waitForFailoverEnd(ctx, keyspace, shard, kev, err)
 }
 
 func (b *Buffer) HandleKeyspaceEvent(ksevent *discovery.KeyspaceEvent) {
+	log.Infof("Keyspace Event received for keyspace %v", ksevent.Keyspace)
 	for _, shard := range ksevent.Shards {
 		sb := b.getOrCreateBuffer(shard.Target.Keyspace, shard.Target.Shard)
 		if sb != nil {

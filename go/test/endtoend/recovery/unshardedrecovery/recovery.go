@@ -33,6 +33,7 @@ import (
 	"vitess.io/vitess/go/test/endtoend/recovery"
 	"vitess.io/vitess/go/test/endtoend/utils"
 	"vitess.io/vitess/go/vt/log"
+	vtutils "vitess.io/vitess/go/vt/utils"
 	"vitess.io/vitess/go/vt/vtgate/vtgateconn"
 )
 
@@ -51,10 +52,10 @@ var (
 	dbCredentialFile string
 	shardName        = "0"
 	commonTabletArg  = []string{
-		"--vreplication_retry_delay", "1s",
-		"--degraded_threshold", "5s",
-		"--lock_tables_timeout", "5s",
-		"--watch_replication_stream",
+		"--vreplication-retry-delay", "1s",
+		vtutils.GetFlagVariantForTests("--degraded-threshold"), "5s",
+		vtutils.GetFlagVariantForTests("--lock-tables-timeout"), "5s",
+		vtutils.GetFlagVariantForTests("--watch-replication-stream"),
 		"--serving_state_grace_period", "1s"}
 	recoveryKS1  = "recovery_ks1"
 	recoveryKS2  = "recovery_ks2"
@@ -72,7 +73,6 @@ var (
 
 // TestMainImpl creates cluster for unsharded recovery testing.
 func TestMainImpl(m *testing.M) {
-	defer cluster.PanicHandler(nil)
 	flag.Parse()
 
 	exitCode, err := func() (int, error) {
@@ -159,7 +159,7 @@ func TestMainImpl(m *testing.M) {
 			}
 		}
 
-		vtctldClientProcess := cluster.VtctldClientProcessInstance("localhost", localCluster.VtctldProcess.GrpcPort, localCluster.TmpDirectory)
+		vtctldClientProcess := cluster.VtctldClientProcessInstance(localCluster.VtctldProcess.GrpcPort, localCluster.TopoPort, "localhost", localCluster.TmpDirectory)
 		_, err = vtctldClientProcess.ExecuteCommandWithOutput("SetKeyspaceDurabilityPolicy", keyspaceName, "--durability-policy=semi_sync")
 		if err != nil {
 			return 1, err
@@ -201,7 +201,6 @@ func TestMainImpl(m *testing.M) {
 //
 // 7. check that vtgate queries work correctly
 func TestRecoveryImpl(t *testing.T) {
-	defer cluster.PanicHandler(t)
 	defer tabletsTeardown()
 	verifyInitialReplication(t)
 

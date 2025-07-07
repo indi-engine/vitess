@@ -23,6 +23,7 @@ grpc_port=15999
 
 echo "Starting vtctld..."
 # shellcheck disable=SC2086
+#TODO: Remove underscore(_) flags in v25, replace them with dashed(-) notation
 vtctld \
  $TOPOLOGY_FLAGS \
  --cell $cell \
@@ -33,7 +34,10 @@ vtctld \
  --port $vtctld_web_port \
  --grpc_port $grpc_port \
  --pid_file $VTDATAROOT/tmp/vtctld.pid \
+ --pprof-http \
   > $VTDATAROOT/tmp/vtctld.out 2>&1 &
+
+echo "Curling \"http://${hostname}:${vtctld_web_port}/debug/status\" to check if vtctld is up"
 
 for _ in {0..300}; do
  curl -I "http://${hostname}:${vtctld_web_port}/debug/status" &>/dev/null && break

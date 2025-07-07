@@ -29,6 +29,7 @@ import (
 	"vitess.io/vitess/go/test/endtoend/cluster"
 	"vitess.io/vitess/go/test/endtoend/encryption"
 	"vitess.io/vitess/go/vt/log"
+	"vitess.io/vitess/go/vt/utils"
 )
 
 var (
@@ -42,7 +43,6 @@ var (
 
 // This test makes sure that we can use SSL replication with Vitess
 func TestSecure(t *testing.T) {
-	defer cluster.PanicHandler(t)
 	testReplicationBase(t, true)
 	testReplicationBase(t, false)
 }
@@ -61,10 +61,11 @@ func testReplicationBase(t *testing.T, isClientCertPassed bool) {
 	replicaTablet := *clusterInstance.Keyspaces[0].Shards[0].Vttablets[1]
 
 	if isClientCertPassed {
-		replicaTablet.VttabletProcess.ExtraArgs = append(replicaTablet.VttabletProcess.ExtraArgs, "--db_flags", "2048",
-			"--db_ssl_ca", path.Join(certDirectory, "ca-cert.pem"),
-			"--db_ssl_cert", path.Join(certDirectory, "client-cert.pem"),
-			"--db_ssl_key", path.Join(certDirectory, "client-key.pem"),
+		replicaTablet.VttabletProcess.ExtraArgs = append(replicaTablet.VttabletProcess.ExtraArgs,
+			utils.GetFlagVariantForTests("--db-flags"), "2048",
+			utils.GetFlagVariantForTests("--db-ssl-ca"), path.Join(certDirectory, "ca-cert.pem"),
+			utils.GetFlagVariantForTests("--db-ssl-cert"), path.Join(certDirectory, "client-cert.pem"),
+			"--db-ssl-key", path.Join(certDirectory, "client-key.pem"),
 		)
 	}
 
@@ -131,7 +132,7 @@ func initializeCluster(t *testing.T) (int, error) {
 	for _, keyspaceStr := range []string{keyspace} {
 		KeyspacePtr := &cluster.Keyspace{Name: keyspaceStr}
 		keyspace := *KeyspacePtr
-		if err := clusterInstance.VtctlProcess.CreateKeyspace(keyspace.Name, sidecar.DefaultName, ""); err != nil {
+		if err := clusterInstance.VtctldClientProcess.CreateKeyspace(keyspace.Name, sidecar.DefaultName, ""); err != nil {
 			return 1, err
 		}
 		shard := &cluster.Shard{

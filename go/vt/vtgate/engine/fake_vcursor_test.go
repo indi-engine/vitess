@@ -61,6 +61,10 @@ type noopVCursor struct {
 	inTx bool
 }
 
+func (t *noopVCursor) GetExecutionMetrics() *Metrics {
+	panic("implement me")
+}
+
 func (t *noopVCursor) SetExecQueryTimeout(timeout *int) {
 	panic("implement me")
 }
@@ -164,7 +168,7 @@ func (t *noopVCursor) Environment() *vtenv.Environment {
 }
 
 func (t *noopVCursor) TimeZone() *time.Location {
-	return nil
+	return time.Local
 }
 
 func (t *noopVCursor) SQLMode() string {
@@ -263,11 +267,15 @@ func (t *noopVCursor) SetFoundRows(u uint64) {
 	panic("implement me")
 }
 
+func (t *noopVCursor) SetInDMLExecution(inDMLExec bool) {
+	panic("implement me")
+}
+
 func (t *noopVCursor) InTransactionAndIsDML() bool {
 	panic("implement me")
 }
 
-func (t *noopVCursor) FindRoutedTable(sqlparser.TableName) (*vindexes.Table, error) {
+func (t *noopVCursor) FindRoutedTable(sqlparser.TableName) (*vindexes.BaseTable, error) {
 	panic("implement me")
 }
 
@@ -368,7 +376,7 @@ func (t *noopVCursor) Execute(ctx context.Context, method string, query string, 
 	panic("unimplemented")
 }
 
-func (t *noopVCursor) ExecuteMultiShard(ctx context.Context, primitive Primitive, rss []*srvtopo.ResolvedShard, queries []*querypb.BoundQuery, rollbackOnError, canAutocommit bool) (*sqltypes.Result, []error) {
+func (t *noopVCursor) ExecuteMultiShard(ctx context.Context, primitive Primitive, rss []*srvtopo.ResolvedShard, queries []*querypb.BoundQuery, rollbackOnError, canAutocommit, fetchLastInsertID bool) (*sqltypes.Result, []error) {
 	panic("unimplemented")
 }
 
@@ -376,11 +384,11 @@ func (t *noopVCursor) AutocommitApproval() bool {
 	panic("unimplemented")
 }
 
-func (t *noopVCursor) ExecuteStandalone(ctx context.Context, primitive Primitive, query string, bindvars map[string]*querypb.BindVariable, rs *srvtopo.ResolvedShard) (*sqltypes.Result, error) {
+func (t *noopVCursor) ExecuteStandalone(ctx context.Context, primitive Primitive, query string, bindvars map[string]*querypb.BindVariable, rs *srvtopo.ResolvedShard, fetchLastInsertID bool) (*sqltypes.Result, error) {
 	panic("unimplemented")
 }
 
-func (t *noopVCursor) StreamExecuteMulti(ctx context.Context, primitive Primitive, query string, rss []*srvtopo.ResolvedShard, bindVars []map[string]*querypb.BindVariable, rollbackOnError bool, autocommit bool, callback func(reply *sqltypes.Result) error) []error {
+func (t *noopVCursor) StreamExecuteMulti(ctx context.Context, primitive Primitive, query string, rss []*srvtopo.ResolvedShard, bindVars []map[string]*querypb.BindVariable, rollbackOnError, autocommit, fetchLastInsertID bool, callback func(reply *sqltypes.Result) error) []error {
 	panic("unimplemented")
 }
 
@@ -388,16 +396,30 @@ func (t *noopVCursor) ExecuteKeyspaceID(ctx context.Context, keyspace string, ks
 	panic("unimplemented")
 }
 
-func (t *noopVCursor) ResolveDestinations(ctx context.Context, keyspace string, ids []*querypb.Value, destinations []key.Destination) ([]*srvtopo.ResolvedShard, [][]*querypb.Value, error) {
+func (t *noopVCursor) ResolveDestinations(ctx context.Context, keyspace string, ids []*querypb.Value, destinations []key.ShardDestination) ([]*srvtopo.ResolvedShard, [][]*querypb.Value, error) {
 	return nil, nil, nil
 }
 
-func (t *noopVCursor) ResolveDestinationsMultiCol(ctx context.Context, keyspace string, ids [][]sqltypes.Value, destinations []key.Destination) ([]*srvtopo.ResolvedShard, [][][]sqltypes.Value, error) {
+func (t *noopVCursor) ResolveDestinationsMultiCol(ctx context.Context, keyspace string, ids [][]sqltypes.Value, destinations []key.ShardDestination) ([]*srvtopo.ResolvedShard, [][][]sqltypes.Value, error) {
 	panic("unimplemented")
 }
 
 func (t *noopVCursor) GetDBDDLPluginName() string {
 	panic("unimplemented")
+}
+
+func (t *noopVCursor) SetLastInsertID(uint64) {}
+func (t *noopVCursor) VExplainLogging()       {}
+func (t *noopVCursor) DisableLogging()        {}
+func (t *noopVCursor) GetVExplainLogs() []ExecuteEntry {
+	return nil
+}
+func (t *noopVCursor) GetLogs() ([]ExecuteEntry, error) {
+	return nil, nil
+}
+
+// RecordMirrorStats implements VCursor.
+func (t *noopVCursor) RecordMirrorStats(sourceExecTime, targetExecTime time.Duration, targetErr error) {
 }
 
 var (
@@ -445,9 +467,16 @@ type loggingVCursor struct {
 
 	parser *sqlparser.Parser
 
-	handleMirrorClonesFn   func(context.Context) VCursor
+	onMirrorClonesFn       func(context.Context) VCursor
 	onExecuteMultiShardFn  func(context.Context, Primitive, []*srvtopo.ResolvedShard, []*querypb.BoundQuery, bool, bool)
 	onStreamExecuteMultiFn func(context.Context, Primitive, string, []*srvtopo.ResolvedShard, []map[string]*querypb.BindVariable, bool, bool, func(*sqltypes.Result) error)
+	onRecordMirrorStatsFn  func(time.Duration, time.Duration, error)
+
+	metrics *Metrics
+}
+
+func (f *loggingVCursor) GetExecutionMetrics() *Metrics {
+	return f.metrics
 }
 
 func (f *loggingVCursor) HasCreatedTempTable() {
@@ -465,7 +494,7 @@ func (f *loggingVCursor) GetUDV(key string) *querypb.BindVariable {
 }
 
 type tableRoutes struct {
-	tbl *vindexes.Table
+	tbl *vindexes.BaseTable
 }
 
 func (f *loggingVCursor) ExecutePrimitive(ctx context.Context, primitive Primitive, bindVars map[string]*querypb.BindVariable, wantfields bool) (*sqltypes.Result, error) {
@@ -498,6 +527,10 @@ func (f *loggingVCursor) GetSystemVariables(func(k string, v string)) {
 
 func (f *loggingVCursor) SetFoundRows(u uint64) {
 	panic("implement me")
+}
+
+func (f *loggingVCursor) SetInDMLExecution(inDMLExec bool) {
+	f.log = append(f.log, fmt.Sprintf("InDMLExecution set to %v", inDMLExec))
 }
 
 func (f *loggingVCursor) InTransactionAndIsDML() bool {
@@ -564,8 +597,8 @@ func (f *loggingVCursor) CloneForReplicaWarming(ctx context.Context) VCursor {
 }
 
 func (f *loggingVCursor) CloneForMirroring(ctx context.Context) VCursor {
-	if f.handleMirrorClonesFn != nil {
-		return f.handleMirrorClonesFn(ctx)
+	if f.onMirrorClonesFn != nil {
+		return f.onMirrorClonesFn(ctx)
 	}
 	panic("no mirror clones available")
 }
@@ -582,11 +615,11 @@ func (f *loggingVCursor) Execute(ctx context.Context, method string, query strin
 	case vtgatepb.CommitOrder_AUTOCOMMIT:
 		name = "ExecuteAutocommit"
 	}
-	f.log = append(f.log, fmt.Sprintf("%s %s %v %v", name, query, printBindVars(bindvars), rollbackOnError))
+	f.log = append(f.log, fmt.Sprintf("%s %s %v %v", name, query, deprecatedPrintBindVars(bindvars), rollbackOnError))
 	return f.nextResult()
 }
 
-func (f *loggingVCursor) ExecuteMultiShard(ctx context.Context, primitive Primitive, rss []*srvtopo.ResolvedShard, queries []*querypb.BoundQuery, rollbackOnError, canAutocommit bool) (*sqltypes.Result, []error) {
+func (f *loggingVCursor) ExecuteMultiShard(ctx context.Context, primitive Primitive, rss []*srvtopo.ResolvedShard, queries []*querypb.BoundQuery, rollbackOnError, canAutocommit, fetchLastInsertID bool) (*sqltypes.Result, []error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.log = append(f.log, fmt.Sprintf("ExecuteMultiShard %v%v %v", printResolvedShardQueries(rss, queries), rollbackOnError, canAutocommit))
@@ -605,12 +638,12 @@ func (f *loggingVCursor) AutocommitApproval() bool {
 	return true
 }
 
-func (f *loggingVCursor) ExecuteStandalone(ctx context.Context, primitive Primitive, query string, bindvars map[string]*querypb.BindVariable, rs *srvtopo.ResolvedShard) (*sqltypes.Result, error) {
-	f.log = append(f.log, fmt.Sprintf("ExecuteStandalone %s %v %s %s", query, printBindVars(bindvars), rs.Target.Keyspace, rs.Target.Shard))
+func (f *loggingVCursor) ExecuteStandalone(ctx context.Context, _ Primitive, query string, bindvars map[string]*querypb.BindVariable, rs *srvtopo.ResolvedShard, fetchLastInsertID bool) (*sqltypes.Result, error) {
+	f.log = append(f.log, fmt.Sprintf("ExecuteStandalone %s %v %s %s", query, deprecatedPrintBindVars(bindvars), rs.Target.Keyspace, rs.Target.Shard))
 	return f.nextResult()
 }
 
-func (f *loggingVCursor) StreamExecuteMulti(ctx context.Context, primitive Primitive, query string, rss []*srvtopo.ResolvedShard, bindVars []map[string]*querypb.BindVariable, rollbackOnError bool, autocommit bool, callback func(reply *sqltypes.Result) error) []error {
+func (f *loggingVCursor) StreamExecuteMulti(ctx context.Context, primitive Primitive, query string, rss []*srvtopo.ResolvedShard, bindVars []map[string]*querypb.BindVariable, rollbackOnError, autocommit, fetchLastInsertID bool, callback func(reply *sqltypes.Result) error) []error {
 	f.mu.Lock()
 	f.log = append(f.log, fmt.Sprintf("StreamExecuteMulti %s %s", query, printResolvedShardsBindVars(rss, bindVars)))
 	if f.onStreamExecuteMultiFn != nil {
@@ -625,7 +658,7 @@ func (f *loggingVCursor) StreamExecuteMulti(ctx context.Context, primitive Primi
 	return []error{callback(r)}
 }
 
-func (f *loggingVCursor) ResolveDestinations(ctx context.Context, keyspace string, ids []*querypb.Value, destinations []key.Destination) ([]*srvtopo.ResolvedShard, [][]*querypb.Value, error) {
+func (f *loggingVCursor) ResolveDestinations(ctx context.Context, keyspace string, ids []*querypb.Value, destinations []key.ShardDestination) ([]*srvtopo.ResolvedShard, [][]*querypb.Value, error) {
 	f.log = append(f.log, fmt.Sprintf("ResolveDestinations %v %v %v", keyspace, ids, key.DestinationsString(destinations)))
 	if f.shardErr != nil {
 		return nil, nil, f.shardErr
@@ -698,7 +731,7 @@ func (f *loggingVCursor) ResolveDestinations(ctx context.Context, keyspace strin
 	return rss, values, nil
 }
 
-func (f *loggingVCursor) ResolveDestinationsMultiCol(ctx context.Context, keyspace string, ids [][]sqltypes.Value, destinations []key.Destination) ([]*srvtopo.ResolvedShard, [][][]sqltypes.Value, error) {
+func (f *loggingVCursor) ResolveDestinationsMultiCol(ctx context.Context, keyspace string, ids [][]sqltypes.Value, destinations []key.ShardDestination) ([]*srvtopo.ResolvedShard, [][][]sqltypes.Value, error) {
 	f.log = append(f.log, fmt.Sprintf("ResolveDestinationsMultiCol %v %v %v", keyspace, ids, key.DestinationsString(destinations)))
 	if f.shardErr != nil {
 		return nil, nil, f.shardErr
@@ -830,7 +863,7 @@ func (f *loggingVCursor) SetPriority(string) {
 	panic("implement me")
 }
 
-func (f *loggingVCursor) FindRoutedTable(tbl sqlparser.TableName) (*vindexes.Table, error) {
+func (f *loggingVCursor) FindRoutedTable(tbl sqlparser.TableName) (*vindexes.BaseTable, error) {
 	f.log = append(f.log, fmt.Sprintf("FindTable(%s)", sqlparser.String(tbl)))
 	return f.tableRoutes.tbl, nil
 }
@@ -886,14 +919,10 @@ func (t *loggingVCursor) SQLParser() *sqlparser.Parser {
 	return t.parser
 }
 
-func (t *noopVCursor) VExplainLogging() {}
-func (t *noopVCursor) DisableLogging()  {}
-func (t *noopVCursor) GetVExplainLogs() []ExecuteEntry {
-	return nil
-}
-
-func (t *noopVCursor) GetLogs() ([]ExecuteEntry, error) {
-	return nil, nil
+func (t *loggingVCursor) RecordMirrorStats(sourceExecTime, targetExecTime time.Duration, targetErr error) {
+	if t.onRecordMirrorStatsFn != nil {
+		t.onRecordMirrorStatsFn(sourceExecTime, targetExecTime, targetErr)
+	}
 }
 
 func expectResult(t *testing.T, result, want *sqltypes.Result) {
@@ -932,7 +961,9 @@ func expectResultAnyOrder(t *testing.T, result, want *sqltypes.Result) {
 	}
 }
 
-func printBindVars(bindvars map[string]*querypb.BindVariable) string {
+// deprecatedPrintBindVars does not print bind variables, specifically tuples, correctly.
+// We should use printBindVars instead.
+func deprecatedPrintBindVars(bindvars map[string]*querypb.BindVariable) string {
 	var keys []string
 	for k := range bindvars {
 		keys = append(keys, k)
@@ -948,10 +979,47 @@ func printBindVars(bindvars map[string]*querypb.BindVariable) string {
 	return buf.String()
 }
 
+func printBindVars(bindvars map[string]*querypb.BindVariable) string {
+	var keys []string
+	for k := range bindvars {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+	buf := &bytes.Buffer{}
+	for i, k := range keys {
+		if i > 0 {
+			fmt.Fprintf(buf, " ")
+		}
+
+		if bindvars[k].Type == querypb.Type_TUPLE {
+			fmt.Fprintf(buf, "%s: [", k)
+			for _, val := range bindvars[k].Values {
+				if val.Type != querypb.Type_TUPLE {
+					fmt.Fprintf(buf, "[%s]", val.String())
+					continue
+				}
+				var s []string
+				v := sqltypes.ProtoToValue(val)
+				err := v.ForEachValue(func(bv sqltypes.Value) {
+					s = append(s, bv.String())
+				})
+				if err != nil {
+					panic(err)
+				}
+				fmt.Fprintf(buf, "[%s]", strings.Join(s, " "))
+			}
+			fmt.Fprintf(buf, "]")
+			continue
+		}
+		fmt.Fprintf(buf, "%s: %v", k, bindvars[k])
+	}
+	return buf.String()
+}
+
 func printResolvedShardQueries(rss []*srvtopo.ResolvedShard, queries []*querypb.BoundQuery) string {
 	buf := &bytes.Buffer{}
 	for i, rs := range rss {
-		fmt.Fprintf(buf, "%s.%s: %s {%s} ", rs.Target.Keyspace, rs.Target.Shard, queries[i].Sql, printBindVars(queries[i].BindVariables))
+		fmt.Fprintf(buf, "%s.%s: %s {%s} ", rs.Target.Keyspace, rs.Target.Shard, queries[i].Sql, deprecatedPrintBindVars(queries[i].BindVariables))
 	}
 	return buf.String()
 }
@@ -959,7 +1027,7 @@ func printResolvedShardQueries(rss []*srvtopo.ResolvedShard, queries []*querypb.
 func printResolvedShardsBindVars(rss []*srvtopo.ResolvedShard, bvs []map[string]*querypb.BindVariable) string {
 	buf := &bytes.Buffer{}
 	for i, rs := range rss {
-		fmt.Fprintf(buf, "%s.%s: {%v} ", rs.Target.Keyspace, rs.Target.Shard, printBindVars(bvs[i]))
+		fmt.Fprintf(buf, "%s.%s: {%v} ", rs.Target.Keyspace, rs.Target.Shard, deprecatedPrintBindVars(bvs[i]))
 	}
 	return buf.String()
 }

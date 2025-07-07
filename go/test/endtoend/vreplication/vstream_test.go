@@ -22,13 +22,16 @@ import (
 	"io"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
+	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
+	"vitess.io/vitess/go/sets"
 	"vitess.io/vitess/go/vt/log"
-	_ "vitess.io/vitess/go/vt/vtctl/grpcvtctlclient"
+	"vitess.io/vitess/go/vt/utils"
 	_ "vitess.io/vitess/go/vt/vtgate/grpcvtgateconn"
 	"vitess.io/vitess/go/vt/vtgate/vtgateconn"
 
@@ -36,6 +39,166 @@ import (
 	topodatapb "vitess.io/vitess/go/vt/proto/topodata"
 	vtgatepb "vitess.io/vitess/go/vt/proto/vtgate"
 )
+
+func TestVStreamWithTablesToSkipCopyFlag(t *testing.T) {
+	vc = NewVitessCluster(t, nil)
+	defer vc.TearDown()
+
+	require.NotNil(t, vc)
+	defaultReplicas = 2
+	defaultRdonly = 0
+
+	defaultCell := vc.Cells[vc.CellNames[0]]
+	vc.AddKeyspace(t, []*Cell{defaultCell}, "product", "0", initialProductVSchema, initialProductSchema, defaultReplicas, defaultRdonly, 100, nil)
+	verifyClusterHealth(t, vc)
+
+	ctx := context.Background()
+	vstreamConn, err := vtgateconn.Dial(ctx, fmt.Sprintf("%s:%d", vc.ClusterConfig.hostname, vc.ClusterConfig.vtgateGrpcPort))
+	if err != nil {
+		log.Fatal(err)
+	}
+	defer vstreamConn.Close()
+	vgtid := &binlogdatapb.VGtid{
+		ShardGtids: []*binlogdatapb.ShardGtid{{
+			Keyspace: "product",
+			Shard:    "0",
+			Gtid:     "",
+		}}}
+
+	filter := &binlogdatapb.Filter{
+		Rules: []*binlogdatapb.Rule{
+			{
+				Match:  "customer",
+				Filter: "select * from customer",
+			}, {
+				Match:  "product",
+				Filter: "select * from product",
+			}, {
+				Match:  "merchant",
+				Filter: "select * from merchant",
+			},
+		},
+	}
+	flags := &vtgatepb.VStreamFlags{
+		TablesToCopy: []string{"product", "customer"},
+	}
+	id := 0
+	vtgateConn := vc.GetVTGateConn(t)
+	defer vtgateConn.Close()
+
+	// To test the copy phase, let's insert 10 rows intitally in each table
+	// present in the filter before running the VStream.
+	for range 10 {
+		id++
+		execVtgateQuery(t, vtgateConn, "product", fmt.Sprintf("insert into customer (cid, name) values (%d, 'customer%d')", id+100, id))
+		execVtgateQuery(t, vtgateConn, "product", fmt.Sprintf("insert into product (pid, description) values (%d, 'description%d')", id+100, id))
+		execVtgateQuery(t, vtgateConn, "product", fmt.Sprintf("insert into merchant (mname, category) values ('mname%d', 'category%d')", id+100, id))
+	}
+
+	// Stream events from the VStream API
+	reader, err := vstreamConn.VStream(ctx, topodatapb.TabletType_PRIMARY, vgtid, filter, flags)
+	require.NoError(t, err)
+	var numRowEvents int64
+
+	copyPhaseCompleted := atomic.Bool{}
+	copyPhaseCompleted.Store(false)
+
+	done := atomic.Bool{}
+	done.Store(false)
+
+	copiedTables := make(sets.Set[string])
+	// Start reading events from the VStream.
+	go func() {
+		for {
+			evs, err := reader.Recv()
+			switch err {
+			case nil:
+				for _, ev := range evs {
+					if ev.Type == binlogdatapb.VEventType_ROW {
+						if !copyPhaseCompleted.Load() {
+							escapedTableNameParts := strings.Split(ev.RowEvent.TableName, ".")
+							require.Len(t, escapedTableNameParts, 2)
+							copiedTables.Insert(escapedTableNameParts[1])
+						}
+						numRowEvents++
+					}
+					if ev.Type == binlogdatapb.VEventType_COPY_COMPLETED {
+						copyPhaseCompleted.Store(true)
+					}
+				}
+			case io.EOF:
+				log.Infof("Stream Ended")
+			default:
+				log.Infof("%s:: remote error: %v", time.Now(), err)
+			}
+
+			if done.Load() {
+				return
+			}
+		}
+	}()
+
+	// Wait for copy phase to complete.
+	ticker := time.NewTicker(100 * time.Millisecond)
+	for {
+		<-ticker.C
+		if copyPhaseCompleted.Load() {
+			break
+		}
+	}
+
+	stopInserting := atomic.Bool{}
+	stopInserting.Store(false)
+	var insertMu sync.Mutex
+	go func() {
+		for {
+			if stopInserting.Load() {
+				return
+			}
+			insertMu.Lock()
+			id++
+			execVtgateQuery(t, vtgateConn, "product", fmt.Sprintf("insert into customer (cid, name) values (%d, 'customer%d')", id+100, id))
+			execVtgateQuery(t, vtgateConn, "product", fmt.Sprintf("insert into product (pid, description) values (%d, 'description%d')", id+100, id))
+			execVtgateQuery(t, vtgateConn, "product", fmt.Sprintf("insert into merchant (mname, category) values ('mname%d', 'category%d')", id+100, id))
+			insertMu.Unlock()
+		}
+	}()
+
+	time.Sleep(100 * time.Millisecond)
+	stopInserting.Store(true)
+	time.Sleep(10 * time.Second) // Give the vstream plenty of time to catchup
+	done.Store(true)
+
+	qr1 := execVtgateQuery(t, vtgateConn, "product", "select count(*) from customer")
+	qr2 := execVtgateQuery(t, vtgateConn, "product", "select count(*) from product")
+	qr3 := execVtgateQuery(t, vtgateConn, "product", "select count(*) from merchant")
+	require.NotNil(t, qr1)
+	require.NotNil(t, qr2)
+	require.NotNil(t, qr3)
+
+	// Total number of rows.
+	insertedRows1, err := qr1.Rows[0][0].ToCastInt64()
+	require.NoError(t, err)
+	require.NotZero(t, insertedRows1)
+	insertedRows2, err := qr2.Rows[0][0].ToCastInt64()
+	require.NoError(t, err)
+	require.NotZero(t, insertedRows2)
+	insertedRows3, err := qr3.Rows[0][0].ToCastInt64()
+	require.NoError(t, err)
+	require.NotZero(t, insertedRows3)
+
+	assert.Len(t, copiedTables, 2)
+	for _, expectedCopiedTableName := range flags.TablesToCopy {
+		assert.Truef(t, copiedTables.Has(expectedCopiedTableName), "expected table %s to be copied", expectedCopiedTableName)
+	}
+	// We don't expect merchant table to be part of copy phase.
+	assert.False(t, copiedTables.Has("merchant"), "expected table merchant not to be copied")
+
+	// Since we don't expect merchant table to be part of copy phase, we can
+	// subtract 10 from the total rows found in the 3 tables.
+	wantTotalRows := insertedRows1 + insertedRows2 + insertedRows3 - 10
+	assert.Equal(t, wantTotalRows, numRowEvents)
+}
 
 // Validates that we have a working VStream API
 // If Failover is enabled:
@@ -77,11 +240,13 @@ func testVStreamWithFailover(t *testing.T, failover bool) {
 		}},
 	}
 	flags := &vtgatepb.VStreamFlags{HeartbeatInterval: 3600}
-	done := false
+	done := atomic.Bool{}
+	done.Store(false)
 
 	// don't insert while PRS is going on
 	var insertMu sync.Mutex
-	stopInserting := false
+	stopInserting := atomic.Bool{}
+	stopInserting.Store(false)
 	id := 0
 
 	vtgateConn := vc.GetVTGateConn(t)
@@ -90,7 +255,7 @@ func testVStreamWithFailover(t *testing.T, failover bool) {
 	// first goroutine that keeps inserting rows into table being streamed until some time elapses after second PRS
 	go func() {
 		for {
-			if stopInserting {
+			if stopInserting.Load() {
 				return
 			}
 			insertMu.Lock()
@@ -122,7 +287,7 @@ func testVStreamWithFailover(t *testing.T, failover bool) {
 				log.Infof("%s:: remote error: %v", time.Now(), err)
 			}
 
-			if done {
+			if done.Load() {
 				return
 			}
 		}
@@ -140,7 +305,7 @@ func testVStreamWithFailover(t *testing.T, failover bool) {
 		case 1:
 			if failover {
 				insertMu.Lock()
-				output, err := vc.VtctlClient.ExecuteCommandWithOutput("PlannedReparentShard", "--", "--keyspace_shard=product/0", "--new_primary=zone1-101")
+				output, err := vc.VtctldClient.ExecuteCommandWithOutput("PlannedReparentShard", "product/0", "--new-primary=zone1-101")
 				insertMu.Unlock()
 				log.Infof("output of first PRS is %s", output)
 				require.NoError(t, err)
@@ -148,18 +313,18 @@ func testVStreamWithFailover(t *testing.T, failover bool) {
 		case 2:
 			if failover {
 				insertMu.Lock()
-				output, err := vc.VtctlClient.ExecuteCommandWithOutput("PlannedReparentShard", "--", "--keyspace_shard=product/0", "--new_primary=zone1-100")
+				output, err := vc.VtctldClient.ExecuteCommandWithOutput("PlannedReparentShard", "product/0", "--new-primary=zone1-100")
 				insertMu.Unlock()
 				log.Infof("output of second PRS is %s", output)
 				require.NoError(t, err)
 			}
 			time.Sleep(100 * time.Millisecond)
-			stopInserting = true
-			time.Sleep(2 * time.Second)
-			done = true
+			stopInserting.Store(true)
+			time.Sleep(10 * time.Second) // Give the vstream plenty of time to catchup
+			done.Store(true)
 		}
 
-		if done {
+		if done.Load() {
 			break
 		}
 	}
@@ -655,6 +820,8 @@ func TestMultiVStreamsKeyspaceReshard(t *testing.T) {
 	// Confirm that we have shard GTIDs for the global shard and the old/original shards.
 	require.Len(t, newVGTID.GetShardGtids(), 3)
 
+	waitForWorkflowState(t, vc, fmt.Sprintf("%s.%s", ks, wf), binlogdatapb.VReplicationWorkflowState_Running.String())
+
 	// Switch the traffic to the new shards.
 	reshardAction(t, "SwitchTraffic", wf, ks, oldShards, newShards, defaultCellName, tabletType)
 
@@ -936,7 +1103,7 @@ func TestVStreamStopOnReshardFalse(t *testing.T) {
 
 func TestVStreamWithKeyspacesToWatch(t *testing.T) {
 	extraVTGateArgs = append(extraVTGateArgs, []string{
-		"--keyspaces_to_watch", "product",
+		utils.GetFlagVariantForTests("--keyspaces-to-watch"), "product",
 	}...)
 
 	testVStreamWithFailover(t, false)
@@ -1031,9 +1198,9 @@ func doVStream(t *testing.T, vc *VitessCluster, flags *vtgatepb.VStreamFlags) (n
 func TestVStreamHeartbeats(t *testing.T) {
 	// Enable continuous heartbeats.
 	extraVTTabletArgs = append(extraVTTabletArgs,
-		"--heartbeat_enable",
-		"--heartbeat_interval", "1s",
-		"--heartbeat_on_demand_duration", "0",
+		utils.GetFlagVariantForTests("--heartbeat-enable"),
+		utils.GetFlagVariantForTests("--heartbeat-interval"), "1s",
+		utils.GetFlagVariantForTests("--heartbeat-on-demand-duration"), "0",
 	)
 	setSidecarDBName("_vt")
 	config := *mainClusterConfig
@@ -1088,4 +1255,142 @@ func TestVStreamHeartbeats(t *testing.T) {
 			require.Equal(t, expectedNumRowEvents, gotNumRowEvents)
 		})
 	}
+}
+
+// TestVStreamPushdownFilters confirms that pushdown filters are applied correctly
+// when they are specified in the VStream API via the rule.Filter.
+// It also confirms that we use the proper collation for the VStream filter when
+// using VARCHAR fields.
+func TestVStreamPushdownFilters(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
+	defer cancel()
+	setSidecarDBName("_vt")
+	config := *mainClusterConfig
+	vc = NewVitessCluster(t, &clusterOptions{
+		clusterConfig: &config,
+	})
+	defer vc.TearDown()
+	require.NotNil(t, vc)
+	ks := "product"
+	shard := "0"
+	defaultCell := vc.Cells[vc.CellNames[0]]
+
+	_, err := vc.AddKeyspace(t, []*Cell{defaultCell}, ks, shard, initialProductVSchema, initialProductSchema, 0, 0, 100, nil)
+	require.NoError(t, err)
+	verifyClusterHealth(t, vc)
+	insertInitialData(t)
+
+	vtgateConn := getConnection(t, vc.ClusterConfig.hostname, vc.ClusterConfig.vtgateMySQLPort)
+	defer vtgateConn.Close()
+
+	// Make sure that we get at least one paul row event in the copy phase.
+	_, err = vtgateConn.ExecuteFetch(fmt.Sprintf("insert into %s.customer (name) values ('PAUĹ')", ks), 1, false)
+	require.NoError(t, err)
+	res, err := vtgateConn.ExecuteFetch(fmt.Sprintf("select count(*) from %s.customer where name = 'pauĺ'", ks), 1, false)
+	require.NoError(t, err)
+	require.Len(t, res.Rows, 1)
+	startingPauls, err := res.Rows[0][0].ToInt()
+	require.NoError(t, err)
+
+	// Coordinate go-routines.
+	streamCtx, streamCancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer streamCancel()
+	done := make(chan struct{})
+
+	// First goroutine that keeps inserting rows into the table being streamed until the
+	// stream context is cancelled.
+	createdPauls := startingPauls
+	createdNonPauls := 0
+	go func() {
+		id := 1
+		for {
+			select {
+			case <-streamCtx.Done():
+				// Give the VStream a little catch-up time before telling it to stop
+				// via the done channel.
+				time.Sleep(10 * time.Second)
+				close(done)
+				return
+			default:
+				if id%10 == 0 {
+					_, err := vtgateConn.ExecuteFetch(fmt.Sprintf("insert into %s.customer (name) values ('paÜl')", ks), 1, false)
+					require.NoError(t, err)
+					createdPauls++
+				} else {
+					insertRow(ks, "customer", id)
+					createdNonPauls++
+				}
+				time.Sleep(10 * time.Millisecond)
+				id++
+			}
+		}
+	}()
+
+	vgtid := &binlogdatapb.VGtid{
+		ShardGtids: []*binlogdatapb.ShardGtid{{
+			Keyspace: ks,
+			Shard:    shard,
+			Gtid:     "",
+		}}}
+
+	filter := &binlogdatapb.Filter{
+		Rules: []*binlogdatapb.Rule{{
+			Match:  "customer",
+			Filter: "select * from customer where name = 'påul'",
+		}},
+	}
+	vstreamConn, err := vtgateconn.Dial(ctx, fmt.Sprintf("%s:%d", vc.ClusterConfig.hostname, vc.ClusterConfig.vtgateGrpcPort))
+	require.NoError(t, err)
+	defer vstreamConn.Close()
+
+	// So we should have at least one paul row event in the copy phase, and
+	// we should have many paul row events in the running phase.
+	copyPhaseRowEvents, runningPhaseRowEvents := runVStreamAndGetNumOfRowEvents(t, ctx, vstreamConn, vgtid, filter, done)
+
+	require.NotZero(t, createdPauls)
+	require.NotZero(t, createdNonPauls)
+	require.Greater(t, createdNonPauls, createdPauls)
+	require.NotZero(t, copyPhaseRowEvents)
+	require.NotZero(t, runningPhaseRowEvents)
+
+	t.Logf("Created pauls: %d, pauls copied: %d, pauls replicated: %d", createdPauls, copyPhaseRowEvents, runningPhaseRowEvents)
+	require.Equal(t, createdPauls, copyPhaseRowEvents+runningPhaseRowEvents)
+}
+
+// runVStreamAndGetNumOfRowEvents runs VStream with the specified filter and
+// returns number of copy phase and running phase row events.
+func runVStreamAndGetNumOfRowEvents(t *testing.T, ctx context.Context, vstreamConn *vtgateconn.VTGateConn,
+	vgtid *binlogdatapb.VGtid, filter *binlogdatapb.Filter, done chan struct{}) (copyPhaseRowEvents int, runningPhaseRowEvents int) {
+	copyPhase := true
+	func() {
+		reader, err := vstreamConn.VStream(ctx, topodatapb.TabletType_PRIMARY, vgtid, filter, &vtgatepb.VStreamFlags{})
+		require.NoError(t, err)
+		for {
+			evs, err := reader.Recv()
+
+			switch err {
+			case nil:
+				for _, ev := range evs {
+					switch ev.Type {
+					case binlogdatapb.VEventType_COPY_COMPLETED:
+						copyPhase = false
+					case binlogdatapb.VEventType_ROW:
+						if copyPhase {
+							copyPhaseRowEvents++
+						} else {
+							runningPhaseRowEvents++
+						}
+					}
+				}
+			default:
+				require.FailNow(t, fmt.Sprintf("VStream returned unexpected error: %v", err))
+			}
+			select {
+			case <-done:
+				return
+			default:
+			}
+		}
+	}()
+	return
 }

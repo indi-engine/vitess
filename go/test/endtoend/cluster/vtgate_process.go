@@ -28,10 +28,12 @@ import (
 	"strconv"
 	"strings"
 	"syscall"
+	"testing"
 	"time"
 
 	"vitess.io/vitess/go/vt/log"
 	"vitess.io/vitess/go/vt/mysqlctl"
+
 	"vitess.io/vitess/go/vt/vtgate/planbuilder"
 	"vitess.io/vitess/go/vt/vtgate/planbuilder/plancontext"
 )
@@ -39,9 +41,7 @@ import (
 // VtgateProcess is a generic handle for a running vtgate .
 // It can be spawned manually
 type VtgateProcess struct {
-	Name                  string
-	Binary                string
-	CommonArg             VtctlProcess
+	VtProcess
 	LogDir                string
 	ErrorLog              string
 	FileToLogQueries      string
@@ -57,6 +57,9 @@ type VtgateProcess struct {
 	Directory             string
 	VerifyURL             string
 	VSchemaURL            string
+	QueryPlanURL          string
+	ConfigFile            string
+	Config                VTGateConfiguration
 	SysVarSetEnabled      bool
 	PlannerVersion        plancontext.PlannerVersion
 	// Extra Args to be set before starting the vtgate process
@@ -66,14 +69,91 @@ type VtgateProcess struct {
 	exit chan error
 }
 
+type VTGateConfiguration struct {
+	TransactionMode                   string `json:"transaction_mode,omitempty"`
+	DiscoveryLowReplicationLag        string `json:"discovery_low_replication_lag,omitempty"`
+	DiscoveryHighReplicationLag       string `json:"discovery_high_replication_lag,omitempty"`
+	DiscoveryMinServingVttablets      string `json:"discovery_min_number_serving_vttablets,omitempty"`
+	DiscoveryLegacyReplicationLagAlgo string `json:"discovery_legacy_replication_lag_algorithm"`
+}
+
+// ToJSONString will marshal this configuration as JSON
+func (config *VTGateConfiguration) ToJSONString() string {
+	b, _ := json.MarshalIndent(config, "", "\t")
+	return string(b)
+}
+
+func (vtgate *VtgateProcess) RewriteConfiguration() error {
+	return os.WriteFile(vtgate.ConfigFile, []byte(vtgate.Config.ToJSONString()), 0644)
+}
+
+// WaitForConfig waits for the expectedConfig to be present in the vtgate configuration.
+func (vtgate *VtgateProcess) WaitForConfig(expectedConfig string) error {
+	timeout := time.After(30 * time.Second)
+	var response string
+	for {
+		select {
+		case <-timeout:
+			return fmt.Errorf("timed out waiting for api to work. Last response - %s", response)
+		default:
+			_, response, _ = vtgate.MakeAPICall("/debug/config")
+			if strings.Contains(response, expectedConfig) {
+				return nil
+			}
+			time.Sleep(1 * time.Second)
+		}
+	}
+}
+
+// MakeAPICall makes an API call on the given endpoint of VTOrc
+func (vtgate *VtgateProcess) MakeAPICall(endpoint string) (status int, response string, err error) {
+	url := fmt.Sprintf("http://localhost:%d/%s", vtgate.Port, endpoint)
+	resp, err := http.Get(url)
+	if err != nil {
+		if resp != nil {
+			status = resp.StatusCode
+		}
+		return status, "", err
+	}
+	defer func() {
+		if resp != nil && resp.Body != nil {
+			resp.Body.Close()
+		}
+	}()
+
+	respByte, _ := io.ReadAll(resp.Body)
+	return resp.StatusCode, string(respByte), err
+}
+
+// MakeAPICallRetry is used to make an API call and retries until success
+func (vtgate *VtgateProcess) MakeAPICallRetry(t *testing.T, url string) {
+	t.Helper()
+	timeout := time.After(10 * time.Second)
+	for {
+		select {
+		case <-timeout:
+			t.Fatal("timed out waiting for api to work")
+			return
+		default:
+			status, _, err := vtgate.MakeAPICall(url)
+			if err == nil && status == 200 {
+				return
+			}
+			time.Sleep(1 * time.Second)
+		}
+	}
+}
+
 const defaultVtGatePlannerVersion = planbuilder.Gen4
 
 // Setup starts Vtgate process with required arguements
 func (vtgate *VtgateProcess) Setup() (err error) {
 	args := []string{
-		"--topo_implementation", vtgate.CommonArg.TopoImplementation,
-		"--topo_global_server_address", vtgate.CommonArg.TopoGlobalAddress,
-		"--topo_global_root", vtgate.CommonArg.TopoGlobalRoot,
+		//TODO: Remove underscore(_) flags in v25, replace them with dashed(-) notation
+		"--topo_implementation", vtgate.TopoImplementation,
+		"--topo_global_server_address", vtgate.TopoGlobalAddress,
+		"--topo_global_root", vtgate.TopoGlobalRoot,
+		"--config-file", vtgate.ConfigFile,
 		"--log_dir", vtgate.LogDir,
 		"--log_queries_to_file", vtgate.FileToLogQueries,
 		"--port", fmt.Sprintf("%d", vtgate.Port),
@@ -88,15 +168,30 @@ func (vtgate *VtgateProcess) Setup() (err error) {
 		"--bind-address", "127.0.0.1",
 		"--grpc_bind_address", "127.0.0.1",
 	}
+
 	// If no explicit mysql_server_version has been specified then we autodetect
 	// the MySQL version that will be used for the test and base the vtgate's
 	// mysql server version on that.
 	msvflag := false
 	for _, f := range vtgate.ExtraArgs {
+		// TODO: Replace flag with dashed version in v25
 		if strings.Contains(f, "mysql_server_version") {
 			msvflag = true
 			break
 		}
+	}
+	configFile, err := os.Create(vtgate.ConfigFile)
+	if err != nil {
+		log.Errorf("cannot create config file for vtgate: %v", err)
+		return err
+	}
+	_, err = configFile.WriteString(vtgate.Config.ToJSONString())
+	if err != nil {
+		return err
+	}
+	err = configFile.Close()
+	if err != nil {
+		return err
 	}
 	if !msvflag {
 		version, err := mysqlctl.GetVersionString()
@@ -108,6 +203,7 @@ func (vtgate *VtgateProcess) Setup() (err error) {
 			return err
 		}
 		mysqlvers := fmt.Sprintf("%d.%d.%d-vitess", vers.Major, vers.Minor, vers.Patch)
+		// TODO: Replace flag with dashed version in v25
 		args = append(args, "--mysql_server_version", mysqlvers)
 	}
 	if vtgate.PlannerVersion > 0 {
@@ -132,6 +228,7 @@ func (vtgate *VtgateProcess) Setup() (err error) {
 		return err
 	}
 	vtgate.proc.Stderr = errFile
+	vtgate.ErrorLog = errFile.Name()
 
 	vtgate.proc.Env = append(vtgate.proc.Env, os.Environ()...)
 	vtgate.proc.Env = append(vtgate.proc.Env, DefaultVttestEnv)
@@ -281,11 +378,11 @@ func VtgateProcessInstance(
 	extraArgs []string,
 	plannerVersion plancontext.PlannerVersion,
 ) *VtgateProcess {
-	vtctl := VtctlProcessInstance(topoPort, hostname)
+	base := VtProcessInstance("vtgate", "vtgate", topoPort, hostname)
 	vtgate := &VtgateProcess{
-		Name:                  "vtgate",
-		Binary:                "vtgate",
+		VtProcess:             base,
 		FileToLogQueries:      path.Join(tmpDirectory, "/vtgate_querylog.txt"),
+		ConfigFile:            path.Join(tmpDirectory, fmt.Sprintf("vtgate-config-%d.json", port)),
 		Directory:             os.Getenv("VTDATAROOT"),
 		ServiceMap:            "grpc-tabletmanager,grpc-throttler,grpc-queryservice,grpc-updatestream,grpc-vtctl,grpc-vtgateservice",
 		LogDir:                tmpDirectory,
@@ -296,7 +393,6 @@ func VtgateProcessInstance(
 		Cell:                  cell,
 		CellsToWatch:          cellsToWatch,
 		TabletTypesToWait:     tabletTypesToWait,
-		CommonArg:             *vtctl,
 		MySQLAuthServerImpl:   "none",
 		ExtraArgs:             extraArgs,
 		PlannerVersion:        plannerVersion,
@@ -304,16 +400,17 @@ func VtgateProcessInstance(
 
 	vtgate.VerifyURL = fmt.Sprintf("http://%s:%d/debug/vars", hostname, port)
 	vtgate.VSchemaURL = fmt.Sprintf("http://%s:%d/debug/vschema", hostname, port)
+	vtgate.QueryPlanURL = fmt.Sprintf("http://%s:%d/debug/query_plans", hostname, port)
 
 	return vtgate
 }
 
 // GetVars returns map of vars
-func (vtgate *VtgateProcess) GetVars() (map[string]any, error) {
+func (vtgate *VtgateProcess) GetVars() map[string]any {
 	resultMap := make(map[string]any)
 	resp, err := http.Get(vtgate.VerifyURL)
 	if err != nil {
-		return nil, fmt.Errorf("error getting response from %s", vtgate.VerifyURL)
+		return nil
 	}
 	defer resp.Body.Close()
 
@@ -321,11 +418,11 @@ func (vtgate *VtgateProcess) GetVars() (map[string]any, error) {
 		respByte, _ := io.ReadAll(resp.Body)
 		err := json.Unmarshal(respByte, &resultMap)
 		if err != nil {
-			return nil, fmt.Errorf("not able to parse response body")
+			return nil
 		}
-		return resultMap, nil
+		return resultMap
 	}
-	return nil, fmt.Errorf("unsuccessful response")
+	return nil
 }
 
 // ReadVSchema reads the vschema from the vtgate endpoint for it and returns
@@ -347,4 +444,29 @@ func (vtgate *VtgateProcess) ReadVSchema() (*interface{}, error) {
 		return nil, err
 	}
 	return &results, nil
+}
+
+// ReadQueryPlans reads the query plans from the vtgate endpoint for it and returns
+// a pointer to the interface. To read this query plans, the caller must convert it to a map
+func (vtgate *VtgateProcess) ReadQueryPlans() (map[string]any, error) {
+	httpClient := &http.Client{Timeout: 5 * time.Second}
+	resp, err := httpClient.Get(vtgate.QueryPlanURL)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+	res, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return nil, err
+	}
+	var results any
+	err = json.Unmarshal(res, &results)
+	if err != nil {
+		return nil, err
+	}
+	output, ok := results.(map[string]any)
+	if !ok {
+		return nil, fmt.Errorf("result is not a map")
+	}
+	return output, nil
 }

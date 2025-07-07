@@ -35,6 +35,7 @@ import (
 	"vitess.io/vitess/go/vt/mysqlctl/tmutils"
 	"vitess.io/vitess/go/vt/servenv"
 	"vitess.io/vitess/go/vt/topo/topoproto"
+	"vitess.io/vitess/go/vt/utils"
 	"vitess.io/vitess/go/vt/vttablet/tmclient"
 
 	logutilpb "vitess.io/vitess/go/vt/proto/logutil"
@@ -63,13 +64,13 @@ var (
 	name        string
 )
 
-func registerFlags(fs *pflag.FlagSet) {
-	fs.IntVar(&concurrency, "tablet_manager_grpc_concurrency", concurrency, "concurrency to use to talk to a vttablet server for performance-sensitive RPCs (like ExecuteFetchAs{Dba,App}, CheckThrottler and FullStatus)")
-	fs.StringVar(&cert, "tablet_manager_grpc_cert", cert, "the cert to use to connect")
-	fs.StringVar(&key, "tablet_manager_grpc_key", key, "the key to use to connect")
-	fs.StringVar(&ca, "tablet_manager_grpc_ca", ca, "the server ca to use to validate servers when connecting")
-	fs.StringVar(&crl, "tablet_manager_grpc_crl", crl, "the server crl to use to validate server certificates when connecting")
-	fs.StringVar(&name, "tablet_manager_grpc_server_name", name, "the server name to use to validate server certificate")
+func RegisterFlags(fs *pflag.FlagSet) {
+	utils.SetFlagIntVar(fs, &concurrency, "tablet-manager-grpc-concurrency", concurrency, "concurrency to use to talk to a vttablet server for performance-sensitive RPCs (like ExecuteFetchAs{Dba,App}, CheckThrottler and FullStatus)")
+	utils.SetFlagStringVar(fs, &cert, "tablet-manager-grpc-cert", cert, "the cert to use to connect")
+	utils.SetFlagStringVar(fs, &key, "tablet-manager-grpc-key", key, "the key to use to connect")
+	utils.SetFlagStringVar(fs, &ca, "tablet-manager-grpc-ca", ca, "the server ca to use to validate servers when connecting")
+	utils.SetFlagStringVar(fs, &crl, "tablet-manager-grpc-crl", crl, "the server crl to use to validate server certificates when connecting")
+	utils.SetFlagStringVar(fs, &name, "tablet-manager-grpc-server-name", name, "the server name to use to validate server certificate")
 }
 
 var _binaries = []string{ // binaries that require the flags in this package
@@ -92,7 +93,7 @@ func init() {
 	})
 
 	for _, cmd := range _binaries {
-		servenv.OnParseFor(cmd, registerFlags)
+		servenv.OnParseFor(cmd, RegisterFlags)
 	}
 }
 
@@ -134,9 +135,9 @@ type poolDialer interface {
 // In order to more efficiently use the underlying tcp connections, you can
 // instead use the cachedConnDialer implementation by specifying
 //
-//	--tablet_manager_protocol "grpc-cached"
+//	--tablet-manager-protocol "grpc-cached"
 //
-// The cachedConnDialer keeps connections to up to --tablet_manager_grpc_connpool_size
+// The cachedConnDialer keeps connections to up to --tablet-manager-grpc-connpool-size
 // distinct tablets open at any given time, for faster per-RPC call time, and less
 // connection churn.
 type Client struct {
@@ -382,6 +383,19 @@ func (client *Client) SetReadWrite(ctx context.Context, tablet *topodatapb.Table
 	defer closer.Close()
 	_, err = c.SetReadWrite(ctx, &tabletmanagerdatapb.SetReadWriteRequest{})
 	return err
+}
+
+// ChangeTags is part of the tmclient.TabletManagerClient interface.
+func (client *Client) ChangeTags(ctx context.Context, tablet *topodatapb.Tablet, tabletTags map[string]string, replace bool) (*tabletmanagerdatapb.ChangeTagsResponse, error) {
+	c, closer, err := client.dialer.dial(ctx, tablet)
+	if err != nil {
+		return nil, err
+	}
+	defer closer.Close()
+	return c.ChangeTags(ctx, &tabletmanagerdatapb.ChangeTagsRequest{
+		Tags:    tabletTags,
+		Replace: replace,
+	})
 }
 
 // ChangeType is part of the tmclient.TabletManagerClient interface.
@@ -659,14 +673,16 @@ func (client *Client) ExecuteFetchAsApp(ctx context.Context, tablet *topodatapb.
 }
 
 // GetUnresolvedTransactions is part of the tmclient.TabletManagerClient interface.
-func (client *Client) GetUnresolvedTransactions(ctx context.Context, tablet *topodatapb.Tablet) ([]*querypb.TransactionMetadata, error) {
+func (client *Client) GetUnresolvedTransactions(ctx context.Context, tablet *topodatapb.Tablet, abandonAge int64) ([]*querypb.TransactionMetadata, error) {
 	c, closer, err := client.dialer.dial(ctx, tablet)
 	if err != nil {
 		return nil, err
 	}
 	defer closer.Close()
 
-	response, err := c.GetUnresolvedTransactions(ctx, &tabletmanagerdatapb.GetUnresolvedTransactionsRequest{})
+	response, err := c.GetUnresolvedTransactions(ctx, &tabletmanagerdatapb.GetUnresolvedTransactionsRequest{
+		AbandonAge: abandonAge,
+	})
 	if err != nil {
 		return nil, err
 	}
@@ -686,6 +702,54 @@ func (client *Client) ConcludeTransaction(ctx context.Context, tablet *topodatap
 		Mm:   mm,
 	})
 	return err
+}
+
+func (client *Client) MysqlHostMetrics(ctx context.Context, tablet *topodatapb.Tablet, req *tabletmanagerdatapb.MysqlHostMetricsRequest) (*tabletmanagerdatapb.MysqlHostMetricsResponse, error) {
+	c, closer, err := client.dialer.dial(ctx, tablet)
+	if err != nil {
+		return nil, err
+	}
+	defer closer.Close()
+
+	resp, err := c.MysqlHostMetrics(ctx, req)
+	if err != nil {
+		return nil, err
+	}
+	return resp, nil
+}
+
+// ReadTransaction is part of the tmclient.TabletManagerClient interface.
+func (client *Client) ReadTransaction(ctx context.Context, tablet *topodatapb.Tablet, dtid string) (*querypb.TransactionMetadata, error) {
+	c, closer, err := client.dialer.dial(ctx, tablet)
+	if err != nil {
+		return nil, err
+	}
+	defer closer.Close()
+
+	resp, err := c.ReadTransaction(ctx, &tabletmanagerdatapb.ReadTransactionRequest{
+		Dtid: dtid,
+	})
+	if err != nil {
+		return nil, err
+	}
+	return resp.Transaction, nil
+}
+
+// GetTransactionInfo is part of the tmclient.TabletManagerClient interface.
+func (client *Client) GetTransactionInfo(ctx context.Context, tablet *topodatapb.Tablet, dtid string) (*tabletmanagerdatapb.GetTransactionInfoResponse, error) {
+	c, closer, err := client.dialer.dial(ctx, tablet)
+	if err != nil {
+		return nil, err
+	}
+	defer closer.Close()
+
+	resp, err := c.GetTransactionInfo(ctx, &tabletmanagerdatapb.GetTransactionInfoRequest{
+		Dtid: dtid,
+	})
+	if err != nil {
+		return nil, err
+	}
+	return resp, nil
 }
 
 //
@@ -866,6 +930,19 @@ func (client *Client) CreateVReplicationWorkflow(ctx context.Context, tablet *to
 	return response, nil
 }
 
+func (client *Client) DeleteTableData(ctx context.Context, tablet *topodatapb.Tablet, request *tabletmanagerdatapb.DeleteTableDataRequest) (*tabletmanagerdatapb.DeleteTableDataResponse, error) {
+	c, closer, err := client.dialer.dial(ctx, tablet)
+	if err != nil {
+		return nil, err
+	}
+	defer closer.Close()
+	response, err := c.DeleteTableData(ctx, request)
+	if err != nil {
+		return nil, err
+	}
+	return response, nil
+}
+
 func (client *Client) DeleteVReplicationWorkflow(ctx context.Context, tablet *topodatapb.Tablet, request *tabletmanagerdatapb.DeleteVReplicationWorkflowRequest) (*tabletmanagerdatapb.DeleteVReplicationWorkflowResponse, error) {
 	c, closer, err := client.dialer.dial(ctx, tablet)
 	if err != nil {
@@ -912,6 +989,19 @@ func (client *Client) ReadVReplicationWorkflow(ctx context.Context, tablet *topo
 	}
 	defer closer.Close()
 	response, err := c.ReadVReplicationWorkflow(ctx, request)
+	if err != nil {
+		return nil, err
+	}
+	return response, nil
+}
+
+func (client *Client) ValidateVReplicationPermissions(ctx context.Context, tablet *topodatapb.Tablet, request *tabletmanagerdatapb.ValidateVReplicationPermissionsRequest) (*tabletmanagerdatapb.ValidateVReplicationPermissionsResponse, error) {
+	c, closer, err := client.dialer.dial(ctx, tablet)
+	if err != nil {
+		return nil, err
+	}
+	defer closer.Close()
+	response, err := c.ValidateVReplicationPermissions(ctx, request)
 	if err != nil {
 		return nil, err
 	}
@@ -969,6 +1059,24 @@ func (client *Client) UpdateVReplicationWorkflows(ctx context.Context, tablet *t
 		return nil, err
 	}
 	return response, nil
+}
+
+func (client *Client) GetMaxValueForSequences(ctx context.Context, tablet *topodatapb.Tablet, request *tabletmanagerdatapb.GetMaxValueForSequencesRequest) (*tabletmanagerdatapb.GetMaxValueForSequencesResponse, error) {
+	c, closer, err := client.dialer.dial(ctx, tablet)
+	if err != nil {
+		return nil, err
+	}
+	defer closer.Close()
+	return c.GetMaxValueForSequences(ctx, request)
+}
+
+func (client *Client) UpdateSequenceTables(ctx context.Context, tablet *topodatapb.Tablet, request *tabletmanagerdatapb.UpdateSequenceTablesRequest) (*tabletmanagerdatapb.UpdateSequenceTablesResponse, error) {
+	c, closer, err := client.dialer.dial(ctx, tablet)
+	if err != nil {
+		return nil, err
+	}
+	defer closer.Close()
+	return c.UpdateSequenceTables(ctx, request)
 }
 
 // VDiff is part of the tmclient.TabletManagerClient interface.
@@ -1032,6 +1140,20 @@ func (client *Client) PopulateReparentJournal(ctx context.Context, tablet *topod
 		ReplicationPosition: pos,
 	})
 	return err
+}
+
+// ReadReparentJournalInfo is part of the tmclient.TabletManagerClient interface.
+func (client *Client) ReadReparentJournalInfo(ctx context.Context, tablet *topodatapb.Tablet) (int32, error) {
+	c, closer, err := client.dialer.dial(ctx, tablet)
+	if err != nil {
+		return 0, err
+	}
+	defer closer.Close()
+	resp, err := c.ReadReparentJournalInfo(ctx, &tabletmanagerdatapb.ReadReparentJournalInfoRequest{})
+	if err != nil {
+		return 0, err
+	}
+	return resp.Length, nil
 }
 
 // InitReplica is part of the tmclient.TabletManagerClient interface.

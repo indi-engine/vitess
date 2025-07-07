@@ -20,14 +20,19 @@ import (
 	"context"
 	"testing"
 
+	"vitess.io/vitess/go/vt/log"
+
 	"github.com/stretchr/testify/require"
 
+	"vitess.io/vitess/go/vt/external/golib/sqlutils"
 	topodatapb "vitess.io/vitess/go/vt/proto/topodata"
 	"vitess.io/vitess/go/vt/topo/memorytopo"
 	"vitess.io/vitess/go/vt/topo/topoproto"
+	"vitess.io/vitess/go/vt/vtctl/reparentutil/policy"
 	"vitess.io/vitess/go/vt/vtorc/config"
 	"vitess.io/vitess/go/vt/vtorc/db"
 	"vitess.io/vitess/go/vt/vtorc/inst"
+	"vitess.io/vitess/go/vt/vtorc/test"
 	_ "vitess.io/vitess/go/vt/vttablet/grpctmclient"
 )
 
@@ -41,6 +46,16 @@ func TestAnalysisEntriesHaveSameRecovery(t *testing.T) {
 			// DeadPrimary and DeadPrimaryAndSomeReplicas have the same recovery
 			prevAnalysisCode: inst.DeadPrimary,
 			newAnalysisCode:  inst.DeadPrimaryAndSomeReplicas,
+			shouldBeEqual:    true,
+		}, {
+			// DeadPrimary and StalledDiskPrimary have the same recovery
+			prevAnalysisCode: inst.DeadPrimary,
+			newAnalysisCode:  inst.PrimaryDiskStalled,
+			shouldBeEqual:    true,
+		}, {
+			// PrimarySemiSyncBlocked and PrimaryDiskStalled have the same recovery
+			prevAnalysisCode: inst.PrimarySemiSyncBlocked,
+			newAnalysisCode:  inst.PrimaryDiskStalled,
 			shouldBeEqual:    true,
 		}, {
 			// DeadPrimary and PrimaryTabletDeleted are different recoveries.
@@ -70,6 +85,10 @@ func TestAnalysisEntriesHaveSameRecovery(t *testing.T) {
 			shouldBeEqual:    true,
 		}, {
 			prevAnalysisCode: inst.PrimarySemiSyncMustBeSet,
+			newAnalysisCode:  inst.PrimarySemiSyncMustNotBeSet,
+			shouldBeEqual:    true,
+		}, {
+			prevAnalysisCode: inst.PrimaryCurrentTypeMismatch,
 			newAnalysisCode:  inst.PrimarySemiSyncMustNotBeSet,
 			shouldBeEqual:    true,
 		}, {
@@ -126,7 +145,7 @@ func TestElectNewPrimaryPanic(t *testing.T) {
 	defer cancel()
 
 	ts = memorytopo.NewServer(ctx, "zone1")
-	recoveryAttempted, _, err := electNewPrimary(context.Background(), analysisEntry)
+	recoveryAttempted, _, err := electNewPrimary(context.Background(), analysisEntry, log.NewPrefixedLogger("prefix"))
 	require.True(t, recoveryAttempted)
 	require.Error(t, err)
 }
@@ -216,6 +235,26 @@ func TestGetCheckAndRecoverFunctionCode(t *testing.T) {
 			analysisCode:         inst.DeadPrimary,
 			wantRecoveryFunction: noRecoveryFunc,
 		}, {
+			name:                 "StalledDiskPrimary with ERS enabled",
+			ersEnabled:           true,
+			analysisCode:         inst.PrimaryDiskStalled,
+			wantRecoveryFunction: recoverDeadPrimaryFunc,
+		}, {
+			name:                 "StalledDiskPrimary with ERS disabled",
+			ersEnabled:           false,
+			analysisCode:         inst.PrimaryDiskStalled,
+			wantRecoveryFunction: noRecoveryFunc,
+		}, {
+			name:                 "PrimarySemiSyncBlocked with ERS enabled",
+			ersEnabled:           true,
+			analysisCode:         inst.PrimarySemiSyncBlocked,
+			wantRecoveryFunction: recoverDeadPrimaryFunc,
+		}, {
+			name:                 "PrimarySemiSyncBlocked with ERS disabled",
+			ersEnabled:           false,
+			analysisCode:         inst.PrimarySemiSyncBlocked,
+			wantRecoveryFunction: noRecoveryFunc,
+		}, {
 			name:                 "PrimaryTabletDeleted with ERS enabled",
 			ersEnabled:           true,
 			analysisCode:         inst.PrimaryTabletDeleted,
@@ -274,4 +313,109 @@ func TestGetCheckAndRecoverFunctionCode(t *testing.T) {
 			require.EqualValues(t, tt.wantRecoveryFunction, gotFunc)
 		})
 	}
+}
+
+func TestRecheckPrimaryHealth(t *testing.T) {
+	tests := []struct {
+		name    string
+		info    []*test.InfoForRecoveryAnalysis
+		wantErr string
+	}{
+		{
+			name: "analysis change",
+			info: []*test.InfoForRecoveryAnalysis{{
+				TabletInfo: &topodatapb.Tablet{
+					Alias:         &topodatapb.TabletAlias{Cell: "zon1", Uid: 100},
+					Hostname:      "localhost",
+					Keyspace:      "ks",
+					Shard:         "0",
+					Type:          topodatapb.TabletType_PRIMARY,
+					MysqlHostname: "localhost",
+					MysqlPort:     6709,
+				},
+				DurabilityPolicy:              "none",
+				LastCheckValid:                0,
+				CountReplicas:                 4,
+				CountValidReplicas:            4,
+				CountValidReplicatingReplicas: 0,
+			}},
+			wantErr: "aborting ReplicationStopped, primary mitigation is required",
+		},
+		{
+			name: "analysis did not change",
+			info: []*test.InfoForRecoveryAnalysis{{
+				TabletInfo: &topodatapb.Tablet{
+					Alias:         &topodatapb.TabletAlias{Cell: "zon1", Uid: 101},
+					Hostname:      "localhost",
+					Keyspace:      "ks",
+					Shard:         "0",
+					Type:          topodatapb.TabletType_PRIMARY,
+					MysqlHostname: "localhost",
+					MysqlPort:     6708,
+				},
+				DurabilityPolicy:              policy.DurabilityNone,
+				LastCheckValid:                1,
+				CountReplicas:                 4,
+				CountValidReplicas:            4,
+				CountValidReplicatingReplicas: 3,
+				CountValidOracleGTIDReplicas:  4,
+				CountLoggingReplicas:          2,
+				IsPrimary:                     1,
+				CurrentTabletType:             int(topodatapb.TabletType_PRIMARY),
+			}, {
+				TabletInfo: &topodatapb.Tablet{
+					Alias:         &topodatapb.TabletAlias{Cell: "zon1", Uid: 100},
+					Hostname:      "localhost",
+					Keyspace:      "ks",
+					Shard:         "0",
+					Type:          topodatapb.TabletType_REPLICA,
+					MysqlHostname: "localhost",
+					MysqlPort:     6709,
+				},
+				DurabilityPolicy: policy.DurabilityNone,
+				PrimaryTabletInfo: &topodatapb.Tablet{
+					Alias: &topodatapb.TabletAlias{Cell: "zon1", Uid: 101},
+				},
+				LastCheckValid:     1,
+				ReadOnly:           1,
+				ReplicationStopped: 1,
+			}},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			// reset vtorc db after every test
+			oldDB := db.Db
+			defer func() {
+				db.Db = oldDB
+			}()
+
+			var rowMaps []sqlutils.RowMap
+			for _, analysis := range tt.info {
+				analysis.SetValuesFromTabletInfo()
+				rowMaps = append(rowMaps, analysis.ConvertToRowMap())
+			}
+
+			// set replication analysis in Vtorc DB.
+			db.Db = test.NewTestDB([][]sqlutils.RowMap{rowMaps})
+
+			err := recheckPrimaryHealth(&inst.ReplicationAnalysis{
+				AnalyzedInstanceAlias: "zon1-0000000100",
+				Analysis:              inst.ReplicationStopped,
+				AnalyzedKeyspace:      "ks",
+				AnalyzedShard:         "0",
+			}, func(s string, b bool) {
+				// the implementation for DiscoverInstance is not required because we are mocking the db response.
+			})
+
+			if tt.wantErr != "" {
+				require.EqualError(t, err, tt.wantErr)
+				return
+			}
+
+			require.NoError(t, err)
+		})
+	}
+
 }

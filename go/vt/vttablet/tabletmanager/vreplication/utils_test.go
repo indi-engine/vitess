@@ -22,8 +22,6 @@ import (
 	"strings"
 	"testing"
 
-	vttablet "vitess.io/vitess/go/vt/vttablet/common"
-
 	"github.com/stretchr/testify/require"
 
 	"vitess.io/vitess/go/mysql/sqlerror"
@@ -31,6 +29,7 @@ import (
 	"vitess.io/vitess/go/textutil"
 	"vitess.io/vitess/go/vt/binlog/binlogplayer"
 	"vitess.io/vitess/go/vt/vterrors"
+	vttablet "vitess.io/vitess/go/vt/vttablet/common"
 
 	binlogdatapb "vitess.io/vitess/go/vt/proto/binlogdata"
 	vtrpcpb "vitess.io/vitess/go/vt/proto/vtrpc"
@@ -151,6 +150,16 @@ func TestIsUnrecoverableError(t *testing.T) {
 			name:     "SQL error with ERDataOutOfRange",
 			err:      sqlerror.NewSQLError(sqlerror.ERDataOutOfRange, "data out of range", "test"),
 			expected: true,
+		},
+		{
+			name:     "SQL error with HaErrDiskFullNowait error",
+			err:      sqlerror.NewSQLError(sqlerror.ERErrorDuringCommit, "unknown", "ERROR HY000: Got error 204 - 'No more room in disk' during COMMIT"),
+			expected: true,
+		},
+		{
+			name:     "SQL error with HaErrLockDeadlock error",
+			err:      sqlerror.NewSQLError(sqlerror.ERErrorDuringCommit, "unknown", "ERROR HY000: Got error 149 - 'Lock deadlock; Retry transaction' during COMMIT"),
+			expected: false,
 		},
 	}
 	for _, tc := range testCases {

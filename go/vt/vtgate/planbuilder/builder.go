@@ -28,6 +28,7 @@ import (
 	topodatapb "vitess.io/vitess/go/vt/proto/topodata"
 	"vitess.io/vitess/go/vt/sqlparser"
 	"vitess.io/vitess/go/vt/vterrors"
+	"vitess.io/vitess/go/vt/vtgate/dynamicconfig"
 	"vitess.io/vitess/go/vt/vtgate/engine"
 	"vitess.io/vitess/go/vt/vtgate/planbuilder/plancontext"
 	"vitess.io/vitess/go/vt/vtgate/vindexes"
@@ -40,10 +41,6 @@ const (
 	Gen4GreedyOnly = querypb.ExecuteOptions_Gen4Greedy
 	// Gen4Left2Right joins table in the order they are listed in the FROM-clause
 	Gen4Left2Right = querypb.ExecuteOptions_Gen4Left2Right
-)
-
-var (
-	plannerVersions = []plancontext.PlannerVersion{Gen4, Gen4GreedyOnly, Gen4Left2Right}
 )
 
 type (
@@ -63,10 +60,20 @@ func singleTable(ks, tbl string) string {
 	return fmt.Sprintf("%s.%s", ks, tbl)
 }
 
+type staticConfig struct{}
+
+func (staticConfig) OnlineEnabled() bool {
+	return true
+}
+
+func (staticConfig) DirectEnabled() bool {
+	return true
+}
+
 // TestBuilder builds a plan for a query based on the specified vschema.
 // This method is only used from tests
 func TestBuilder(query string, vschema plancontext.VSchema, keyspace string) (*engine.Plan, error) {
-	stmt, reserved, err := vschema.Environment().Parser().Parse2(query)
+	stmt, known, err := vschema.Environment().Parser().Parse2(query)
 	if err != nil {
 		return nil, err
 	}
@@ -86,18 +93,18 @@ func TestBuilder(query string, vschema plancontext.VSchema, keyspace string) (*e
 			}()
 		}
 	}
-	result, err := sqlparser.RewriteAST(stmt, keyspace, sqlparser.SQLSelectLimitUnset, "", nil, vschema.GetForeignKeyChecksState(), vschema)
+	reservedVars := sqlparser.NewReservedVars("vtg", known)
+	result, err := sqlparser.Normalize(stmt, reservedVars, map[string]*querypb.BindVariable{}, false, keyspace, sqlparser.SQLSelectLimitUnset, "", nil, vschema.GetForeignKeyChecksState(), vschema)
 	if err != nil {
 		return nil, err
 	}
 
-	reservedVars := sqlparser.NewReservedVars("vtg", reserved)
-	return BuildFromStmt(context.Background(), query, result.AST, reservedVars, vschema, result.BindVarNeeds, true, true)
+	return BuildFromStmt(context.Background(), query, result.AST, reservedVars, vschema, result.BindVarNeeds, staticConfig{})
 }
 
 // BuildFromStmt builds a plan based on the AST provided.
-func BuildFromStmt(ctx context.Context, query string, stmt sqlparser.Statement, reservedVars *sqlparser.ReservedVars, vschema plancontext.VSchema, bindVarNeeds *sqlparser.BindVarNeeds, enableOnlineDDL, enableDirectDDL bool) (*engine.Plan, error) {
-	planResult, err := createInstructionFor(ctx, query, stmt, reservedVars, vschema, enableOnlineDDL, enableDirectDDL)
+func BuildFromStmt(ctx context.Context, query string, stmt sqlparser.Statement, reservedVars *sqlparser.ReservedVars, vschema plancontext.VSchema, bindVarNeeds *sqlparser.BindVarNeeds, cfg dynamicconfig.DDL) (*engine.Plan, error) {
+	planResult, err := createInstructionFor(ctx, query, stmt, reservedVars, vschema, cfg)
 	if err != nil {
 		return nil, err
 	}
@@ -108,14 +115,7 @@ func BuildFromStmt(ctx context.Context, query string, stmt sqlparser.Statement, 
 		primitive = planResult.primitive
 		tablesUsed = planResult.tables
 	}
-	plan := &engine.Plan{
-		Type:         sqlparser.ASTToStatementType(stmt),
-		Original:     query,
-		Instructions: primitive,
-		BindVarNeeds: bindVarNeeds,
-		TablesUsed:   tablesUsed,
-	}
-	return plan, nil
+	return engine.NewPlan(query, stmt, primitive, bindVarNeeds, tablesUsed), nil
 }
 
 func getConfiguredPlanner(vschema plancontext.VSchema, stmt sqlparser.Statement, query string) (stmtPlanner, error) {
@@ -148,13 +148,13 @@ func getPlannerFromQueryHint(stmt sqlparser.Statement) (plancontext.PlannerVersi
 }
 
 func buildRoutePlan(stmt sqlparser.Statement, reservedVars *sqlparser.ReservedVars, vschema plancontext.VSchema, f func(statement sqlparser.Statement, reservedVars *sqlparser.ReservedVars, schema plancontext.VSchema) (*planResult, error)) (*planResult, error) {
-	if vschema.Destination() != nil {
+	if vschema.ShardDestination() != nil {
 		return buildPlanForBypass(stmt, reservedVars, vschema)
 	}
 	return f(stmt, reservedVars, vschema)
 }
 
-func createInstructionFor(ctx context.Context, query string, stmt sqlparser.Statement, reservedVars *sqlparser.ReservedVars, vschema plancontext.VSchema, enableOnlineDDL, enableDirectDDL bool) (*planResult, error) {
+func createInstructionFor(ctx context.Context, query string, stmt sqlparser.Statement, reservedVars *sqlparser.ReservedVars, vschema plancontext.VSchema, cfg dynamicconfig.DDL) (*planResult, error) {
 	switch stmt := stmt.(type) {
 	case *sqlparser.Select, *sqlparser.Insert, *sqlparser.Update, *sqlparser.Delete:
 		configuredPlanner, err := getConfiguredPlanner(vschema, stmt, query)
@@ -169,13 +169,13 @@ func createInstructionFor(ctx context.Context, query string, stmt sqlparser.Stat
 		}
 		return buildRoutePlan(stmt, reservedVars, vschema, configuredPlanner)
 	case sqlparser.DDLStatement:
-		return buildGeneralDDLPlan(ctx, query, stmt, reservedVars, vschema, enableOnlineDDL, enableDirectDDL)
+		return buildGeneralDDLPlan(ctx, query, stmt, reservedVars, vschema, cfg)
 	case *sqlparser.AlterMigration:
-		return buildAlterMigrationPlan(query, stmt, vschema, enableOnlineDDL)
+		return buildAlterMigrationPlan(query, stmt, vschema, cfg)
 	case *sqlparser.RevertMigration:
-		return buildRevertMigrationPlan(query, stmt, vschema, enableOnlineDDL)
+		return buildRevertMigrationPlan(query, stmt, vschema, cfg)
 	case *sqlparser.ShowMigrationLogs:
-		return buildShowMigrationLogsPlan(query, vschema, enableOnlineDDL)
+		return buildShowMigrationLogsPlan(query, vschema, cfg)
 	case *sqlparser.ShowThrottledApps:
 		return buildShowThrottledAppsPlan(query, vschema)
 	case *sqlparser.ShowThrottlerStatus:
@@ -189,7 +189,7 @@ func createInstructionFor(ctx context.Context, query string, stmt sqlparser.Stat
 	case *sqlparser.ExplainStmt:
 		return buildRoutePlan(stmt, reservedVars, vschema, buildExplainStmtPlan)
 	case *sqlparser.VExplainStmt:
-		return buildVExplainPlan(ctx, stmt, reservedVars, vschema, enableOnlineDDL, enableDirectDDL)
+		return buildVExplainPlan(ctx, stmt, reservedVars, vschema, cfg)
 	case *sqlparser.OtherAdmin:
 		return buildOtherReadAndAdmin(query, vschema)
 	case *sqlparser.Analyze:
@@ -239,7 +239,7 @@ func buildAnalyzePlan(stmt sqlparser.Statement, _ *sqlparser.ReservedVars, vsche
 
 	var ks *vindexes.Keyspace
 	var err error
-	dest := key.Destination(key.DestinationAllShards{})
+	dest := key.ShardDestination(key.DestinationAllShards{})
 
 	if analyzeStmt.Table.Qualifier.NotEmpty() && sqlparser.SystemSchema(analyzeStmt.Table.Qualifier.String()) {
 		ks, err = vschema.AnyKeyspace()
@@ -275,7 +275,7 @@ func buildDBDDLPlan(stmt sqlparser.Statement, _ *sqlparser.ReservedVars, vschema
 	dbDDLstmt := stmt.(sqlparser.DBDDLStatement)
 	ksName := dbDDLstmt.GetDatabaseName()
 	if ksName == "" {
-		ks, err := vschema.DefaultKeyspace()
+		ks, err := vschema.SelectedKeyspace()
 		if err != nil {
 			return nil, err
 		}
@@ -310,12 +310,12 @@ func buildDBDDLPlan(stmt sqlparser.Statement, _ *sqlparser.ReservedVars, vschema
 }
 
 func buildLoadPlan(query string, vschema plancontext.VSchema) (*planResult, error) {
-	keyspace, err := vschema.DefaultKeyspace()
+	keyspace, err := vschema.SelectedKeyspace()
 	if err != nil {
 		return nil, err
 	}
 
-	destination := vschema.Destination()
+	destination := vschema.ShardDestination()
 	if destination == nil {
 		if err := vschema.ErrorIfShardedF(keyspace, "LOAD", "LOAD is not supported on sharded keyspace"); err != nil {
 			return nil, err
@@ -355,12 +355,12 @@ func buildFlushOptions(stmt *sqlparser.Flush, vschema plancontext.VSchema) (*pla
 		return nil, vterrors.VT09012("FLUSH", vschema.TabletType().String())
 	}
 
-	keyspace, err := vschema.DefaultKeyspace()
+	keyspace, err := vschema.SelectedKeyspace()
 	if err != nil {
 		return nil, err
 	}
 
-	dest := vschema.Destination()
+	dest := vschema.ShardDestination()
 	if dest == nil {
 		dest = key.DestinationAllShards{}
 	}
@@ -380,10 +380,10 @@ func buildFlushTables(stmt *sqlparser.Flush, vschema plancontext.VSchema) (*plan
 	tc := &tableCollector{}
 	type sendDest struct {
 		ks   *vindexes.Keyspace
-		dest key.Destination
+		dest key.ShardDestination
 	}
 
-	dest := vschema.Destination()
+	dest := vschema.ShardDestination()
 	if dest == nil {
 		dest = key.DestinationAllShards{}
 	}

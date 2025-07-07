@@ -46,7 +46,7 @@ func gen4SelectStmtPlanner(
 		}
 		if p != nil {
 			used := "dual"
-			keyspace, ksErr := vschema.DefaultKeyspace()
+			keyspace, ksErr := vschema.SelectedKeyspace()
 			if ksErr == nil {
 				// we are just getting the ks to log the correct table use.
 				// no need to fail this if we can't find the default keyspace
@@ -101,7 +101,7 @@ func gen4SelectStmtPlanner(
 
 func gen4planSQLCalcFoundRows(vschema plancontext.VSchema, sel *sqlparser.Select, query string, reservedVars *sqlparser.ReservedVars) (*planResult, error) {
 	ksName := ""
-	if ks, _ := vschema.DefaultKeyspace(); ks != nil {
+	if ks, _ := vschema.SelectedKeyspace(); ks != nil {
 		ksName = ks.Name
 	}
 	semTable, err := semantics.Analyze(sel, ksName, vschema)
@@ -139,19 +139,20 @@ func buildSQLCalcFoundRowsPlan(
 	sel2.OrderBy = nil
 	sel2.Limit = nil
 
-	countStartExpr := []sqlparser.SelectExpr{&sqlparser.AliasedExpr{
-		Expr: &sqlparser.CountStar{},
-	}}
+	countStar := &sqlparser.AliasedExpr{Expr: &sqlparser.CountStar{}}
+	selectExprs := &sqlparser.SelectExprs{
+		Exprs: []sqlparser.SelectExpr{countStar},
+	}
 	if sel2.GroupBy == nil && sel2.Having == nil {
 		// if there is no grouping, we can use the same query and
 		// just replace the SELECT sub-clause to have a single count(*)
-		sel2.SelectExprs = countStartExpr
+		sel2.SetSelectExprs(countStar)
 	} else {
 		// when there is grouping, we have to move the original query into a derived table.
 		//                       select id, sum(12) from user group by id =>
 		// select count(*) from (select id, sum(12) from user group by id) t
 		sel3 := &sqlparser.Select{
-			SelectExprs: countStartExpr,
+			SelectExprs: selectExprs,
 			From: []sqlparser.TableExpr{
 				&sqlparser.AliasedTableExpr{
 					Expr: &sqlparser.DerivedTable{Select: sel2},
@@ -218,7 +219,7 @@ func newBuildSelectPlan(
 		return nil, nil, ctx.SemTable.NotUnshardedErr
 	}
 
-	op, err := createSelectOperator(ctx, selStmt, reservedVars)
+	op, err := createSelectOperator(ctx, selStmt)
 	if err != nil {
 		return nil, nil, err
 	}
@@ -231,7 +232,7 @@ func newBuildSelectPlan(
 	return plan, operators.TablesUsed(op), nil
 }
 
-func createSelectOperator(ctx *plancontext.PlanningContext, selStmt sqlparser.SelectStatement, reservedVars *sqlparser.ReservedVars) (operators.Operator, error) {
+func createSelectOperator(ctx *plancontext.PlanningContext, selStmt sqlparser.SelectStatement) (operators.Operator, error) {
 	err := queryRewrite(ctx, selStmt)
 	if err != nil {
 		return nil, err
@@ -292,10 +293,12 @@ func handleDualSelects(sel *sqlparser.Select, vschema plancontext.VSchema) (engi
 		return nil, nil
 	}
 
-	exprs := make([]evalengine.Expr, len(sel.SelectExprs))
-	cols := make([]string, len(sel.SelectExprs))
+	columns := sel.GetColumns()
+	size := len(columns)
+	exprs := make([]evalengine.Expr, size)
+	cols := make([]string, size)
 	var lockFunctions []*engine.LockFunc
-	for i, e := range sel.SelectExprs {
+	for i, e := range columns {
 		expr, ok := e.(*sqlparser.AliasedExpr)
 		if !ok {
 			return nil, nil

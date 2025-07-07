@@ -21,14 +21,17 @@ import (
 	"context"
 	"fmt"
 	"io"
+	"slices"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
 	"github.com/google/safehtml/template"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+	"golang.org/x/exp/maps"
 
 	"vitess.io/vitess/go/test/utils"
 	"vitess.io/vitess/go/vt/grpcclient"
@@ -63,6 +66,77 @@ func init() {
 	refreshInterval = time.Minute
 }
 
+func TestNewVTGateHealthCheckFilters(t *testing.T) {
+	defer func() {
+		KeyspacesToWatch = nil
+		tabletFilters = nil
+		tabletFilterTags = nil
+	}()
+
+	testCases := []struct {
+		name                string
+		keyspacesToWatch    []string
+		tabletFilters       []string
+		tabletFilterTags    map[string]string
+		expectedError       string
+		expectedFilterTypes []any
+	}{
+		{
+			name: "noFilters",
+		},
+		{
+			name:                "tabletFilters",
+			tabletFilters:       []string{"ks1|-80"},
+			expectedFilterTypes: []any{&FilterByShard{}},
+		},
+		{
+			name:                "keyspacesToWatch",
+			keyspacesToWatch:    []string{"ks1"},
+			expectedFilterTypes: []any{&FilterByKeyspace{}},
+		},
+		{
+			name:                "tabletFiltersAndTags",
+			tabletFilters:       []string{"ks1|-80"},
+			tabletFilterTags:    map[string]string{"test": "true"},
+			expectedFilterTypes: []any{&FilterByShard{}, &FilterByTabletTags{}},
+		},
+		{
+			name:                "keyspacesToWatchAndTags",
+			tabletFilterTags:    map[string]string{"test": "true"},
+			keyspacesToWatch:    []string{"ks1"},
+			expectedFilterTypes: []any{&FilterByKeyspace{}, &FilterByTabletTags{}},
+		},
+		{
+			name:             "failKeyspacesToWatchAndFilters",
+			tabletFilters:    []string{"ks1|-80"},
+			keyspacesToWatch: []string{"ks1"},
+			expectedError:    errKeyspacesToWatchAndTabletFilters.Error(),
+		},
+		{
+			name:          "failInvalidTabletFilters",
+			tabletFilters: []string{"shouldfail|"},
+			expectedError: "failed to parse tablet_filters value \"shouldfail|\": error parsing shard name : Code: INVALID_ARGUMENT\nempty name\n",
+		},
+	}
+
+	for _, testCase := range testCases {
+		t.Run(testCase.name, func(t *testing.T) {
+			KeyspacesToWatch = testCase.keyspacesToWatch
+			tabletFilters = testCase.tabletFilters
+			tabletFilterTags = testCase.tabletFilterTags
+
+			filters, err := NewVTGateHealthCheckFilters()
+			if testCase.expectedError != "" {
+				assert.EqualError(t, err, testCase.expectedError)
+			}
+			assert.Len(t, filters, len(testCase.expectedFilterTypes))
+			for i, filter := range filters {
+				assert.IsType(t, testCase.expectedFilterTypes[i], filter)
+			}
+		})
+	}
+}
+
 func TestHealthCheck(t *testing.T) {
 	ctx := utils.LeakCheckContext(t)
 	// reset error counters
@@ -78,7 +152,7 @@ func TestHealthCheck(t *testing.T) {
 	conn := createFakeConn(tablet, input)
 
 	// create a channel and subscribe to healthcheck
-	resultChan := hc.Subscribe()
+	resultChan := hc.Subscribe("TestHealthCheck")
 	testChecksum(t, 0, hc.stateChecksum())
 	hc.AddTablet(tablet)
 	testChecksum(t, 1027934207, hc.stateChecksum())
@@ -217,7 +291,7 @@ func TestHealthCheckStreamError(t *testing.T) {
 
 	tablet := createTestTablet(0, "cell", "a")
 	input := make(chan *querypb.StreamHealthResponse)
-	resultChan := hc.Subscribe()
+	resultChan := hc.Subscribe("TestHealthCheckStreamError")
 	fc := createFakeConn(tablet, input)
 	fc.errCh = make(chan error)
 	hc.AddTablet(tablet)
@@ -281,7 +355,7 @@ func TestHealthCheckErrorOnPrimary(t *testing.T) {
 
 	tablet := createTestTablet(0, "cell", "a")
 	input := make(chan *querypb.StreamHealthResponse)
-	resultChan := hc.Subscribe()
+	resultChan := hc.Subscribe("TestHealthCheckErrorOnPrimary")
 	fc := createFakeConn(tablet, input)
 	fc.errCh = make(chan error)
 	hc.AddTablet(tablet)
@@ -342,7 +416,7 @@ func TestHealthCheckErrorOnPrimaryAfterExternalReparent(t *testing.T) {
 	hc := createTestHc(ctx, ts)
 	defer hc.Close()
 
-	resultChan := hc.Subscribe()
+	resultChan := hc.Subscribe("TestHealthCheckErrorOnPrimaryAfterExternalReparent")
 
 	tablet1 := createTestTablet(0, "cell", "a")
 	input1 := make(chan *querypb.StreamHealthResponse)
@@ -426,7 +500,7 @@ func TestHealthCheckVerifiesTabletAlias(t *testing.T) {
 	tablet := createTestTablet(0, "cell", "a")
 	input := make(chan *querypb.StreamHealthResponse, 1)
 	fc := createFakeConn(tablet, input)
-	resultChan := hc.Subscribe()
+	resultChan := hc.Subscribe("TestHealthCheckVerifiesTabletAlias")
 
 	hc.AddTablet(tablet)
 
@@ -471,7 +545,7 @@ func TestHealthCheckCloseWaitsForGoRoutines(t *testing.T) {
 	tablet := createTestTablet(0, "cell", "a")
 	input := make(chan *querypb.StreamHealthResponse, 1)
 	createFakeConn(tablet, input)
-	resultChan := hc.Subscribe()
+	resultChan := hc.Subscribe("TestHealthCheckCloseWaitsForGoRoutines")
 
 	hc.AddTablet(tablet)
 
@@ -538,7 +612,7 @@ func TestHealthCheckTimeout(t *testing.T) {
 	tablet := createTestTablet(0, "cell", "a")
 	input := make(chan *querypb.StreamHealthResponse)
 	fc := createFakeConn(tablet, input)
-	resultChan := hc.Subscribe()
+	resultChan := hc.Subscribe("TestHealthCheckTimeout")
 	hc.AddTablet(tablet)
 	// Immediately after AddTablet() there will be the first notification.
 	want := &TabletHealth{
@@ -620,7 +694,7 @@ func TestWaitForAllServingTablets(t *testing.T) {
 	createFakeConn(tablet, input)
 
 	// create a channel and subscribe to healthcheck
-	resultChan := hc.Subscribe()
+	resultChan := hc.Subscribe("TestWaitForAllServingTablets")
 	hc.AddTablet(tablet)
 	// there will be a first result, get and discard it
 	<-resultChan
@@ -688,7 +762,7 @@ func TestRemoveTablet(t *testing.T) {
 	createFakeConn(tablet, input)
 
 	// create a channel and subscribe to healthcheck
-	resultChan := hc.Subscribe()
+	resultChan := hc.Subscribe("TestRemoveTablet")
 	hc.AddTablet(tablet)
 	// there will be a first result, get and discard it
 	<-resultChan
@@ -824,7 +898,7 @@ func TestRemoveTabletDuringExternalReparenting(t *testing.T) {
 	thirdTabletConn := createFakeConn(thirdTablet, thirdTabletHealthStream)
 	thirdTabletConn.errCh = make(chan error)
 
-	resultChan := hc.Subscribe()
+	resultChan := hc.Subscribe("TestRemoveTabletDuringExternalReparenting")
 
 	hc.AddTablet(firstTablet)
 	<-resultChan
@@ -919,7 +993,7 @@ func TestGetHealthyTablets(t *testing.T) {
 	createFakeConn(tablet, input)
 
 	// create a channel and subscribe to healthcheck
-	resultChan := hc.Subscribe()
+	resultChan := hc.Subscribe("TestGetHealthyTablets")
 	hc.AddTablet(tablet)
 	// there will be a first result, get and discard it
 	<-resultChan
@@ -1100,7 +1174,7 @@ func TestPrimaryInOtherCell(t *testing.T) {
 
 	ts := memorytopo.NewServer(ctx, "cell1", "cell2")
 	defer ts.Close()
-	hc := NewHealthCheck(ctx, 1*time.Millisecond, time.Hour, ts, "cell1", "cell1, cell2")
+	hc := NewHealthCheck(ctx, 1*time.Millisecond, time.Hour, ts, "cell1", "cell1, cell2", nil)
 	defer hc.Close()
 
 	// add a tablet as primary in different cell
@@ -1109,7 +1183,7 @@ func TestPrimaryInOtherCell(t *testing.T) {
 	input := make(chan *querypb.StreamHealthResponse)
 	fc := createFakeConn(tablet, input)
 	// create a channel and subscribe to healthcheck
-	resultChan := hc.Subscribe()
+	resultChan := hc.Subscribe("TestPrimaryInOtherCell")
 	hc.AddTablet(tablet)
 	// should get a result, but this will hang if multi-cell logic is broken
 	// so wait and timeout
@@ -1155,12 +1229,74 @@ func TestPrimaryInOtherCell(t *testing.T) {
 	mustMatch(t, want, a[0], "Expecting healthy primary")
 }
 
+// TestLoadTabletsTrigger tests that we send the correct information on the load tablets trigger.
+func TestLoadTabletsTrigger(t *testing.T) {
+	ctx := utils.LeakCheckContext(t)
+
+	// create a health check instance.
+	hc := NewHealthCheck(ctx, time.Hour, time.Hour, nil, "", "", nil)
+	defer hc.Close()
+
+	ks := "keyspace"
+	shard := "shard"
+	// Add a tablet to the topology.
+	tablet1 := &topodatapb.Tablet{
+		Alias: &topodatapb.TabletAlias{
+			Cell: "zone-1",
+			Uid:  100,
+		},
+		Type:     topodatapb.TabletType_REPLICA,
+		Hostname: "host1",
+		PortMap: map[string]int32{
+			"grpc": 123,
+		},
+		Keyspace: ks,
+		Shard:    shard,
+	}
+
+	// We want to run updateHealth with arguments that always
+	// make it trigger load Tablets.
+	th := &TabletHealth{
+		Tablet: tablet1,
+		Target: &querypb.Target{
+			Keyspace:   ks,
+			Shard:      shard,
+			TabletType: topodatapb.TabletType_REPLICA,
+		},
+	}
+	prevTarget := &querypb.Target{
+		Keyspace:   ks,
+		Shard:      shard,
+		TabletType: topodatapb.TabletType_PRIMARY,
+	}
+	hc.AddTablet(tablet1)
+
+	numTriggers := 10
+	for i := 0; i < numTriggers; i++ {
+		// Since the previous target was a primary, and there are no other
+		// primary tablets for the given keyspace shard, we will see the healtcheck
+		// send on the loadTablets trigger. We just want to verify the information
+		// there is correct.
+		hc.updateHealth(th, prevTarget, false, false)
+	}
+
+	ch := hc.GetLoadTabletsTrigger()
+	require.Len(t, ch, numTriggers)
+	for i := 0; i < numTriggers; i++ {
+		// Read from the channel and verify we indeed have the right values.
+		kss := <-ch
+		require.EqualValues(t, ks, kss.Keyspace)
+		require.EqualValues(t, shard, kss.Shard)
+	}
+	require.Len(t, ch, 0)
+}
+
 func TestReplicaInOtherCell(t *testing.T) {
 	ctx := utils.LeakCheckContext(t)
 
 	ts := memorytopo.NewServer(ctx, "cell1", "cell2")
 	defer ts.Close()
-	hc := NewHealthCheck(ctx, 1*time.Millisecond, time.Hour, ts, "cell1", "cell1, cell2")
+	hc := NewHealthCheck(ctx, 1*time.Millisecond, time.Hour, ts, "cell1", "cell1, cell2", nil)
 	defer hc.Close()
 
 	// add a tablet as replica
@@ -1169,7 +1305,7 @@ func TestReplicaInOtherCell(t *testing.T) {
 	input := make(chan *querypb.StreamHealthResponse)
 	fc := createFakeConn(local, input)
 	// create a channel and subscribe to healthcheck
-	resultChan := hc.Subscribe()
+	resultChan := hc.Subscribe("TestReplicaInOtherCell")
 	hc.AddTablet(local)
 
 	ticker := time.NewTicker(1 * time.Second)
@@ -1214,7 +1350,7 @@ func TestReplicaInOtherCell(t *testing.T) {
 	input2 := make(chan *querypb.StreamHealthResponse)
 	fc2 := createFakeConn(remote, input2)
 	// create a channel and subscribe to healthcheck
-	resultChan2 := hc.Subscribe()
+	resultChan2 := hc.Subscribe("TestReplicaInOtherCell")
 	hc.AddTablet(remote)
 	// should get a result, but this will hang if multi-cell logic is broken
 	// so wait and timeout
@@ -1265,7 +1401,7 @@ func TestCellAliases(t *testing.T) {
 
 	ts := memorytopo.NewServer(ctx, "cell1", "cell2")
 	defer ts.Close()
-	hc := NewHealthCheck(ctx, 1*time.Millisecond, time.Hour, ts, "cell1", "cell1, cell2")
+	hc := NewHealthCheck(ctx, 1*time.Millisecond, time.Hour, ts, "cell1", "cell1, cell2", nil)
 	defer hc.Close()
 
 	cellsAlias := &topodatapb.CellsAlias{
@@ -1280,7 +1416,7 @@ func TestCellAliases(t *testing.T) {
 	input := make(chan *querypb.StreamHealthResponse)
 	fc := createFakeConn(tablet, input)
 	// create a channel and subscribe to healthcheck
-	resultChan := hc.Subscribe()
+	resultChan := hc.Subscribe("TestCellAliases")
 	hc.AddTablet(tablet)
 	// should get a result, but this will hang if cell alias logic is broken
 	// so wait and timeout
@@ -1333,7 +1469,7 @@ func TestHealthCheckChecksGrpcPort(t *testing.T) {
 
 	tablet := createTestTablet(0, "cell", "a")
 	tablet.PortMap["grpc"] = 0
-	resultChan := hc.Subscribe()
+	resultChan := hc.Subscribe("TestHealthCheckChecksGrpcPort")
 
 	// AddTablet should not add the tablet because port is 0
 	hc.AddTablet(tablet)
@@ -1374,6 +1510,33 @@ func TestTemplate(t *testing.T) {
 	require.Nil(t, err, "error executing template: %v", err)
 }
 
+// TestHealthCheckImplSubscriberName tests that we have the subscirber name in the healthcheck.
+func TestHealthCheckImplSubscriberName(t *testing.T) {
+	ctx := utils.LeakCheckContext(t)
+
+	hc := NewHealthCheck(ctx, 1*time.Millisecond, time.Hour, nil, "", "", nil)
+	defer hc.Close()
+
+	subsName := "SubscriberName1"
+	subsName2 := "SubscriberName2"
+	ch := hc.Subscribe(subsName)
+	ch2 := hc.Subscribe(subsName2)
+
+	subsNames := maps.Values(hc.subscribers)
+	slices.Sort(subsNames)
+	require.Equal(t, 2, len(subsNames), "expected 2 subscribers")
+	require.EqualValues(t, []string{subsName, subsName2}, subsNames, "unexpected subscribers")
+
+	hc.Unsubscribe(ch)
+	subsNames = maps.Values(hc.subscribers)
+	require.Equal(t, 1, len(subsNames), "expected 1 subscriber")
+	require.EqualValues(t, []string{subsName2}, subsNames, "unexpected subscribers")
+
+	hc.Unsubscribe(ch2)
+	subsNames = maps.Values(hc.subscribers)
+	require.Empty(t, subsNames, "expected no subscribers")
+}
+
 func TestDebugURLFormatting(t *testing.T) {
 	defer utils.EnsureNoLeaks(t)
 	TabletURLTemplateString = "https://{{.GetHostNameLevel 0}}.bastion.{{.Tablet.Alias.Cell}}.corp"
@@ -1404,6 +1567,79 @@ func TestDebugURLFormatting(t *testing.T) {
 	require.Contains(t, wr.String(), expectedURL, "output missing formatted URL")
 }
 
+// TestConcurrentUpdates tests that concurrent updates from the HealthCheck implementation aren't dropped.
+// Added in response to https://github.com/vitessio/vitess/issues/17629.
+func TestConcurrentUpdates(t *testing.T) {
+	ctx := utils.LeakCheckContext(t)
+	// reset error counters
+	hcErrorCounters.ResetAll()
+	ts := memorytopo.NewServer(ctx, "cell")
+	defer ts.Close()
+	hc := createTestHc(ctx, ts)
+	// close healthcheck
+	defer hc.Close()
+
+	// Subscribe to the healthcheck
+	// Make the receiver keep track of the updates received.
+	ch := hc.Subscribe("TestConcurrentUpdates")
+	var totalCount atomic.Int32
+	go func() {
+		for range ch {
+			totalCount.Add(1)
+			// Simulate a somewhat slow consumer.
+			time.Sleep(100 * time.Millisecond)
+		}
+	}()
+
+	// Run multiple updates really quickly
+	// one after the other.
+	totalUpdates := 10
+	for i := 0; i < totalUpdates; i++ {
+		hc.broadcast(&TabletHealth{})
+	}
+	// Unsubscribe from the healthcheck
+	// and verify we process all the updates eventually.
+	hc.Unsubscribe(ch)
+	defer close(ch)
+	require.Eventuallyf(t, func() bool {
+		return totalUpdates == int(totalCount.Load())
+	}, 5*time.Second, 100*time.Millisecond, "expected all updates to be processed")
+}
+
+// TestHealthCheckBufferFull tests that we print the stack trace when the buffer gets full.
+func TestHealthCheckBufferFull(t *testing.T) {
+	origPrintStack := printStack
+	defer func() {
+		printStack = origPrintStack
+		hcChannelFullCounter.Reset()
+	}()
+
+	ctx := utils.LeakCheckContext(t)
+	hcChannelFullCounter.Reset()
+	// Create a new healthcheck.
+	hc := NewHealthCheck(ctx, time.Hour, time.Hour, nil, "", "", nil)
+	defer hc.Close()
+
+	// Create a subscriber
+	ch := hc.Subscribe("TestHealthCheckBufferFull")
+	defer hc.Unsubscribe(ch)
+
+	// Send many broadcasting updates that the user doesn't consume.
+	// See that we print the stack trace.
+	var printStackCalled atomic.Bool
+	printStack = func() {
+		printStackCalled.Store(true)
+	}
+	hcUpdateCount := 2050
+	for i := 0; i < hcUpdateCount; i++ {
+		hc.broadcast(&TabletHealth{Tablet: topo.NewTablet(0, "cell", "host")})
+	}
+
+	// Check in the end that we have the print stack called.
+	require.True(t, printStackCalled.Load(), "expected printStack to be called")
+	require.Greater(t, int(hcChannelFullCounter.Get()), 1, "expected hcChannelFullCounter to be greater than 1")
+}
+
 func tabletDialer(ctx context.Context, tablet *topodatapb.Tablet, _ grpcclient.FailFast) (queryservice.QueryService, error) {
 	connMapMu.Lock()
 	defer connMapMu.Unlock()
@@ -1416,7 +1652,7 @@ func tabletDialer(ctx context.Context, tablet *topodatapb.Tablet, _ grpcclient.F
 }
 
 func createTestHc(ctx context.Context, ts *topo.Server) *HealthCheckImpl {
-	return NewHealthCheck(ctx, 1*time.Millisecond, time.Hour, ts, "cell", "")
+	return NewHealthCheck(ctx, 1*time.Millisecond, time.Hour, ts, "cell", "", nil)
 }
 
 type fakeConn struct {

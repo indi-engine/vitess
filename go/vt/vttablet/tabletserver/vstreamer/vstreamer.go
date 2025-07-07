@@ -37,6 +37,7 @@ import (
 	"vitess.io/vitess/go/vt/logutil"
 	vtschema "vitess.io/vitess/go/vt/schema"
 	"vitess.io/vitess/go/vt/sqlparser"
+	"vitess.io/vitess/go/vt/vtenv"
 	"vitess.io/vitess/go/vt/vterrors"
 	vttablet "vitess.io/vitess/go/vt/vttablet/common"
 	"vitess.io/vitess/go/vt/vttablet/tabletserver/schema"
@@ -183,7 +184,7 @@ func (vs *vstreamer) Stream() error {
 	if err != nil {
 		vs.vse.errorCounts.Add("StreamRows", 1)
 		vs.vse.vstreamersEndedWithErrors.Add(1)
-		return err
+		return vterrors.Wrapf(err, "failed to determine starting position")
 	}
 	vs.pos = pos
 	return vs.replicate(ctx)
@@ -288,7 +289,8 @@ func (vs *vstreamer) parseEvents(ctx context.Context, events <-chan mysql.Binlog
 			bufferedEvents = append(bufferedEvents, vevent)
 		default:
 			vs.vse.errorCounts.Add("BufferAndTransmit", 1)
-			return fmt.Errorf("unexpected event: %v", vevent)
+			return vterrors.Errorf(vtrpcpb.Code_INVALID_ARGUMENT, "usupported event type %s found for event: %+v",
+				vevent.Type.String(), vevent)
 		}
 		return nil
 	}
@@ -368,13 +370,15 @@ func (vs *vstreamer) parseEvents(ctx context.Context, events <-chan mysql.Binlog
 		case ev, ok := <-throttledEvents:
 			if !ok {
 				select {
+				case err := <-errs:
+					return err
 				case <-ctx.Done():
 					return nil
 				default:
 				}
-				return fmt.Errorf("unexpected server EOF")
+				return vterrors.Errorf(vtrpcpb.Code_ABORTED, "unexpected server EOF while parsing events")
 			}
-			vevents, err := vs.parseEvent(ev)
+			vevents, err := vs.parseEvent(ev, bufferAndTransmit)
 			if err != nil {
 				vs.vse.errorCounts.Add("ParseEvent", 1)
 				return err
@@ -385,16 +389,18 @@ func (vs *vstreamer) parseEvents(ctx context.Context, events <-chan mysql.Binlog
 						return nil
 					}
 					vs.vse.errorCounts.Add("BufferAndTransmit", 1)
-					return fmt.Errorf("error sending event: %v", err)
+					return vterrors.Wrapf(err, "error sending event: %+v", vevent)
 				}
 			}
 		case vs.vschema = <-vs.vevents:
 			select {
+			case err := <-errs:
+				return err
 			case <-ctx.Done():
 				return nil
 			default:
 				if err := vs.rebuildPlans(); err != nil {
-					return err
+					return vterrors.Wrap(err, "failed to rebuild replication plans")
 				}
 			}
 		case err := <-errs:
@@ -408,14 +414,18 @@ func (vs *vstreamer) parseEvents(ctx context.Context, events <-chan mysql.Binlog
 					return nil
 				}
 				vs.vse.errorCounts.Add("Send", 1)
-				return fmt.Errorf("error sending event: %v", err)
+				return vterrors.Wrapf(err, "failed to send heartbeat event")
 			}
 		}
 	}
 }
 
 // parseEvent parses an event from the binlog and converts it to a list of VEvents.
-func (vs *vstreamer) parseEvent(ev mysql.BinlogEvent) ([]*binlogdatapb.VEvent, error) {
+// The bufferAndTransmit function must be passed if the event is a TransactionPayloadEvent
+// as for larger payloads (> ZstdInMemoryDecompressorMaxSize) the internal events need
+// to be streamed directly here in order to avoid holding the entire payload's contents,
+// which can be 10s or even 100s of GiBs, all in memory.
+func (vs *vstreamer) parseEvent(ev mysql.BinlogEvent, bufferAndTransmit func(vevent *binlogdatapb.VEvent) error) ([]*binlogdatapb.VEvent, error) {
 	if !ev.IsValid() {
 		return nil, fmt.Errorf("can't parse binlog event: invalid data: %#v", ev)
 	}
@@ -455,7 +465,7 @@ func (vs *vstreamer) parseEvent(ev mysql.BinlogEvent) ([]*binlogdatapb.VEvent, e
 	case ev.IsGTID():
 		gtid, hasBegin, err := ev.GTID(vs.format)
 		if err != nil {
-			return nil, fmt.Errorf("can't get GTID from binlog event: %v, event data: %#v", err, ev)
+			return nil, vterrors.Wrapf(err, "failed to get GTID from binlog event: %#v", ev)
 		}
 		if hasBegin {
 			vevents = append(vevents, &binlogdatapb.VEvent{
@@ -473,7 +483,7 @@ func (vs *vstreamer) parseEvent(ev mysql.BinlogEvent) ([]*binlogdatapb.VEvent, e
 	case ev.IsQuery():
 		q, err := ev.Query(vs.format)
 		if err != nil {
-			return nil, fmt.Errorf("can't get query from binlog event: %v, event data: %#v", err, ev)
+			return nil, vterrors.Wrapf(err, "failed to get query from binlog event: %#v", ev)
 		}
 		// Insert/Delete/Update are supported only to be used in the context of external mysql streams where source databases
 		// could be using SBR. Vitess itself will never run into cases where it needs to consume non rbr statements.
@@ -574,7 +584,7 @@ func (vs *vstreamer) parseEvent(ev mysql.BinlogEvent) ([]*binlogdatapb.VEvent, e
 
 		tm, err := ev.TableMap(vs.format)
 		if err != nil {
-			return nil, err
+			return nil, vterrors.Wrapf(err, "failed to parse table map from binlog event: %#v", ev)
 		}
 		if plan, ok := vs.plans[id]; ok {
 			// When the underlying mysql server restarts the table map can change.
@@ -602,7 +612,7 @@ func (vs *vstreamer) parseEvent(ev mysql.BinlogEvent) ([]*binlogdatapb.VEvent, e
 			vs.plans[id] = nil
 			return nil, nil
 		}
-		if vtschema.IsInternalOperationTableName(tm.Name) { // ignore tables created by onlineddl/gh-ost/pt-osc
+		if vtschema.IsInternalOperationTableName(tm.Name) { // ignore tables created by onlineddl/GC
 			vs.plans[id] = nil
 			return nil, nil
 		}
@@ -613,12 +623,12 @@ func (vs *vstreamer) parseEvent(ev mysql.BinlogEvent) ([]*binlogdatapb.VEvent, e
 		vevent, err := vs.buildTablePlan(id, tm)
 		if err != nil {
 			vs.vse.errorCounts.Add("TablePlan", 1)
-			return nil, err
+			return nil, vterrors.Wrapf(err, "failed to build table replication plan for table %s", tm.Name)
 		}
 		if vevent != nil {
 			vevents = append(vevents, vevent)
 		}
-	case ev.IsWriteRows() || ev.IsDeleteRows() || ev.IsUpdateRows():
+	case ev.IsWriteRows() || ev.IsDeleteRows() || ev.IsUpdateRows() || ev.IsPartialUpdateRows():
 		// The existence of before and after images can be used to
 		// identify statement types. It's also possible that the
 		// before and after images end up going to different shards.
@@ -634,16 +644,17 @@ func (vs *vstreamer) parseEvent(ev mysql.BinlogEvent) ([]*binlogdatapb.VEvent, e
 			return nil, err
 		}
 
-		if id == vs.journalTableID {
+		switch id {
+		case vs.journalTableID:
 			vevents, err = vs.processJournalEvent(vevents, plan, rows)
-		} else if id == vs.versionTableID {
+		case vs.versionTableID:
 			vs.se.RegisterVersionEvent()
 			vevent := &binlogdatapb.VEvent{
 				Type: binlogdatapb.VEventType_VERSION,
 			}
 			vevents = append(vevents, vevent)
 
-		} else {
+		default:
 			vevents, err = vs.processRowEvent(vevents, plan, rows)
 		}
 		if err != nil {
@@ -671,11 +682,31 @@ func (vs *vstreamer) parseEvent(ev mysql.BinlogEvent) ([]*binlogdatapb.VEvent, e
 				}
 				return nil, err
 			}
-			tpvevents, err := vs.parseEvent(tpevent)
+			tpvevents, err := vs.parseEvent(tpevent, nil) // Parse the internal event
 			if err != nil {
 				return nil, vterrors.Wrap(err, "failed to parse transaction payload's internal event")
 			}
-			vevents = append(vevents, tpvevents...)
+			if tp.StreamingContents {
+				// Transmit each internal event individually to avoid buffering
+				// the large transaction's entire payload of events in memory, as
+				// the uncompressed size can be 10s or even 100s of GiBs in size.
+				if bufferAndTransmit == nil {
+					return nil, vterrors.New(vtrpcpb.Code_INTERNAL, "[bug] cannot stream compressed transaction payload's internal events as no bufferAndTransmit function was provided")
+				}
+				for _, tpvevent := range tpvevents {
+					tpvevent.Timestamp = int64(ev.Timestamp())
+					tpvevent.CurrentTime = time.Now().UnixNano()
+					if err := bufferAndTransmit(tpvevent); err != nil {
+						if err == io.EOF {
+							return nil, nil
+						}
+						vs.vse.errorCounts.Add("TransactionPayloadBufferAndTransmit", 1)
+						return nil, vterrors.Errorf(vtrpcpb.Code_INTERNAL, "error sending compressed transaction payload's internal event: %v", err)
+					}
+				}
+			} else { // Process the payload's internal events all at once
+				vevents = append(vevents, tpvevents...)
+			}
 		}
 		vs.vse.vstreamerCompressedTransactionsDecoded.Add(1)
 	}
@@ -783,7 +814,7 @@ func (vs *vstreamer) buildTablePlan(id uint64, tm *mysql.TableMap) (*binlogdatap
 		vs.plans[id] = nil
 		return nil, nil
 	}
-	if err := addEnumAndSetMappingstoPlan(plan, cols, tm.Metadata); err != nil {
+	if err := addEnumAndSetMappingstoPlan(vs.se.Environment(), plan, cols, tm.Metadata); err != nil {
 		return nil, vterrors.Wrapf(err, "failed to build ENUM and SET column integer to string mappings")
 	}
 	vs.plans[id] = &streamerPlan{
@@ -882,7 +913,7 @@ func getExtColInfos(ctx context.Context, cp dbconfigs.Connector, se *schema.Engi
 	extColInfos := make(map[string]*extColInfo)
 	conn, err := cp.Connect(ctx)
 	if err != nil {
-		return nil, err
+		return nil, vterrors.Wrapf(err, "failed to connect to database %s", database)
 	}
 	defer conn.Close()
 	queryTemplate := "select column_name, column_type, collation_name from information_schema.columns where table_schema=%s and table_name=%s;"
@@ -935,9 +966,7 @@ type extColInfo struct {
 }
 
 func encodeString(in string) string {
-	buf := bytes.NewBuffer(nil)
-	sqltypes.NewVarChar(in).EncodeSQL(buf)
-	return buf.String()
+	return sqltypes.EncodeStringSQL(in)
 }
 
 func (vs *vstreamer) processJournalEvent(vevents []*binlogdatapb.VEvent, plan *streamerPlan, rows mysql.Rows) ([]*binlogdatapb.VEvent, error) {
@@ -948,9 +977,9 @@ func (vs *vstreamer) processJournalEvent(vevents []*binlogdatapb.VEvent, plan *s
 	}
 nextrow:
 	for _, row := range rows.Rows {
-		afterOK, afterValues, _, err := vs.extractRowAndFilter(plan, row.Data, rows.DataColumns, row.NullColumns)
+		afterOK, afterValues, _, err := vs.extractRowAndFilter(plan, row.Data, rows.DataColumns, row.NullColumns, row.JSONPartialValues)
 		if err != nil {
-			return nil, err
+			return nil, vterrors.Wrap(err, "failed to extract journal from binlog event and apply filters")
 		}
 		if !afterOK {
 			// This can happen if someone manually deleted rows.
@@ -972,7 +1001,7 @@ nextrow:
 				return nil, err
 			}
 			if err := prototext.Unmarshal(avBytes, journal); err != nil {
-				return nil, err
+				return nil, vterrors.Wrap(err, "failed to unmarshal journal event")
 			}
 			vevents = append(vevents, &binlogdatapb.VEvent{
 				Type:    binlogdatapb.VEventType_JOURNAL,
@@ -986,13 +1015,16 @@ nextrow:
 func (vs *vstreamer) processRowEvent(vevents []*binlogdatapb.VEvent, plan *streamerPlan, rows mysql.Rows) ([]*binlogdatapb.VEvent, error) {
 	rowChanges := make([]*binlogdatapb.RowChange, 0, len(rows.Rows))
 	for _, row := range rows.Rows {
-		beforeOK, beforeValues, _, err := vs.extractRowAndFilter(plan, row.Identify, rows.IdentifyColumns, row.NullIdentifyColumns)
+		// The BEFORE image does not have partial JSON values so we pass an empty bitmap.
+		beforeOK, beforeValues, _, err := vs.extractRowAndFilter(plan, row.Identify, rows.IdentifyColumns, row.NullIdentifyColumns, mysql.Bitmap{})
 		if err != nil {
-			return nil, err
+			return nil, vterrors.Wrap(err, "failed to extract row's before values from binlog event and apply filters")
 		}
-		afterOK, afterValues, partial, err := vs.extractRowAndFilter(plan, row.Data, rows.DataColumns, row.NullColumns)
+		// The AFTER image is where we may have partial JSON values, as reflected in the
+		// row's JSONPartialValues bitmap.
+		afterOK, afterValues, partial, err := vs.extractRowAndFilter(plan, row.Data, rows.DataColumns, row.NullColumns, row.JSONPartialValues)
 		if err != nil {
-			return nil, err
+			return nil, vterrors.Wrap(err, "failed to extract row's after values from binlog event and apply filters")
 		}
 		if !beforeOK && !afterOK {
 			continue
@@ -1003,12 +1035,18 @@ func (vs *vstreamer) processRowEvent(vevents []*binlogdatapb.VEvent, plan *strea
 		}
 		if afterOK {
 			rowChange.After = sqltypes.RowToProto3(afterValues)
-			if (vs.config.ExperimentalFlags /**/ & /**/ vttablet.VReplicationExperimentalFlagAllowNoBlobBinlogRowImage != 0) &&
-				partial {
+			if ((vs.config.ExperimentalFlags /**/ & /**/ vttablet.VReplicationExperimentalFlagAllowNoBlobBinlogRowImage != 0) && partial) ||
+				(row.JSONPartialValues.Count() > 0) {
 
 				rowChange.DataColumns = &binlogdatapb.RowChange_Bitmap{
 					Count: int64(rows.DataColumns.Count()),
 					Cols:  rows.DataColumns.Bits(),
+				}
+			}
+			if row.JSONPartialValues.Count() > 0 {
+				rowChange.JsonPartialValues = &binlogdatapb.RowChange_Bitmap{
+					Count: int64(row.JSONPartialValues.Count()),
+					Cols:  row.JSONPartialValues.Bits(),
 				}
 			}
 		}
@@ -1056,13 +1094,14 @@ func (vs *vstreamer) rebuildPlans() error {
 //   - true, if row needs to be skipped because of workflow filter rules
 //   - data values, array of one value per column
 //   - true, if the row image was partial (i.e. binlog_row_image=noblob and dml doesn't update one or more blob/text columns)
-func (vs *vstreamer) extractRowAndFilter(plan *streamerPlan, data []byte, dataColumns, nullColumns mysql.Bitmap) (bool, []sqltypes.Value, bool, error) {
+func (vs *vstreamer) extractRowAndFilter(plan *streamerPlan, data []byte, dataColumns, nullColumns mysql.Bitmap, jsonPartialValues mysql.Bitmap) (bool, []sqltypes.Value, bool, error) {
 	if len(data) == 0 {
 		return false, nil, false, nil
 	}
 	values := make([]sqltypes.Value, dataColumns.Count())
 	charsets := make([]collations.ID, len(values))
 	valueIndex := 0
+	jsonIndex := 0
 	pos := 0
 	partial := false
 	for colNum := 0; colNum < dataColumns.Count(); colNum++ {
@@ -1076,13 +1115,22 @@ func (vs *vstreamer) extractRowAndFilter(plan *streamerPlan, data []byte, dataCo
 		}
 		if nullColumns.Bit(valueIndex) {
 			valueIndex++
+			if plan.Table.Fields[colNum].Type == querypb.Type_JSON {
+				jsonIndex++
+			}
 			continue
 		}
-		value, l, err := mysqlbinlog.CellValue(data, pos, plan.TableMap.Types[colNum], plan.TableMap.Metadata[colNum], plan.Table.Fields[colNum])
+		partialJSON := false
+		if jsonPartialValues.Count() > 0 && plan.Table.Fields[colNum].Type == querypb.Type_JSON {
+			partialJSON = jsonPartialValues.Bit(jsonIndex)
+			jsonIndex++
+		}
+		value, l, err := mysqlbinlog.CellValue(data, pos, plan.TableMap.Types[colNum], plan.TableMap.Metadata[colNum], plan.Table.Fields[colNum], partialJSON)
 		if err != nil {
 			log.Errorf("extractRowAndFilter: %s, table: %s, colNum: %d, fields: %+v, current values: %+v",
 				err, plan.Table.Name, colNum, plan.Table.Fields, values)
-			return false, nil, false, err
+			return false, nil, false, vterrors.Wrapf(err, "failed to extract row's value for column %s from binlog event",
+				plan.Table.Fields[colNum].Name)
 		}
 		pos += l
 
@@ -1097,13 +1145,13 @@ func (vs *vstreamer) extractRowAndFilter(plan *streamerPlan, data []byte, dataCo
 			// Convert the integer values in the binlog event for any SET and ENUM fields into their
 			// string representations.
 			if plan.Table.Fields[colNum].Type == querypb.Type_ENUM || mysqlType == mysqlbinlog.TypeEnum {
-				value, err = buildEnumStringValue(plan, colNum, value)
+				value, err = buildEnumStringValue(vs.se.Environment(), plan, colNum, value)
 				if err != nil {
 					return false, nil, false, vterrors.Wrapf(err, "failed to perform ENUM column integer to string value mapping")
 				}
 			}
 			if plan.Table.Fields[colNum].Type == querypb.Type_SET || mysqlType == mysqlbinlog.TypeSet {
-				value, err = buildSetStringValue(plan, colNum, value)
+				value, err = buildSetStringValue(vs.se.Environment(), plan, colNum, value)
 				if err != nil {
 					return false, nil, false, vterrors.Wrapf(err, "failed to perform SET column integer to string value mapping")
 				}
@@ -1120,7 +1168,7 @@ func (vs *vstreamer) extractRowAndFilter(plan *streamerPlan, data []byte, dataCo
 }
 
 // addEnumAndSetMappingstoPlan sets up any necessary ENUM and SET integer to string mappings.
-func addEnumAndSetMappingstoPlan(plan *Plan, cols []*querypb.Field, metadata []uint16) error {
+func addEnumAndSetMappingstoPlan(env *vtenv.Environment, plan *Plan, cols []*querypb.Field, metadata []uint16) error {
 	plan.EnumSetValuesMap = make(map[int]map[int]string)
 	for i, col := range cols {
 		// If the column is a CHAR based type with a binary collation (e.g. utf8mb4_bin) then
@@ -1139,22 +1187,26 @@ func addEnumAndSetMappingstoPlan(plan *Plan, cols []*querypb.Field, metadata []u
 				return fmt.Errorf("enum or set column %s does not have valid string values: %s",
 					col.Name, col.ColumnType)
 			}
-			plan.EnumSetValuesMap[i] = vtschema.ParseEnumOrSetTokensMap(col.ColumnType[begin+1 : end])
+			var err error
+			plan.EnumSetValuesMap[i], err = vtschema.ParseEnumOrSetTokensMap(env, col.ColumnType[begin+1:end])
+			if err != nil {
+				return err
+			}
 		}
 	}
 	return nil
 }
 
 // buildEnumStringValue takes the integer value of an ENUM column and returns the string value.
-func buildEnumStringValue(plan *streamerPlan, colNum int, value sqltypes.Value) (sqltypes.Value, error) {
+func buildEnumStringValue(env *vtenv.Environment, plan *streamerPlan, colNum int, value sqltypes.Value) (sqltypes.Value, error) {
 	if value.IsNull() { // No work is needed
 		return value, nil
 	}
 	// Add the mappings just-in-time in case we haven't properly received and processed a
 	// table map event to initialize it.
 	if plan.EnumSetValuesMap == nil {
-		if err := addEnumAndSetMappingstoPlan(plan.Plan, plan.Table.Fields, plan.TableMap.Metadata); err != nil {
-			return sqltypes.Value{}, err
+		if err := addEnumAndSetMappingstoPlan(env, plan.Plan, plan.Table.Fields, plan.TableMap.Metadata); err != nil {
+			return sqltypes.Value{}, vterrors.Wrap(err, "failed to build ENUM column integer to string mappings")
 		}
 	}
 	// ENUM columns are stored as an unsigned 16-bit integer as they can contain a maximum
@@ -1162,7 +1214,7 @@ func buildEnumStringValue(plan *streamerPlan, colNum int, value sqltypes.Value) 
 	// reserved for any integer value that has no string mapping.
 	iv, err := value.ToUint16()
 	if err != nil {
-		return sqltypes.Value{}, fmt.Errorf("no valid integer value found for column %s in table %s, bytes: %b",
+		return sqltypes.Value{}, vterrors.Wrapf(err, "no valid integer value found for column %s in table %s, bytes: %b",
 			plan.Table.Fields[colNum].Name, plan.Table.Name, iv)
 	}
 	var strVal string
@@ -1181,15 +1233,15 @@ func buildEnumStringValue(plan *streamerPlan, colNum int, value sqltypes.Value) 
 }
 
 // buildSetStringValue takes the integer value of a SET column and returns the string value.
-func buildSetStringValue(plan *streamerPlan, colNum int, value sqltypes.Value) (sqltypes.Value, error) {
+func buildSetStringValue(env *vtenv.Environment, plan *streamerPlan, colNum int, value sqltypes.Value) (sqltypes.Value, error) {
 	if value.IsNull() { // No work is needed
 		return value, nil
 	}
 	// Add the mappings just-in-time in case we haven't properly received and processed a
 	// table map event to initialize it.
 	if plan.EnumSetValuesMap == nil {
-		if err := addEnumAndSetMappingstoPlan(plan.Plan, plan.Table.Fields, plan.TableMap.Metadata); err != nil {
-			return sqltypes.Value{}, err
+		if err := addEnumAndSetMappingstoPlan(env, plan.Plan, plan.Table.Fields, plan.TableMap.Metadata); err != nil {
+			return sqltypes.Value{}, vterrors.Wrap(err, "failed to build SET column integer to string mappings")
 		}
 	}
 	// A SET column can have 64 unique values: https://dev.mysql.com/doc/refman/en/set.html
@@ -1198,7 +1250,7 @@ func buildSetStringValue(plan *streamerPlan, colNum int, value sqltypes.Value) (
 	val := bytes.Buffer{}
 	iv, err := value.ToUint64()
 	if err != nil {
-		return value, fmt.Errorf("no valid integer value found for column %s in table %s, bytes: %b",
+		return value, vterrors.Wrapf(err, "no valid integer value found for column %s in table %s, bytes: %b",
 			plan.Table.Fields[colNum].Name, plan.Table.Name, iv)
 	}
 	idx := 1

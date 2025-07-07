@@ -500,9 +500,14 @@ func (c *CreateTableEntity) IndexDefinitionEntities() []*IndexDefinitionEntity {
 	keys := c.CreateTable.TableSpec.Indexes
 	entities := make([]*IndexDefinitionEntity, len(keys))
 	for i, key := range keys {
-		colEntities := make([]*ColumnDefinitionEntity, len(key.Columns))
-		for i, keyCol := range key.Columns {
-			colEntities[i] = colMap[keyCol.Column.Lowered()]
+		colEntities := []*ColumnDefinitionEntity{}
+		for _, keyCol := range key.Columns {
+			colEntity, ok := colMap[keyCol.Column.Lowered()]
+			if !ok {
+				// This can happen if the index is on an expression, e.g. `KEY idx1 ((id + 1))`.
+				continue
+			}
+			colEntities = append(colEntities, colEntity)
 		}
 		entities[i] = NewIndexDefinitionEntity(c.Env, key, NewColumnDefinitionEntityList(colEntities))
 	}
@@ -764,6 +769,40 @@ func (c *CreateTableEntity) normalizeColumnOptions() {
 			// as the table level. In that case, we can clear it since that is equivalent.
 			if col.Type.Options.Collate == cc.collate {
 				col.Type.Options.Collate = ""
+			}
+		}
+	}
+	for _, colEntity := range c.ColumnDefinitionEntities() {
+		col := colEntity.ColumnDefinition
+		if col.Type.Length == nil {
+			continue
+		}
+		colLength := *col.Type.Length
+		if col.Type.Type == "blob" {
+			if colLength <= TinyBlogStorageLength {
+				col.Type.Type = "tinyblob"
+			} else if colLength <= BlobStorageLength {
+				col.Type.Type = "blob"
+			} else if colLength <= MediumBlobStorageLength {
+				col.Type.Type = "mediumblob"
+			} else {
+				col.Type.Type = "longblob"
+			}
+			col.Type.Length = nil
+		}
+		if col.Type.Type == "text" {
+			if _, _, maxWidth, _, err := colEntity.InferCharsetCollate(); err == nil {
+				lengthByCharset := colLength * maxWidth
+				if lengthByCharset <= TinyBlogStorageLength {
+					col.Type.Type = "tinytext"
+				} else if lengthByCharset <= BlobStorageLength {
+					col.Type.Type = "text"
+				} else if lengthByCharset <= MediumBlobStorageLength {
+					col.Type.Type = "mediumtext"
+				} else {
+					col.Type.Type = "longtext"
+				}
+				col.Type.Length = nil
 			}
 		}
 	}
@@ -1092,16 +1131,6 @@ func (c *CreateTableEntity) TableDiff(other *CreateTableEntity, hints *DiffHints
 	}
 
 	return parentAlterTableEntityDiff, nil
-}
-
-func (c *CreateTableEntity) diffTableCharset(
-	t1cc *charsetCollate,
-	t2cc *charsetCollate,
-) string {
-	if t1cc.charset != t2cc.charset {
-		return t2cc.charset
-	}
-	return ""
 }
 
 // isDefaultTableOptionValue sees if the value for a TableOption is also its default value
@@ -1684,6 +1713,7 @@ func (c *CreateTableEntity) diffKeys(alterTable *sqlparser.AlterTable,
 						NewName: t2Key.Info.Name,
 					}
 					alterTable.AlterOptions = append(alterTable.AlterOptions, renameIndex)
+					annotations.MarkAdded(sqlparser.CanonicalString(t2Key))
 					convertedToRename = true
 				}
 			}
@@ -1711,8 +1741,10 @@ func (c *CreateTableEntity) diffKeys(alterTable *sqlparser.AlterTable,
 			}
 		}
 	}
-	for _, stmt := range dropKeyStatements {
-		alterTable.AlterOptions = append(alterTable.AlterOptions, stmt)
+	for _, t1Key := range t1Keys {
+		if stmt, ok := dropKeyStatements[t1Key.Info.Name.String()]; ok {
+			alterTable.AlterOptions = append(alterTable.AlterOptions, stmt)
+		}
 	}
 	return superfluousFulltextKeys
 }
@@ -2691,6 +2723,11 @@ func (c *CreateTableEntity) validate() error {
 			return &ApplyDuplicateColumnError{Table: c.Name(), Column: col.Name.String()}
 		}
 		columnExists[colName] = true
+	}
+	for _, colEntity := range c.ColumnDefinitionEntities() {
+		if _, _, _, _, err := colEntity.InferCharsetCollate(); err != nil {
+			return err
+		}
 	}
 	// validate all columns used by foreign key constraints do in fact exist,
 	// and that there exists an index over those columns

@@ -20,6 +20,7 @@ import (
 	"fmt"
 
 	"vitess.io/vitess/go/vt/sqlparser"
+	"vitess.io/vitess/go/vt/vtgate/engine"
 	"vitess.io/vitess/go/vt/vtgate/planbuilder/plancontext"
 	"vitess.io/vitess/go/vt/vtgate/vindexes"
 )
@@ -27,8 +28,8 @@ import (
 // mergeJoinInputs checks whether two operators can be merged into a single one.
 // If they can be merged, a new operator with the merged routing is returned
 // If they cannot be merged, nil is returned.
-func (jm *joinMerger) mergeJoinInputs(ctx *plancontext.PlanningContext, lhs, rhs Operator, joinPredicates []sqlparser.Expr) *Route {
-	lhsRoute, rhsRoute, routingA, routingB, a, b, sameKeyspace := prepareInputRoutes(lhs, rhs)
+func (jm *joinMerger) mergeJoinInputs(ctx *plancontext.PlanningContext, lhs, rhs Operator) *Route {
+	lhsRoute, rhsRoute, routingA, routingB, a, b, sameKeyspace := prepareInputRoutes(ctx, lhs, rhs)
 	if lhsRoute == nil {
 		return nil
 	}
@@ -37,16 +38,19 @@ func (jm *joinMerger) mergeJoinInputs(ctx *plancontext.PlanningContext, lhs, rhs
 	// We clone the right hand side and try and push all the join predicates that are solved entirely by that side.
 	// If a dual is on the left side, and it is a left join (all right joins are changed to left joins), then we can only merge if the right side is a single sharded routing.
 	case a == dual:
-		rhsClone := Clone(rhs).(*Route)
-		for _, predicate := range joinPredicates {
-			if ctx.SemTable.DirectDeps(predicate).IsSolvedBy(TableID(rhsClone)) {
-				rhsClone.AddPredicate(ctx, predicate)
+		newRouting := rhsRoute.Routing.Clone()
+
+		rhsID := TableID(rhsRoute)
+		for _, predicate := range jm.predicates {
+			if ctx.SemTable.DirectDeps(predicate).IsSolvedBy(rhsID) {
+				newRouting = UpdateRoutingLogic(ctx, predicate, newRouting)
 			}
 		}
-		if !jm.joinType.IsInner() && !rhsClone.Routing.OpCode().IsSingleShard() {
+
+		if !(jm.joinType.IsInner() || newRouting.OpCode().IsSingleShard()) {
 			return nil
 		}
-		return jm.merge(ctx, lhsRoute, rhsClone, rhsClone.Routing)
+		return jm.merge(ctx, lhsRoute, rhsRoute, newRouting)
 
 	// If a dual is on the right side.
 	case b == dual:
@@ -54,7 +58,7 @@ func (jm *joinMerger) mergeJoinInputs(ctx *plancontext.PlanningContext, lhs, rhs
 
 	// As both are reference route. We need to merge the alternates as well.
 	case a == anyShard && b == anyShard && sameKeyspace:
-		newrouting := mergeAnyShardRoutings(ctx, routingA.(*AnyShardRouting), routingB.(*AnyShardRouting), joinPredicates, jm.joinType)
+		newrouting := mergeAnyShardRoutings(ctx, routingA.(*AnyShardRouting), routingB.(*AnyShardRouting), jm.predicates, jm.joinType)
 		return jm.merge(ctx, lhsRoute, rhsRoute, newrouting)
 
 	// an unsharded/reference route can be merged with anything going to that keyspace
@@ -75,7 +79,7 @@ func (jm *joinMerger) mergeJoinInputs(ctx *plancontext.PlanningContext, lhs, rhs
 
 	// sharded routing is complex, so we handle it in a separate method
 	case a == sharded && b == sharded:
-		return tryMergeShardedRouting(ctx, lhsRoute, rhsRoute, jm, joinPredicates)
+		return tryMergeShardedRouting(ctx, lhsRoute, rhsRoute, jm, jm.predicates)
 
 	default:
 		return nil
@@ -102,13 +106,13 @@ func mergeAnyShardRoutings(ctx *plancontext.PlanningContext, a, b *AnyShardRouti
 	}
 }
 
-func prepareInputRoutes(lhs Operator, rhs Operator) (*Route, *Route, Routing, Routing, routingType, routingType, bool) {
+func prepareInputRoutes(ctx *plancontext.PlanningContext, lhs Operator, rhs Operator) (*Route, *Route, Routing, Routing, routingType, routingType, bool) {
 	lhsRoute, rhsRoute := operatorsToRoutes(lhs, rhs)
 	if lhsRoute == nil || rhsRoute == nil {
 		return nil, nil, nil, nil, 0, 0, false
 	}
 
-	lhsRoute, rhsRoute, routingA, routingB, sameKeyspace := getRoutesOrAlternates(lhsRoute, rhsRoute)
+	lhsRoute, rhsRoute, routingA, routingB, sameKeyspace := getRoutesOrAlternates(ctx, lhsRoute, rhsRoute)
 
 	a, b := getRoutingType(routingA), getRoutingType(routingB)
 	return lhsRoute, rhsRoute, routingA, routingB, a, b, sameKeyspace
@@ -116,8 +120,8 @@ func prepareInputRoutes(lhs Operator, rhs Operator) (*Route, *Route, Routing, Ro
 
 type (
 	merger interface {
-		mergeShardedRouting(ctx *plancontext.PlanningContext, r1, r2 *ShardedRouting, op1, op2 *Route) *Route
-		merge(ctx *plancontext.PlanningContext, op1, op2 *Route, r Routing) *Route
+		mergeShardedRouting(ctx *plancontext.PlanningContext, r1, r2 *ShardedRouting, op1, op2 *Route, conditions ...engine.Condition) *Route
+		merge(ctx *plancontext.PlanningContext, op1, op2 *Route, r Routing, conditions ...engine.Condition) *Route
 	}
 
 	joinMerger struct {
@@ -159,7 +163,7 @@ func (rt routingType) String() string {
 
 // getRoutesOrAlternates gets the Routings from each Route. If they are from different keyspaces,
 // we check if this is a table with alternates in other keyspaces that we can use
-func getRoutesOrAlternates(lhsRoute, rhsRoute *Route) (*Route, *Route, Routing, Routing, bool) {
+func getRoutesOrAlternates(ctx *plancontext.PlanningContext, lhsRoute, rhsRoute *Route) (*Route, *Route, Routing, Routing, bool) {
 	routingA := lhsRoute.Routing
 	routingB := rhsRoute.Routing
 	sameKeyspace := routingA.Keyspace() == routingB.Keyspace()
@@ -171,13 +175,17 @@ func getRoutesOrAlternates(lhsRoute, rhsRoute *Route) (*Route, *Route, Routing, 
 		return lhsRoute, rhsRoute, routingA, routingB, sameKeyspace
 	}
 
-	if refA, ok := routingA.(*AnyShardRouting); ok {
+	// If we have a reference route, we will try to find an alternate route in same keyspace as other routing keyspace.
+	// If the reference route is part of DML table update target, alternate keyspace route cannot be considered.
+	if refA, ok := routingA.(*AnyShardRouting); ok &&
+		!TableID(lhsRoute).IsOverlapping(ctx.SemTable.DMLTargets) {
 		if altARoute := refA.AlternateInKeyspace(routingB.Keyspace()); altARoute != nil {
 			return altARoute, rhsRoute, altARoute.Routing, routingB, true
 		}
 	}
 
-	if refB, ok := routingB.(*AnyShardRouting); ok {
+	if refB, ok := routingB.(*AnyShardRouting); ok &&
+		!TableID(rhsRoute).IsOverlapping(ctx.SemTable.DMLTargets) {
 		if altBRoute := refB.AlternateInKeyspace(routingA.Keyspace()); altBRoute != nil {
 			return lhsRoute, altBRoute, routingA, altBRoute.Routing, true
 		}
@@ -211,8 +219,8 @@ func newJoinMerge(predicates []sqlparser.Expr, joinType sqlparser.JoinType) *joi
 	}
 }
 
-func (jm *joinMerger) mergeShardedRouting(ctx *plancontext.PlanningContext, r1, r2 *ShardedRouting, op1, op2 *Route) *Route {
-	return jm.merge(ctx, op1, op2, mergeShardedRouting(r1, r2))
+func (jm *joinMerger) mergeShardedRouting(ctx *plancontext.PlanningContext, r1, r2 *ShardedRouting, op1, op2 *Route, conditions ...engine.Condition) *Route {
+	return jm.merge(ctx, op1, op2, mergeShardedRouting(r1, r2), conditions...)
 }
 
 func mergeShardedRouting(r1 *ShardedRouting, r2 *ShardedRouting) *ShardedRouting {
@@ -230,14 +238,17 @@ func mergeShardedRouting(r1 *ShardedRouting, r2 *ShardedRouting) *ShardedRouting
 	return tr
 }
 
-func (jm *joinMerger) getApplyJoin(ctx *plancontext.PlanningContext, op1, op2 *Route) *ApplyJoin {
-	return NewApplyJoin(ctx, op1.Source, op2.Source, ctx.SemTable.AndExpressions(jm.predicates...), jm.joinType)
-}
-
-func (jm *joinMerger) merge(ctx *plancontext.PlanningContext, op1, op2 *Route, r Routing) *Route {
+func (jm *joinMerger) merge(ctx *plancontext.PlanningContext, op1, op2 *Route, r Routing, conditions ...engine.Condition) *Route {
+	aj := NewApplyJoin(ctx, op1.Source, op2.Source, ctx.SemTable.AndExpressions(jm.predicates...), jm.joinType, false)
+	for _, column := range aj.JoinPredicates.columns {
+		if column.JoinPredicateID != nil {
+			ctx.PredTracker.Set(*column.JoinPredicateID, column.Original)
+		}
+	}
 	return &Route{
-		unaryOperator: newUnaryOp(jm.getApplyJoin(ctx, op1, op2)),
+		unaryOperator: newUnaryOp(aj),
 		MergedWith:    []*Route{op2},
 		Routing:       r,
+		Conditions:    conditions,
 	}
 }

@@ -40,6 +40,7 @@ import (
 	"github.com/spf13/pflag"
 
 	"vitess.io/vitess/go/vt/log"
+	"vitess.io/vitess/go/vt/utils"
 )
 
 var (
@@ -55,12 +56,12 @@ var (
 var CommonTags []string
 
 func RegisterFlags(fs *pflag.FlagSet) {
-	fs.BoolVar(&emitStats, "emit_stats", emitStats, "If set, emit stats to push-based monitoring and stats backends")
-	fs.DurationVar(&statsEmitPeriod, "stats_emit_period", statsEmitPeriod, "Interval between emitting stats to all registered backends")
-	fs.StringVar(&statsBackend, "stats_backend", statsBackend, "The name of the registered push-based monitoring/stats backend to use")
-	fs.StringVar(&combineDimensions, "stats_combine_dimensions", combineDimensions, `List of dimensions to be combined into a single "all" value in exported stats vars`)
-	fs.StringVar(&dropVariables, "stats_drop_variables", dropVariables, `Variables to be dropped from the list of exported variables.`)
-	fs.StringSliceVar(&CommonTags, "stats_common_tags", CommonTags, `Comma-separated list of common tags for the stats backend. It provides both label and values. Example: label1:value1,label2:value2`)
+	utils.SetFlagBoolVar(fs, &emitStats, "emit-stats", emitStats, "If set, emit stats to push-based monitoring and stats backends")
+	utils.SetFlagDurationVar(fs, &statsEmitPeriod, "stats-emit-period", statsEmitPeriod, "Interval between emitting stats to all registered backends")
+	utils.SetFlagStringVar(fs, &statsBackend, "stats-backend", statsBackend, "The name of the registered push-based monitoring/stats backend to use")
+	utils.SetFlagStringVar(fs, &combineDimensions, "stats-combine-dimensions", combineDimensions, `List of dimensions to be combined into a single "all" value in exported stats vars`)
+	utils.SetFlagStringVar(fs, &dropVariables, "stats-drop-variables", dropVariables, `Variables to be dropped from the list of exported variables.`)
+	utils.SetFlagStringSliceVar(fs, &CommonTags, "stats-common-tags", CommonTags, `Comma-separated list of common tags for the stats backend. It provides both label and values. Example: label1:value1,label2:value2`)
 }
 
 // StatsAllStr is the consolidated name if a dimension gets combined.
@@ -384,19 +385,76 @@ func IsDimensionCombined(name string) bool {
 // them apart later. The function also replaces specific label values with "all"
 // if a dimenstion is marked as true in combinedLabels.
 func safeJoinLabels(labels []string, combinedLabels []bool) string {
-	sanitizedLabels := make([]string, len(labels))
+	// fast path that potentially requires 0 allocations
+	switch len(labels) {
+	case 0:
+		return ""
+	case 1:
+		if combinedLabels == nil || !combinedLabels[0] {
+			return safeLabel(labels[0])
+		}
+		return StatsAllStr
+	}
+
+	var b strings.Builder
+	size := len(labels) - 1 // number of separators
 	for idx, label := range labels {
 		if combinedLabels != nil && combinedLabels[idx] {
-			sanitizedLabels[idx] = StatsAllStr
+			size += len(StatsAllStr)
 		} else {
-			sanitizedLabels[idx] = safeLabel(label)
+			size += len(label)
 		}
 	}
-	return strings.Join(sanitizedLabels, ".")
+	b.Grow(size)
+
+	for idx, label := range labels {
+		if idx > 0 {
+			b.WriteByte('.')
+		}
+		if combinedLabels != nil && combinedLabels[idx] {
+			b.WriteString(StatsAllStr)
+		} else {
+			appendSafeLabel(&b, label)
+		}
+	}
+	return b.String()
+}
+
+// appendSafeLabel is a more efficient version equivalent
+// to strings.ReplaceAll(label, ".", "_"), but appends into
+// a strings.Builder.
+func appendSafeLabel(b *strings.Builder, label string) {
+	// first quickly check if there are any periods to be replaced
+	found := false
+	for i := 0; i < len(label); i++ {
+		if label[i] == '.' {
+			found = true
+			break
+		}
+	}
+	// if there are none, we can just write the label as-is into the
+	// Builder.
+	if !found {
+		b.WriteString(label)
+		return
+	}
+
+	for i := 0; i < len(label); i++ {
+		if label[i] == '.' {
+			b.WriteByte('_')
+		} else {
+			b.WriteByte(label[i])
+		}
+	}
 }
 
 func safeLabel(label string) string {
-	return strings.Replace(label, ".", "_", -1)
+	// XXX: strings.ReplaceAll is optimal in the case where '.' does not
+	// exist in the label name, and will return the string as-is without
+	// allocations. So if we are working with a single label, it's preferrable
+	// over appendSafeLabel, since appendSafeLabel is required to allocate
+	// into a strings.Builder.
+	return strings.ReplaceAll(label, ".", "_")
 }
 
 func isVarDropped(name string) bool {

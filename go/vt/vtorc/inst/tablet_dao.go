@@ -44,11 +44,7 @@ func InitializeTMC() tmclient.TabletManagerClient {
 }
 
 // fullStatus gets the full status of the MySQL running in vttablet.
-func fullStatus(tabletAlias string) (*replicationdatapb.FullStatus, error) {
-	tablet, err := ReadTablet(tabletAlias)
-	if err != nil {
-		return nil, err
-	}
+func fullStatus(tablet *topodatapb.Tablet) (*replicationdatapb.FullStatus, error) {
 	tmcCtx, tmcCancel := context.WithTimeout(context.Background(), topo.RemoteOperationTimeout)
 	defer tmcCancel()
 	return tmc.FullStatus(tmcCtx, tablet)
@@ -56,13 +52,13 @@ func fullStatus(tabletAlias string) (*replicationdatapb.FullStatus, error) {
 
 // ReadTablet reads the vitess tablet record.
 func ReadTablet(tabletAlias string) (*topodatapb.Tablet, error) {
-	query := `
-		select
-			info
-		from
-			vitess_tablet
-		where alias = ?
-		`
+	query := `SELECT
+		info
+	FROM
+		vitess_tablet
+	WHERE
+		alias = ?
+	`
 	args := sqlutils.Args(tabletAlias)
 	tablet := &topodatapb.Tablet{}
 	opts := prototext.UnmarshalOptions{DiscardUnknown: true}
@@ -78,20 +74,78 @@ func ReadTablet(tabletAlias string) (*topodatapb.Tablet, error) {
 	return tablet, nil
 }
 
+// ReadTabletCountsByCell returns the count of tablets watched by cell.
+// The backend query uses an index by "cell": cell_idx_vitess_tablet.
+func ReadTabletCountsByCell() (map[string]int64, error) {
+	tabletCounts := make(map[string]int64)
+	query := `SELECT
+		cell,
+		COUNT() AS count
+	FROM
+		vitess_tablet
+	GROUP BY
+		cell`
+	err := db.QueryVTOrc(query, nil, func(row sqlutils.RowMap) error {
+		cell := row.GetString("cell")
+		tabletCounts[cell] = row.GetInt64("count")
+		return nil
+	})
+	return tabletCounts, err
+}
+
+// ReadTabletCountsByKeyspaceShard returns the count of tablets watched by keyspace/shard.
+// The backend query uses an index by "keyspace, shard": ks_idx_vitess_tablet.
+func ReadTabletCountsByKeyspaceShard() (map[string]map[string]int64, error) {
+	tabletCounts := make(map[string]map[string]int64)
+	query := `SELECT
+		keyspace,
+		shard,
+		COUNT() AS count
+	FROM
+		vitess_tablet
+	GROUP BY
+		keyspace,
+		shard`
+	err := db.QueryVTOrc(query, nil, func(row sqlutils.RowMap) error {
+		keyspace := row.GetString("keyspace")
+		shard := row.GetString("shard")
+		if _, found := tabletCounts[keyspace]; !found {
+			tabletCounts[keyspace] = make(map[string]int64)
+		}
+		tabletCounts[keyspace][shard] = row.GetInt64("count")
+		return nil
+	})
+	return tabletCounts, err
+}
+
 // SaveTablet saves the tablet record against the instanceKey.
 func SaveTablet(tablet *topodatapb.Tablet) error {
 	tabletp, err := prototext.Marshal(tablet)
 	if err != nil {
 		return err
 	}
-	_, err = db.ExecVTOrc(`
-		replace
-			into vitess_tablet (
-				alias, hostname, port, cell, keyspace, shard, tablet_type, primary_timestamp, info
-			) values (
-				?, ?, ?, ?, ?, ?, ?, ?, ?
-			)
-		`,
+	_, err = db.ExecVTOrc(`REPLACE
+		INTO vitess_tablet (
+			alias,
+			hostname,
+			port,
+			cell,
+			keyspace,
+			shard,
+			tablet_type,
+			primary_timestamp,
+			info
+		) VALUES (
+			?,
+			?,
+			?,
+			?,
+			?,
+			?,
+			?,
+			?,
+			?
+		)`,
 		topoproto.TabletAliasString(tablet.Alias),
 		tablet.MysqlHostname,
 		int(tablet.MysqlPort),

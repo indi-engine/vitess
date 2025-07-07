@@ -30,6 +30,7 @@ import (
 	"google.golang.org/grpc/keepalive"
 
 	"vitess.io/vitess/go/vt/log"
+	"vitess.io/vitess/go/vt/utils"
 	"vitess.io/vitess/go/vt/vitessdriver"
 
 	"vitess.io/vitess/go/test/endtoend/cluster"
@@ -86,7 +87,6 @@ create table my_message(
 )
 
 func TestMain(m *testing.M) {
-	defer cluster.PanicHandler(nil)
 	flag.Parse()
 
 	exitCode := func() int {
@@ -113,7 +113,7 @@ func TestMain(m *testing.M) {
 		}
 
 		// Start vtgate
-		clusterInstance.VtGateExtraArgs = []string{"--warn_sharded_only=true"}
+		clusterInstance.VtGateExtraArgs = []string{utils.GetFlagVariantForTests("--warn-sharded-only") + "=true"}
 		if err := clusterInstance.StartVtgate(); err != nil {
 			log.Fatal(err.Error())
 			return 1
@@ -125,7 +125,6 @@ func TestMain(m *testing.M) {
 }
 
 func TestStreamMessaging(t *testing.T) {
-	defer cluster.PanicHandler(t)
 
 	cnf := vitessdriver.Configuration{
 		Protocol: "grpc",

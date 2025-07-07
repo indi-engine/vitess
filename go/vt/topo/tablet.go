@@ -24,21 +24,17 @@ import (
 	"sync"
 	"time"
 
-	"golang.org/x/sync/semaphore"
-
-	"vitess.io/vitess/go/protoutil"
-	"vitess.io/vitess/go/vt/key"
-
 	"vitess.io/vitess/go/event"
 	"vitess.io/vitess/go/netutil"
+	"vitess.io/vitess/go/protoutil"
 	"vitess.io/vitess/go/trace"
+	"vitess.io/vitess/go/vt/key"
 	"vitess.io/vitess/go/vt/log"
-	"vitess.io/vitess/go/vt/proto/vtrpc"
-	"vitess.io/vitess/go/vt/vterrors"
-
 	topodatapb "vitess.io/vitess/go/vt/proto/topodata"
+	"vitess.io/vitess/go/vt/proto/vtrpc"
 	"vitess.io/vitess/go/vt/topo/events"
 	"vitess.io/vitess/go/vt/topo/topoproto"
+	"vitess.io/vitess/go/vt/vterrors"
 )
 
 // IsTrivialTypeChange returns if this db type be trivially reassigned
@@ -234,8 +230,9 @@ func (ts *Server) GetTabletAliasesByCell(ctx context.Context, cell string) ([]*t
 // GetTabletsByCellOptions controls the behavior of
 // Server.FindAllShardsInKeyspace.
 type GetTabletsByCellOptions struct {
-	// Concurrency controls the maximum number of concurrent calls to GetTablet.
-	Concurrency int
+	// KeyspaceShard is the optional keyspace/shard that tablets must match.
+	// An empty shard value will match all shards in the keyspace.
+	KeyspaceShard *KeyspaceShard
 }
 
 // GetTabletsByCell returns all the tablets in the cell.
@@ -255,6 +252,13 @@ func (ts *Server) GetTabletsByCell(ctx context.Context, cellAlias string, opt *G
 		// In the etcd case, it is possible that the response is too large. We also fall
 		// back to fetching the tablets one by one in that case.
 		if IsErrType(err, NoImplementation) || IsErrType(err, ResourceExhausted) {
+			// Getting all the tablets individually gets all the tablet records and filters
+			// them afterward. This is inefficient especially if we want to filter by
+			// keyspace and shard. So, we check for that case and use the ShardReplication
+			// to our advantage to reduce the number of topo calls.
+			if opt != nil && opt.KeyspaceShard != nil && opt.KeyspaceShard.Keyspace != "" && opt.KeyspaceShard.Shard != "" {
+				return ts.GetTabletsByShardCell(ctx, opt.KeyspaceShard.Keyspace, opt.KeyspaceShard.Shard, []string{cellAlias})
+			}
 			return ts.GetTabletsIndividuallyByCell(ctx, cellAlias, opt)
 		}
 		if IsErrType(err, NoNode) {
@@ -263,15 +267,27 @@ func (ts *Server) GetTabletsByCell(ctx context.Context, cellAlias string, opt *G
 		return nil, err
 	}
 
-	tablets := make([]*TabletInfo, len(listResults))
+	var capHint int
+	if opt != nil && opt.KeyspaceShard == nil {
+		capHint = len(listResults)
+	}
+
+	tablets := make([]*TabletInfo, 0, capHint)
 	for n := range listResults {
 		tablet := &topodatapb.Tablet{}
 		if err := tablet.UnmarshalVT(listResults[n].Value); err != nil {
 			return nil, err
 		}
-		tablets[n] = &TabletInfo{Tablet: tablet, version: listResults[n].Version}
+		if opt != nil && opt.KeyspaceShard != nil && opt.KeyspaceShard.Keyspace != "" {
+			if opt.KeyspaceShard.Keyspace != tablet.Keyspace {
+				continue
+			}
+			if opt.KeyspaceShard.Shard != "" && opt.KeyspaceShard.Shard != tablet.Shard {
+				continue
+			}
+		}
+		tablets = append(tablets, &TabletInfo{Tablet: tablet, version: listResults[n].Version})
 	}
-
 	return tablets, nil
 }
 
@@ -482,29 +498,14 @@ func (ts *Server) GetTabletMap(ctx context.Context, tabletAliases []*topodatapb.
 		returnErr error
 	)
 
-	concurrency := DefaultConcurrency
-	if opt != nil && opt.Concurrency > 0 {
-		concurrency = opt.Concurrency
-	}
-	var sem = semaphore.NewWeighted(int64(concurrency))
-
 	for _, tabletAlias := range tabletAliases {
+		if tabletAlias == nil {
+			return nil, vterrors.Errorf(vtrpc.Code_INVALID_ARGUMENT, "nil tablet alias in list")
+		}
 		wg.Add(1)
 		go func(tabletAlias *topodatapb.TabletAlias) {
 			defer wg.Done()
-			if err := sem.Acquire(ctx, 1); err != nil {
-				// Only happens if context is cancelled.
-				mu.Lock()
-				defer mu.Unlock()
-				log.Warningf("%v: %v", tabletAlias, err)
-				// We only need to set this on the first error.
-				if returnErr == nil {
-					returnErr = NewError(PartialResult, tabletAlias.GetCell())
-				}
-				return
-			}
 			tabletInfo, err := ts.GetTablet(ctx, tabletAlias)
-			sem.Release(1)
 			mu.Lock()
 			defer mu.Unlock()
 			if err != nil {
@@ -515,12 +516,70 @@ func (ts *Server) GetTabletMap(ctx context.Context, tabletAliases []*topodatapb.
 					returnErr = NewError(PartialResult, tabletAlias.GetCell())
 				}
 			} else {
+				if opt != nil && opt.KeyspaceShard != nil {
+					if opt.KeyspaceShard.Keyspace != "" && opt.KeyspaceShard.Keyspace != tabletInfo.Keyspace {
+						return
+					}
+					if opt.KeyspaceShard.Shard != "" && opt.KeyspaceShard.Shard != tabletInfo.Shard {
+						return
+					}
+				}
 				tabletMap[topoproto.TabletAliasString(tabletAlias)] = tabletInfo
 			}
 		}(tabletAlias)
 	}
 	wg.Wait()
 	return tabletMap, returnErr
+}
+
+// GetTabletList tries to read all the tablets in the provided list,
+// and returns them in a list.
+// If error is ErrPartialResult, the results in the list are
+// incomplete, meaning some tablets couldn't be read.
+func (ts *Server) GetTabletList(ctx context.Context, tabletAliases []*topodatapb.TabletAlias, opt *GetTabletsByCellOptions) ([]*TabletInfo, error) {
+	span, ctx := trace.NewSpan(ctx, "topo.GetTabletList")
+	span.Annotate("num_tablets", len(tabletAliases))
+	defer span.Finish()
+
+	var (
+		mu         sync.Mutex
+		wg         sync.WaitGroup
+		tabletList = make([]*TabletInfo, 0)
+		returnErr  error
+	)
+
+	for _, tabletAlias := range tabletAliases {
+		if tabletAlias == nil {
+			return nil, vterrors.Errorf(vtrpc.Code_INVALID_ARGUMENT, "nil tablet alias in list")
+		}
+		wg.Add(1)
+		go func(tabletAlias *topodatapb.TabletAlias) {
+			defer wg.Done()
+			tabletInfo, err := ts.GetTablet(ctx, tabletAlias)
+			mu.Lock()
+			defer mu.Unlock()
+			if err != nil {
+				log.Warningf("%v: %v", tabletAlias, err)
+				// There can be data races removing nodes - ignore them for now.
+				// We only need to set this on first error.
+				if returnErr == nil && !IsErrType(err, NoNode) {
+					returnErr = NewError(PartialResult, tabletAlias.GetCell())
+				}
+			} else {
+				if opt != nil && opt.KeyspaceShard != nil {
+					if opt.KeyspaceShard.Keyspace != "" && opt.KeyspaceShard.Keyspace != tabletInfo.Keyspace {
+						return
+					}
+					if opt.KeyspaceShard.Shard != "" && opt.KeyspaceShard.Shard != tabletInfo.Shard {
+						return
+					}
+				}
+				tabletList = append(tabletList, tabletInfo)
+			}
+		}(tabletAlias)
+	}
+	wg.Wait()
+	return tabletList, returnErr
 }
 
 // InitTablet creates or updates a tablet. If no parent is specified

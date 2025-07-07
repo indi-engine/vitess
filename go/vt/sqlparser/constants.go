@@ -160,6 +160,29 @@ const (
 	RegexpStr        = "regexp"
 	NotRegexpStr     = "not regexp"
 
+	// ProcParameterMode
+	OutStr   = "out"
+	InoutStr = "inout"
+
+	// SignalConditionName
+	ClassOriginTypeStr       = "class_origin"
+	SubclassOriginTypeStr    = "subclass_origin"
+	MessageTextTypeStr       = "message_text"
+	MySQLErrNoTypeStr        = "mysql_errno"
+	ConstraintCatalogTypeStr = "constraint_catalog"
+	ConstraintSchemaTypeStr  = "constraint_schema"
+	ConstraintNameTypeStr    = "constraint_name"
+	CatalogNameTypeStr       = "catalog_name"
+	SchemaNameTypeStr        = "schema_name"
+	TableNameTypeStr         = "table_name"
+	ColumnNameTypeStr        = "column_name"
+	CursorNameTypeStr        = "cursor_name"
+
+	// HandlerAction
+	ContinueStr = "continue"
+	ExitStr     = "exit"
+	UndoStr     = "undo"
+
 	// IsExpr.Operator
 	IsNullStr     = "is null"
 	IsNotNullStr  = "is not null"
@@ -169,19 +192,17 @@ const (
 	IsNotFalseStr = "is not false"
 
 	// BinaryExpr.Operator
-	BitAndStr               = "&"
-	BitOrStr                = "|"
-	BitXorStr               = "^"
-	PlusStr                 = "+"
-	MinusStr                = "-"
-	MultStr                 = "*"
-	DivStr                  = "/"
-	IntDivStr               = "div"
-	ModStr                  = "%"
-	ShiftLeftStr            = "<<"
-	ShiftRightStr           = ">>"
-	JSONExtractOpStr        = "->"
-	JSONUnquoteExtractOpStr = "->>"
+	BitAndStr     = "&"
+	BitOrStr      = "|"
+	BitXorStr     = "^"
+	PlusStr       = "+"
+	MinusStr      = "-"
+	MultStr       = "*"
+	DivStr        = "/"
+	IntDivStr     = "div"
+	ModStr        = "%"
+	ShiftLeftStr  = "<<"
+	ShiftRightStr = ">>"
 
 	// UnaryExpr.Operator
 	UPlusStr    = "+"
@@ -277,6 +298,7 @@ const (
 	AllVExplainStr = "all"
 	PlanStr        = "plan"
 	TraceStr       = "trace"
+	KeysStr        = "keys"
 
 	// Lock Types
 	ReadStr             = "read"
@@ -512,6 +534,7 @@ const (
 	AddAutoIncDDLAction
 	DropAutoIncDDLAction
 	RevertDDLAction
+	CreateProcedureAction
 )
 
 // Constants for scope of variables
@@ -537,6 +560,13 @@ const (
 	ForUpdateLock
 	ForUpdateLockNoWait
 	ForUpdateLockSkipLocked
+)
+
+// Constants for Enum Type - HandlerAction
+const (
+	ContinueAction HandlerAction = iota
+	ExitAction
+	UndoAction
 )
 
 // Constants for Enum Type - TrimType
@@ -691,47 +721,6 @@ const (
 	All
 )
 
-func (op ComparisonExprOperator) Inverse() ComparisonExprOperator {
-	switch op {
-	case EqualOp:
-		return NotEqualOp
-	case LessThanOp:
-		return GreaterEqualOp
-	case GreaterThanOp:
-		return LessEqualOp
-	case LessEqualOp:
-		return GreaterThanOp
-	case GreaterEqualOp:
-		return LessThanOp
-	case NotEqualOp:
-		return EqualOp
-	case NullSafeEqualOp:
-		return NotEqualOp
-	case InOp:
-		return NotInOp
-	case NotInOp:
-		return InOp
-	case LikeOp:
-		return NotLikeOp
-	case NotLikeOp:
-		return LikeOp
-	case RegexpOp:
-		return NotRegexpOp
-	case NotRegexpOp:
-		return RegexpOp
-	}
-	panic("unreachable")
-}
-
-func (op ComparisonExprOperator) IsCommutative() bool {
-	switch op {
-	case EqualOp, NotEqualOp, NullSafeEqualOp:
-		return true
-	default:
-		return false
-	}
-}
-
 // Constant for Enum Type - IsExprOperator
 const (
 	IsNullOp IsExprOperator = iota
@@ -755,8 +744,6 @@ const (
 	ModOp
 	ShiftLeftOp
 	ShiftRightOp
-	JSONExtractOp
-	JSONUnquoteExtractOp
 )
 
 // Constant for Enum Type - UnaryExprOperator
@@ -819,6 +806,29 @@ const (
 	UpgradeAction
 )
 
+// Constant for Enum Type - ProcParameterMode
+const (
+	InMode ProcParameterMode = iota
+	OutMode
+	InoutMode
+)
+
+// Constant for Enum Type - SignalConditionName
+const (
+	ClassOriginType SignalConditionName = iota
+	SubclassOriginType
+	MessageTextType
+	MySQLErrNoType
+	ConstraintCatalogType
+	ConstraintSchemaType
+	ConstraintNameType
+	CatalogNameType
+	SchemaNameType
+	TableNameType
+	ColumnNameType
+	CursorNameType
+)
+
 // Constant for Enum Type - PartitionByType
 const (
 	HashType PartitionByType = iota
@@ -848,6 +858,7 @@ const (
 	PlanVExplainType
 	AllVExplainType
 	TraceVExplainType
+	KeysVExplainType
 )
 
 // Constant for Enum Type - SelectIntoType
@@ -855,6 +866,7 @@ const (
 	IntoOutfile SelectIntoType = iota
 	IntoOutfileS3
 	IntoDumpfile
+	IntoVariables
 )
 
 // Constant for Enum Type - JtOnResponseType
@@ -948,6 +960,8 @@ const (
 	LaunchAllMigrationType
 	CompleteMigrationType
 	CompleteAllMigrationType
+	PostponeCompleteMigrationType
+	PostponeCompleteAllMigrationType
 	CancelMigrationType
 	CancelAllMigrationType
 	CleanupMigrationType
@@ -958,6 +972,7 @@ const (
 	UnthrottleAllMigrationType
 	ForceCutOverMigrationType
 	ForceCutOverAllMigrationType
+	SetCutOverThresholdMigrationType
 )
 
 // ColumnStorage constants
@@ -972,6 +987,7 @@ const (
 	FixedFormat
 	DynamicFormat
 	DefaultFormat
+	CompressedFormat
 )
 
 // Transaction access mode
@@ -979,6 +995,12 @@ const (
 	WithConsistentSnapshot TxAccessMode = iota
 	ReadWrite
 	ReadOnly
+)
+
+// BEGIN statement type
+const (
+	BeginStmt BeginType = iota
+	StartTransactionStmt
 )
 
 // Enum Types of WKT functions

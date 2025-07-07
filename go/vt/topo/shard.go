@@ -20,7 +20,6 @@ import (
 	"context"
 	"encoding/hex"
 	"errors"
-	"fmt"
 	"path"
 	"slices"
 	"sort"
@@ -29,19 +28,17 @@ import (
 	"time"
 
 	"vitess.io/vitess/go/constants/sidecar"
-	"vitess.io/vitess/go/protoutil"
-	"vitess.io/vitess/go/vt/proto/vtrpc"
-	"vitess.io/vitess/go/vt/vterrors"
-
 	"vitess.io/vitess/go/event"
+	"vitess.io/vitess/go/protoutil"
 	"vitess.io/vitess/go/trace"
 	"vitess.io/vitess/go/vt/concurrency"
 	"vitess.io/vitess/go/vt/key"
 	"vitess.io/vitess/go/vt/log"
+	topodatapb "vitess.io/vitess/go/vt/proto/topodata"
+	"vitess.io/vitess/go/vt/proto/vtrpc"
 	"vitess.io/vitess/go/vt/topo/events"
 	"vitess.io/vitess/go/vt/topo/topoproto"
-
-	topodatapb "vitess.io/vitess/go/vt/proto/topodata"
+	"vitess.io/vitess/go/vt/vterrors"
 )
 
 const (
@@ -166,6 +163,10 @@ func (si *ShardInfo) SetPrimaryTermStartTime(t time.Time) {
 // GetShard is a high level function to read shard data.
 // It generates trace spans.
 func (ts *Server) GetShard(ctx context.Context, keyspace, shard string) (*ShardInfo, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+
 	if err := ValidateKeyspaceName(keyspace); err != nil {
 		return nil, err
 	}
@@ -201,6 +202,10 @@ func (ts *Server) updateShard(ctx context.Context, si *ShardInfo) error {
 	span.Annotate("keyspace", si.keyspace)
 	span.Annotate("shard", si.shardName)
 	defer span.Finish()
+
+	if err := ctx.Err(); err != nil {
+		return err
+	}
 
 	data, err := si.Shard.MarshalVT()
 	if err != nil {
@@ -253,6 +258,10 @@ func (ts *Server) UpdateShardFields(ctx context.Context, keyspace, shard string,
 // This will lock the Keyspace, as we may be looking at other shard servedTypes.
 // Using GetOrCreateShard is probably a better idea for most use cases.
 func (ts *Server) CreateShard(ctx context.Context, keyspace, shard string) (err error) {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+
 	if err := ValidateKeyspaceName(keyspace); err != nil {
 		return err
 	}
@@ -356,6 +365,10 @@ func (ts *Server) GetOrCreateShard(ctx context.Context, keyspace, shard string) 
 // DeleteShard wraps the underlying conn.Delete
 // and dispatches the event.
 func (ts *Server) DeleteShard(ctx context.Context, keyspace, shard string) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+
 	shardPath := shardFilePath(keyspace, shard)
 	if err := ts.globalCell.Delete(ctx, shardPath, nil); err != nil {
 		return err
@@ -553,7 +566,6 @@ func (ts *Server) FindAllTabletAliasesInShardByCell(ctx context.Context, keyspac
 	span.Annotate("shard", shard)
 	span.Annotate("num_cells", len(cells))
 	defer span.Finish()
-	ctx = trace.NewContext(ctx, span)
 	var err error
 
 	// The caller intents to all cells
@@ -597,7 +609,7 @@ func (ts *Server) FindAllTabletAliasesInShardByCell(ctx context.Context, keyspac
 			case IsErrType(err, NoNode):
 				// There is no shard replication for this shard in this cell. NOOP
 			default:
-				rec.RecordError(vterrors.Wrap(err, fmt.Sprintf("GetShardReplication(%v, %v, %v) failed.", cell, keyspace, shard)))
+				rec.RecordError(vterrors.Wrapf(err, "GetShardReplication(%v, %v, %v) failed.", cell, keyspace, shard))
 				return
 			}
 		}(cell)
@@ -614,6 +626,40 @@ func (ts *Server) FindAllTabletAliasesInShardByCell(ctx context.Context, keyspac
 	}
 	sort.Sort(topoproto.TabletAliasList(result))
 	return result, err
+}
+
+// GetTabletsByShard returns the tablets in the given shard using all cells.
+// It can return ErrPartialResult if it couldn't read all the cells, or all
+// the individual tablets, in which case the result is valid, but partial.
+func (ts *Server) GetTabletsByShard(ctx context.Context, keyspace, shard string) ([]*TabletInfo, error) {
+	return ts.GetTabletsByShardCell(ctx, keyspace, shard, nil)
+}
+
+// GetTabletsByShardCell returns the tablets in the given shard. It can return
+// ErrPartialResult if it couldn't read all the cells, or all the individual
+// tablets, in which case the result is valid, but partial.
+func (ts *Server) GetTabletsByShardCell(ctx context.Context, keyspace, shard string, cells []string) ([]*TabletInfo, error) {
+	span, ctx := trace.NewSpan(ctx, "topo.GetTabletsByShardCell")
+	span.Annotate("keyspace", keyspace)
+	span.Annotate("shard", shard)
+	span.Annotate("num_cells", len(cells))
+	defer span.Finish()
+	var err error
+
+	// if we get a partial result, we keep going. It most likely means
+	// a cell is out of commission.
+	aliases, err := ts.FindAllTabletAliasesInShardByCell(ctx, keyspace, shard, cells)
+	if err != nil && !IsErrType(err, PartialResult) {
+		return nil, err
+	}
+
+	// get the tablets for the cells we were able to reach, forward
+	// ErrPartialResult from FindAllTabletAliasesInShard
+	result, gerr := ts.GetTabletList(ctx, aliases, nil)
+	if gerr == nil && err != nil {
+		gerr = err
+	}
+	return result, gerr
 }
 
 // GetTabletMapForShard returns the tablets for a shard. It can return
@@ -660,6 +706,10 @@ type WatchShardData struct {
 // It has the same contract as conn.Watch, but it also unpacks the
 // contents into a Shard object
 func (ts *Server) WatchShard(ctx context.Context, keyspace, shard string) (*WatchShardData, <-chan *WatchShardData, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, nil, err
+	}
+
 	shardPath := shardFilePath(keyspace, shard)
 	ctx, cancel := context.WithCancel(ctx)
 

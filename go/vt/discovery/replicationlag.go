@@ -28,10 +28,9 @@ import (
 )
 
 var (
-	configKey = viperutil.KeyPrefixFunc("discovery")
 	// lowReplicationLag defines the duration that replication lag is low enough that the VTTablet is considered healthy.
 	lowReplicationLag = viperutil.Configure(
-		configKey("low_replication_lag"),
+		"discovery_low_replication_lag",
 		viperutil.Options[time.Duration]{
 			FlagName: "discovery_low_replication_lag",
 			Default:  30 * time.Second,
@@ -39,7 +38,7 @@ var (
 		},
 	)
 	highReplicationLagMinServing = viperutil.Configure(
-		configKey("high_replication_lag"),
+		"discovery_high_replication_lag",
 		viperutil.Options[time.Duration]{
 			FlagName: "discovery_high_replication_lag_minimum_serving",
 			Default:  2 * time.Hour,
@@ -47,7 +46,7 @@ var (
 		},
 	)
 	minNumTablets = viperutil.Configure(
-		configKey("min_number_serving_vttablets"),
+		"discovery_min_number_serving_vttablets",
 		viperutil.Options[int]{
 			FlagName: "min_number_serving_vttablets",
 			Default:  2,
@@ -55,7 +54,7 @@ var (
 		},
 	)
 	legacyReplicationLagAlgorithm = viperutil.Configure(
-		configKey("legacy_replication_lag_algorithm"),
+		"discovery_legacy_replication_lag_algorithm",
 		viperutil.Options[bool]{
 			FlagName: "legacy_replication_lag_algorithm",
 			Default:  true,
@@ -146,7 +145,7 @@ func IsReplicationLagVeryHigh(tabletHealth *TabletHealth) bool {
 // One thing to know about this code: vttablet also has a couple flags that impact the logic here:
 //   - unhealthy_threshold: if replication lag is higher than this, a tablet will be reported as unhealthy.
 //     The default for this is 2h, same as the discovery_high_replication_lag_minimum_serving here.
-//   - degraded_threshold: this is only used by vttablet for display. It should match
+//   - degraded-threshold: this is only used by vttablet for display. It should match
 //     discovery_low_replication_lag here, so the vttablet status display matches what vtgate will do of it.
 func FilterStatsByReplicationLag(tabletHealthList []*TabletHealth) []*TabletHealth {
 	if !legacyReplicationLagAlgorithm.Get() {

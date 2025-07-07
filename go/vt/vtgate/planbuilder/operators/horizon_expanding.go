@@ -78,6 +78,12 @@ func expandSelectHorizon(ctx *plancontext.PlanningContext, horizon *Horizon, sel
 		for _, order := range horizon.Query.GetOrderBy() {
 			qp.addDerivedColumn(ctx, order.Expr)
 		}
+		sel, isSel := horizon.Query.(*sqlparser.Select)
+		if isSel && sel.Having != nil {
+			for _, pred := range sqlparser.SplitAndExpression(nil, sel.Having.Expr) {
+				qp.addDerivedColumn(ctx, pred)
+			}
+		}
 	}
 
 	op := createProjectionFromSelect(ctx, horizon)
@@ -229,7 +235,7 @@ func createProjectionWithAggr(ctx *plancontext.PlanningContext, qp *QueryProject
 
 func pullOutValueSubqueries(ctx *plancontext.PlanningContext, aggr Aggr, sqc *SubQueryBuilder, outerID semantics.TableSet) Aggr {
 	exprs := aggr.getPushColumnExprs()
-	var newExprs sqlparser.Exprs
+	var newExprs []sqlparser.Expr
 	for _, expr := range exprs {
 		newExpr, subqs := sqc.pullOutValueSubqueries(ctx, expr, outerID, false)
 		if newExpr != nil {
@@ -338,7 +344,7 @@ func createProjectionWithoutAggr(ctx *plancontext.PlanningContext, qp *QueryProj
 }
 
 func newStarProjection(src Operator, qp *QueryProjection) *Projection {
-	cols := sqlparser.SelectExprs{}
+	var cols []sqlparser.SelectExpr
 
 	for _, expr := range qp.SelectExprs {
 		_ = sqlparser.Walk(func(node sqlparser.SQLNode) (kontinue bool, err error) {

@@ -26,7 +26,6 @@ import (
 	"time"
 
 	"vitess.io/vitess/go/ptr"
-	"vitess.io/vitess/go/vt/concurrency"
 	"vitess.io/vitess/go/vt/discovery"
 	"vitess.io/vitess/go/vt/key"
 	"vitess.io/vitess/go/vt/proto/vtctldata"
@@ -39,7 +38,6 @@ import (
 
 	binlogdatapb "vitess.io/vitess/go/vt/proto/binlogdata"
 	tabletmanagerdatapb "vitess.io/vitess/go/vt/proto/tabletmanagerdata"
-	vschemapb "vitess.io/vitess/go/vt/proto/vschema"
 	vtrpcpb "vitess.io/vitess/go/vt/proto/vtrpc"
 )
 
@@ -51,7 +49,7 @@ type resharder struct {
 	sourcePrimaries map[string]*topo.TabletInfo
 	targetShards    []*topo.ShardInfo
 	targetPrimaries map[string]*topo.TabletInfo
-	vschema         *vschemapb.Keyspace
+	vschema         *topo.KeyspaceVSchemaInfo
 	refStreams      map[string]*refStream
 	// This can be single cell name or cell alias but it can
 	// also be a comma-separated list of cells.
@@ -146,7 +144,7 @@ func (s *Server) buildResharder(ctx context.Context, req *vtctldata.ReshardCreat
 // VReplication workflow streams as that is an invalid starting
 // state for the non-serving shards involved in a Reshard.
 func (rs *resharder) validateTargets(ctx context.Context) error {
-	err := rs.forAll(rs.targetShards, func(target *topo.ShardInfo) error {
+	err := forAllShards(rs.targetShards, func(target *topo.ShardInfo) error {
 		targetPrimary := rs.targetPrimaries[target.ShardName()]
 		res, err := rs.s.tmc.HasVReplicationWorkflows(ctx, targetPrimary.Tablet, &tabletmanagerdatapb.HasVReplicationWorkflowsRequest{})
 		if err != nil {
@@ -162,7 +160,7 @@ func (rs *resharder) validateTargets(ctx context.Context) error {
 
 func (rs *resharder) readRefStreams(ctx context.Context) error {
 	var mu sync.Mutex
-	err := rs.forAll(rs.sourceShards, func(source *topo.ShardInfo) error {
+	err := forAllShards(rs.sourceShards, func(source *topo.ShardInfo) error {
 		sourcePrimary := rs.sourcePrimaries[source.ShardName()]
 
 		req := &tabletmanagerdatapb.ReadVReplicationWorkflowsRequest{
@@ -268,7 +266,7 @@ func (rs *resharder) identifyRuleType(rule *binlogdatapb.Rule) (StreamType, erro
 
 func (rs *resharder) copySchema(ctx context.Context) error {
 	oneSource := rs.sourceShards[0].PrimaryAlias
-	err := rs.forAll(rs.targetShards, func(target *topo.ShardInfo) error {
+	err := forAllShards(rs.targetShards, func(target *topo.ShardInfo) error {
 		return rs.s.CopySchemaShard(ctx, oneSource, []string{"/.*"}, nil, false, rs.keyspace, target.ShardName(), 1*time.Second, false)
 	})
 	return err
@@ -287,7 +285,7 @@ func (rs *resharder) createStreams(ctx context.Context) error {
 		}
 	}
 
-	err := rs.forAll(rs.targetShards, func(target *topo.ShardInfo) error {
+	err := forAllShards(rs.targetShards, func(target *topo.ShardInfo) error {
 		targetPrimary := rs.targetPrimaries[target.ShardName()]
 
 		ig := vreplication.NewInsertGenerator(binlogdatapb.VReplicationWorkflowState_Stopped, targetPrimary.DbName())
@@ -298,7 +296,6 @@ func (rs *resharder) createStreams(ctx context.Context) error {
 		if err != nil {
 			return err
 		}
-		optionsJSON = fmt.Sprintf("'%s'", optionsJSON)
 		for _, source := range rs.sourceShards {
 			if !key.KeyRangeIntersect(target.KeyRange, source.KeyRange) {
 				continue
@@ -339,7 +336,7 @@ func (rs *resharder) createStreams(ctx context.Context) error {
 }
 
 func (rs *resharder) startStreams(ctx context.Context) error {
-	err := rs.forAll(rs.targetShards, func(target *topo.ShardInfo) error {
+	err := forAllShards(rs.targetShards, func(target *topo.ShardInfo) error {
 		targetPrimary := rs.targetPrimaries[target.ShardName()]
 		// This is the rare case where we truly want to update every stream/record
 		// because we've already confirmed that there were no existing workflows
@@ -356,21 +353,4 @@ func (rs *resharder) startStreams(ctx context.Context) error {
 		return nil
 	})
 	return err
-}
-
-func (rs *resharder) forAll(shards []*topo.ShardInfo, f func(*topo.ShardInfo) error) error {
-	var wg sync.WaitGroup
-	allErrors := &concurrency.AllErrorRecorder{}
-	for _, shard := range shards {
-		wg.Add(1)
-		go func(shard *topo.ShardInfo) {
-			defer wg.Done()
-
-			if err := f(shard); err != nil {
-				allErrors.RecordError(err)
-			}
-		}(shard)
-	}
-	wg.Wait()
-	return allErrors.AggrError(vterrors.Aggregate)
 }

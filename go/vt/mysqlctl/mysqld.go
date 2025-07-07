@@ -35,6 +35,7 @@ import (
 	"path"
 	"path/filepath"
 	"regexp"
+	"runtime"
 	"strconv"
 	"strings"
 	"sync"
@@ -46,6 +47,8 @@ import (
 	"vitess.io/vitess/config"
 	"vitess.io/vitess/go/mysql"
 	"vitess.io/vitess/go/mysql/sqlerror"
+	"vitess.io/vitess/go/os2"
+	"vitess.io/vitess/go/osutil"
 	"vitess.io/vitess/go/protoutil"
 	"vitess.io/vitess/go/sqltypes"
 	"vitess.io/vitess/go/vt/dbconfigs"
@@ -57,6 +60,7 @@ import (
 	mysqlctlpb "vitess.io/vitess/go/vt/proto/mysqlctl"
 	vtrpcpb "vitess.io/vitess/go/vt/proto/vtrpc"
 	"vitess.io/vitess/go/vt/servenv"
+	"vitess.io/vitess/go/vt/utils"
 	"vitess.io/vitess/go/vt/vterrors"
 )
 
@@ -108,9 +112,10 @@ var (
 
 // Mysqld is the object that represents a mysqld daemon running on this server.
 type Mysqld struct {
-	dbcfgs  *dbconfigs.DBConfigs
-	dbaPool *dbconnpool.ConnectionPool
-	appPool *dbconnpool.ConnectionPool
+	dbcfgs   *dbconfigs.DBConfigs
+	dbaPool  *dbconnpool.ConnectionPool
+	appPool  *dbconnpool.ConnectionPool
+	lockConn *dbconnpool.PooledDBConnection
 
 	capabilities capabilitySet
 
@@ -129,35 +134,27 @@ func init() {
 	for _, cmd := range []string{"vtctld", "vtctldclient"} {
 		servenv.OnParseFor(cmd, registerReparentFlags)
 	}
-	for _, cmd := range []string{"vtcombo", "vttablet", "vttestserver"} {
-		servenv.OnParseFor(cmd, registerDeprecatedReparentFlags)
-	}
 	for _, cmd := range []string{"mysqlctl", "mysqlctld", "vtcombo", "vttablet", "vttestserver"} {
 		servenv.OnParseFor(cmd, registerPoolFlags)
 	}
 }
 
 func registerMySQLDFlags(fs *pflag.FlagSet) {
-	fs.DurationVar(&PoolDynamicHostnameResolution, "pool_hostname_resolve_interval", PoolDynamicHostnameResolution, "if set force an update to all hostnames and reconnect if changed, defaults to 0 (disabled)")
-	fs.StringVar(&mycnfTemplateFile, "mysqlctl_mycnf_template", mycnfTemplateFile, "template file to use for generating the my.cnf file during server init")
-	fs.StringVar(&socketFile, "mysqlctl_socket", socketFile, "socket file to use for remote mysqlctl actions (empty for local actions)")
-	fs.DurationVar(&replicationConnectRetry, "replication_connect_retry", replicationConnectRetry, "how long to wait in between replica reconnect attempts. Only precise to the second.")
+	utils.SetFlagDurationVar(fs, &PoolDynamicHostnameResolution, "pool-hostname-resolve-interval", PoolDynamicHostnameResolution, "if set force an update to all hostnames and reconnect if changed, defaults to 0 (disabled)")
+	utils.SetFlagStringVar(fs, &mycnfTemplateFile, "mysqlctl-mycnf-template", mycnfTemplateFile, "template file to use for generating the my.cnf file during server init")
+	utils.SetFlagStringVar(fs, &socketFile, "mysqlctl-socket", socketFile, "socket file to use for remote mysqlctl actions (empty for local actions)")
+	utils.SetFlagDurationVar(fs, &replicationConnectRetry, "replication-connect-retry", replicationConnectRetry, "how long to wait in between replica reconnect attempts. Only precise to the second.")
 }
 
 func registerReparentFlags(fs *pflag.FlagSet) {
-	fs.BoolVar(&DisableActiveReparents, "disable_active_reparents", DisableActiveReparents, "if set, do not allow active reparents. Use this to protect a cluster using external reparents.")
-}
-
-func registerDeprecatedReparentFlags(fs *pflag.FlagSet) {
-	fs.BoolVar(&DisableActiveReparents, "disable_active_reparents", DisableActiveReparents, "if set, do not allow active reparents. Use this to protect a cluster using external reparents.")
-	fs.MarkDeprecated("disable_active_reparents", "Use --unmanaged flag instead for unmanaged tablets.")
+	utils.SetFlagBoolVar(fs, &DisableActiveReparents, "disable-active-reparents", DisableActiveReparents, "if set, do not allow active reparents. Use this to protect a cluster using external reparents.")
 }
 
 func registerPoolFlags(fs *pflag.FlagSet) {
-	fs.IntVar(&dbaPoolSize, "dba_pool_size", dbaPoolSize, "Size of the connection pool for dba connections")
-	fs.DurationVar(&DbaIdleTimeout, "dba_idle_timeout", DbaIdleTimeout, "Idle timeout for dba connections")
-	fs.DurationVar(&appIdleTimeout, "app_idle_timeout", appIdleTimeout, "Idle timeout for app connections")
-	fs.IntVar(&appPoolSize, "app_pool_size", appPoolSize, "Size of the connection pool for app connections")
+	utils.SetFlagIntVar(fs, &dbaPoolSize, "dba-pool-size", dbaPoolSize, "Size of the connection pool for dba connections")
+	utils.SetFlagDurationVar(fs, &DbaIdleTimeout, "dba-idle-timeout", DbaIdleTimeout, "Idle timeout for dba connections")
+	utils.SetFlagDurationVar(fs, &appIdleTimeout, "app-idle-timeout", appIdleTimeout, "Idle timeout for app connections")
+	utils.SetFlagIntVar(fs, &appPoolSize, "app-pool-size", appPoolSize, "Size of the connection pool for app connections")
 }
 
 // NewMysqld creates a Mysqld object based on the provided configuration
@@ -451,6 +448,15 @@ func (mysqld *Mysqld) startNoWait(cnf *Mycnf, mysqldArgs ...string) error {
 		return fmt.Errorf("mysqld_start hook failed: %v", hr.String())
 	}
 
+	// try the postflight mysqld start hook, if any
+	switch hr := hook.NewHook("postflight_mysqld_start", mysqldArgs).Execute(); hr.ExitStatus {
+	case hook.HOOK_SUCCESS, hook.HOOK_DOES_NOT_EXIST:
+		// hook exists and worked, or does not exist, we can keep going
+	default:
+		// hook failed, we report error
+		return fmt.Errorf("postflight_mysqld_start hook failed: %v", hr.String())
+	}
+
 	return nil
 }
 
@@ -621,9 +627,20 @@ func (mysqld *Mysqld) Shutdown(ctx context.Context, cnf *Mycnf, waitForMysqld bo
 		return nil
 	}
 
-	// try the mysqld shutdown hook, if any
-	h := hook.NewSimpleHook("mysqld_shutdown")
+	// try the preflight mysqld shutdown hook, if any
+	h := hook.NewSimpleHook("preflight_mysqld_shutdown")
 	hr := h.ExecuteContext(ctx)
+	switch hr.ExitStatus {
+	case hook.HOOK_SUCCESS, hook.HOOK_DOES_NOT_EXIST:
+		// hook exists and worked, or else does not exist.
+	default:
+		// hook failed, we report error
+		return fmt.Errorf("preflight_mysqld_shutdown hook failed: %v", hr.String())
+	}
+
+	// try the mysqld shutdown hook, if any
+	h = hook.NewSimpleHook("mysqld_shutdown")
+	hr = h.ExecuteContext(ctx)
 	switch hr.ExitStatus {
 	case hook.HOOK_SUCCESS:
 		// hook exists and worked, we can keep going
@@ -898,14 +915,14 @@ func (mysqld *Mysqld) initConfig(cnf *Mycnf, outFile string) error {
 		return err
 	}
 
-	return os.WriteFile(outFile, []byte(configData), 0o664)
+	return os2.WriteFile(outFile, []byte(configData))
 }
 
 func (mysqld *Mysqld) getMycnfTemplate() string {
 	if mycnfTemplateFile != "" {
 		data, err := os.ReadFile(mycnfTemplateFile)
 		if err != nil {
-			log.Fatalf("template file specified by -mysqlctl_mycnf_template could not be read: %v", mycnfTemplateFile)
+			log.Fatalf("template file specified by -mysqlctl-mycnf-template could not be read: %v", mycnfTemplateFile)
 		}
 		return string(data) // use only specified template
 	}
@@ -937,6 +954,8 @@ func (mysqld *Mysqld) getMycnfTemplate() string {
 			} else {
 				versionConfig = config.MycnfMySQL80
 			}
+		case 9:
+			versionConfig = config.MycnfMySQL90
 		default:
 			log.Infof("this version of Vitess does not include built-in support for %v %v", mysqld.capabilities.flavor, mysqld.capabilities.version)
 		}
@@ -1048,7 +1067,7 @@ func (mysqld *Mysqld) ReinitConfig(ctx context.Context, cnf *Mycnf) error {
 func (mysqld *Mysqld) createDirs(cnf *Mycnf) error {
 	tabletDir := cnf.TabletDir()
 	log.Infof("creating directory %s", tabletDir)
-	if err := os.MkdirAll(tabletDir, os.ModePerm); err != nil {
+	if err := os2.MkdirAll(tabletDir); err != nil {
 		return err
 	}
 	for _, dir := range TopLevelDirs() {
@@ -1058,7 +1077,7 @@ func (mysqld *Mysqld) createDirs(cnf *Mycnf) error {
 	}
 	for _, dir := range cnf.directoryList() {
 		log.Infof("creating directory %s", dir)
-		if err := os.MkdirAll(dir, os.ModePerm); err != nil {
+		if err := os2.MkdirAll(dir); err != nil {
 			return err
 		}
 		// FIXME(msolomon) validate permissions?
@@ -1082,14 +1101,14 @@ func (mysqld *Mysqld) createTopDir(cnf *Mycnf, dir string) error {
 		if os.IsNotExist(err) {
 			topdir := path.Join(tabletDir, dir)
 			log.Infof("creating directory %s", topdir)
-			return os.MkdirAll(topdir, os.ModePerm)
+			return os2.MkdirAll(topdir)
 		}
 		return err
 	}
 	linkto := path.Join(target, vtname)
 	source := path.Join(tabletDir, dir)
 	log.Infof("creating directory %s", linkto)
-	err = os.MkdirAll(linkto, os.ModePerm)
+	err = os2.MkdirAll(linkto)
 	if err != nil {
 		return err
 	}
@@ -1173,7 +1192,7 @@ func (mysqld *Mysqld) executeMysqlScript(ctx context.Context, connParams *mysql.
 // 'defer os.Remove()' statement.
 func (mysqld *Mysqld) defaultsExtraFile(connParams *mysql.ConnParams) (string, error) {
 	var contents string
-	connParams.Pass = strings.Replace(connParams.Pass, "#", "\\#", -1)
+	connParams.Pass = strings.ReplaceAll(connParams.Pass, "#", "\\#")
 	if connParams.UnixSocket == "" {
 		contents = fmt.Sprintf(`
 [client]
@@ -1290,6 +1309,60 @@ func (mysqld *Mysqld) GetVersionComment(ctx context.Context) (string, error) {
 	}
 	res := qr.Named().Row()
 	return res.ToString("@@global.version_comment")
+}
+
+// hostMetrics returns several OS metrics to be used by the tablet throttler.
+func hostMetrics(ctx context.Context, cnf *Mycnf) (*mysqlctlpb.HostMetricsResponse, error) {
+	resp := &mysqlctlpb.HostMetricsResponse{
+		Metrics: make(map[string]*mysqlctlpb.HostMetricsResponse_Metric),
+	}
+	newMetric := func(name string) *mysqlctlpb.HostMetricsResponse_Metric {
+		metric := &mysqlctlpb.HostMetricsResponse_Metric{
+			Name: name,
+		}
+		resp.Metrics[name] = metric
+		return metric
+	}
+	withError := func(metric *mysqlctlpb.HostMetricsResponse_Metric, err error) error {
+		if err != nil {
+			metric.Error = &vtrpcpb.RPCError{
+				Message: err.Error(),
+				Code:    vtrpcpb.Code_FAILED_PRECONDITION,
+			}
+		}
+		return err
+	}
+
+	_ = func() error {
+		metric := newMetric("datadir-used-ratio")
+		// 0.0 for empty mount, 1.0 for completely full mount
+		var st syscall.Statfs_t
+		if err := syscall.Statfs(cnf.DataDir, &st); err != nil {
+			return withError(metric, err)
+		}
+		if st.Blocks == 0 {
+			return withError(metric, fmt.Errorf("unexpected zero blocks in %s", cnf.DataDir))
+		}
+		metric.Value = float64(st.Blocks-st.Bfree) / float64(st.Blocks)
+		return nil
+	}()
+
+	_ = func() error {
+		metric := newMetric("loadavg")
+		loadAvg, err := osutil.LoadAvg()
+		if err != nil {
+			return withError(metric, err)
+		}
+		metric.Value = loadAvg / float64(runtime.NumCPU())
+		return nil
+	}()
+
+	return resp, nil
+}
+
+// HostMetrics returns several OS metrics to be used by the tablet throttler.
+func (mysqld *Mysqld) HostMetrics(ctx context.Context, cnf *Mycnf) (*mysqlctlpb.HostMetricsResponse, error) {
+	return hostMetrics(ctx, cnf)
 }
 
 // ApplyBinlogFile extracts a binary log file and applies it to MySQL. It is the equivalent of:

@@ -40,18 +40,28 @@ import (
 	"time"
 
 	"github.com/aws/aws-sdk-go-v2/aws"
+	"github.com/aws/aws-sdk-go-v2/aws/retry"
 	"github.com/aws/aws-sdk-go-v2/config"
 	"github.com/aws/aws-sdk-go-v2/feature/s3/manager"
 	"github.com/aws/aws-sdk-go-v2/service/s3"
 	"github.com/aws/aws-sdk-go-v2/service/s3/types"
+	transport "github.com/aws/smithy-go/endpoints"
 	"github.com/aws/smithy-go/middleware"
+	"github.com/dustin/go-humanize"
 	"github.com/spf13/pflag"
 
-	"vitess.io/vitess/go/vt/concurrency"
+	errorsbackup "vitess.io/vitess/go/vt/mysqlctl/errors"
+	"vitess.io/vitess/go/vt/utils"
+
 	"vitess.io/vitess/go/vt/log"
 	stats "vitess.io/vitess/go/vt/mysqlctl/backupstats"
 	"vitess.io/vitess/go/vt/mysqlctl/backupstorage"
 	"vitess.io/vitess/go/vt/servenv"
+)
+
+const (
+	sseCustomerPrefix = "sse_c:"
+	MaxPartSize       = 1024 * 1024 * 1024 * 5 // 5GiB - limited by AWS https://docs.aws.amazon.com/AmazonS3/latest/userguide/qfacts.html
 )
 
 var (
@@ -83,18 +93,25 @@ var (
 
 	// path component delimiter
 	delimiter = "/"
+
+	// minimum part size
+	minPartSize int64
+
+	ErrPartSize = errors.New("minimum S3 part size must be between 5MiB and 5GiB")
 )
 
 func registerFlags(fs *pflag.FlagSet) {
-	fs.StringVar(&region, "s3_backup_aws_region", "us-east-1", "AWS region to use.")
-	fs.IntVar(&retryCount, "s3_backup_aws_retries", -1, "AWS request retries.")
-	fs.StringVar(&endpoint, "s3_backup_aws_endpoint", "", "endpoint of the S3 backend (region must be provided).")
-	fs.StringVar(&bucket, "s3_backup_storage_bucket", "", "S3 bucket to use for backups.")
-	fs.StringVar(&root, "s3_backup_storage_root", "", "root prefix for all backup-related object names.")
-	fs.BoolVar(&forcePath, "s3_backup_force_path_style", false, "force the s3 path style.")
-	fs.BoolVar(&tlsSkipVerifyCert, "s3_backup_tls_skip_verify_cert", false, "skip the 'certificate is valid' check for SSL connections.")
-	fs.StringVar(&requiredLogLevel, "s3_backup_log_level", "LogOff", "determine the S3 loglevel to use from LogOff, LogDebug, LogDebugWithSigning, LogDebugWithHTTPBody, LogDebugWithRequestRetries, LogDebugWithRequestErrors.")
-	fs.StringVar(&sse, "s3_backup_server_side_encryption", "", "server-side encryption algorithm (e.g., AES256, aws:kms, sse_c:/path/to/key/file).")
+
+	utils.SetFlagStringVar(fs, &region, "s3-backup-aws-region", "us-east-1", "AWS region to use.")
+	utils.SetFlagIntVar(fs, &retryCount, "s3-backup-aws-retries", -1, "AWS request retries.")
+	utils.SetFlagStringVar(fs, &endpoint, "s3-backup-aws-endpoint", "", "endpoint of the S3 backend (region must be provided).")
+	utils.SetFlagStringVar(fs, &bucket, "s3-backup-storage-bucket", "", "S3 bucket to use for backups.")
+	utils.SetFlagStringVar(fs, &root, "s3-backup-storage-root", "", "root prefix for all backup-related object names.")
+	utils.SetFlagBoolVar(fs, &forcePath, "s3-backup-force-path-style", false, "force the s3 path style.")
+	utils.SetFlagBoolVar(fs, &tlsSkipVerifyCert, "s3-backup-tls-skip-verify-cert", false, "skip the 'certificate is valid' check for SSL connections.")
+	utils.SetFlagStringVar(fs, &requiredLogLevel, "s3-backup-log-level", "LogOff", "determine the S3 loglevel to use from LogOff, LogDebug, LogDebugWithSigning, LogDebugWithHTTPBody, LogDebugWithRequestRetries, LogDebugWithRequestErrors.")
+	utils.SetFlagStringVar(fs, &sse, "s3-backup-server-side-encryption", "", "server-side encryption algorithm (e.g., AES256, aws:kms, sse_c:/path/to/key/file).")
+	utils.SetFlagInt64Var(fs, &minPartSize, "s3-backup-aws-min-partsize", manager.MinUploadPartSize, "Minimum part size to use, defaults to 5MiB but can be increased due to the dataset size.")
 }
 
 func init() {
@@ -108,7 +125,22 @@ type logNameToLogLevel map[string]aws.ClientLogMode
 
 var logNameMap logNameToLogLevel
 
-const sseCustomerPrefix = "sse_c:"
+type endpointResolver struct {
+	r        s3.EndpointResolverV2
+	endpoint *string
+}
+
+func (er *endpointResolver) ResolveEndpoint(ctx context.Context, params s3.EndpointParameters) (transport.Endpoint, error) {
+	params.Endpoint = er.endpoint
+	return er.r.ResolveEndpoint(ctx, params)
+}
+
+func newEndpointResolver() *endpointResolver {
+	return &endpointResolver{
+		r:        s3.NewDefaultEndpointResolverV2(),
+		endpoint: &endpoint,
+	}
+}
 
 type iClient interface {
 	manager.UploadAPIClient
@@ -126,8 +158,8 @@ type S3BackupHandle struct {
 	dir       string
 	name      string
 	readOnly  bool
-	errors    concurrency.AllErrorRecorder
 	waitGroup sync.WaitGroup
+	errorsbackup.PerFileErrorRecorder
 }
 
 // Directory is part of the backupstorage.BackupHandle interface.
@@ -140,39 +172,28 @@ func (bh *S3BackupHandle) Name() string {
 	return bh.name
 }
 
-// RecordError is part of the concurrency.ErrorRecorder interface.
-func (bh *S3BackupHandle) RecordError(err error) {
-	bh.errors.RecordError(err)
-}
-
-// HasErrors is part of the concurrency.ErrorRecorder interface.
-func (bh *S3BackupHandle) HasErrors() bool {
-	return bh.errors.HasErrors()
-}
-
-// Error is part of the concurrency.ErrorRecorder interface.
-func (bh *S3BackupHandle) Error() error {
-	return bh.errors.Error()
-}
-
 // AddFile is part of the backupstorage.BackupHandle interface.
 func (bh *S3BackupHandle) AddFile(ctx context.Context, filename string, filesize int64) (io.WriteCloser, error) {
 	if bh.readOnly {
 		return nil, fmt.Errorf("AddFile cannot be called on read-only backup")
 	}
 
-	// Calculate s3 upload part size using the source filesize
-	partSizeBytes := manager.DefaultUploadPartSize
-	if filesize > 0 {
-		minimumPartSize := float64(filesize) / float64(manager.MaxUploadParts)
-		// Round up to ensure large enough partsize
-		calculatedPartSizeBytes := int64(math.Ceil(minimumPartSize))
-		if calculatedPartSizeBytes > partSizeBytes {
-			partSizeBytes = calculatedPartSizeBytes
-		}
+	partSizeBytes, err := calculateUploadPartSize(filesize)
+	if err != nil {
+		return nil, err
 	}
 
+	bh.bs.params.Logger.Infof("Using S3 upload part size: %s", humanize.IBytes(uint64(partSizeBytes)))
+
 	reader, writer := io.Pipe()
+	bh.handleAddFile(ctx, filename, partSizeBytes, reader, func(err error) {
+		reader.CloseWithError(err)
+	})
+
+	return writer, nil
+}
+
+func (bh *S3BackupHandle) handleAddFile(ctx context.Context, filename string, partSizeBytes int64, reader io.Reader, closer func(error)) {
 	bh.waitGroup.Add(1)
 
 	go func() {
@@ -182,8 +203,7 @@ func (bh *S3BackupHandle) AddFile(ctx context.Context, filename string, filesize
 		})
 		object := objName(bh.dir, bh.name, filename)
 		sendStats := bh.bs.params.Stats.Scope(stats.Operation("AWS:Request:Send"))
-		// Using UploadWithContext breaks uploading to Minio and Ceph https://github.com/vitessio/vitess/issues/14188
-		_, err := uploader.Upload(context.Background(), &s3.PutObjectInput{
+		_, err := uploader.Upload(ctx, &s3.PutObjectInput{
 			Bucket:               &bucket,
 			Key:                  &object,
 			Body:                 reader,
@@ -204,12 +224,36 @@ func (bh *S3BackupHandle) AddFile(ctx context.Context, filename string, filesize
 			})
 		})
 		if err != nil {
-			reader.CloseWithError(err)
-			bh.RecordError(err)
+			closer(err)
+			bh.RecordError(filename, err)
 		}
 	}()
+}
 
-	return writer, nil
+// calculateUploadPartSize is a helper to calculate the part size, taking into consideration the minimum part size
+// passed in by an operator.
+func calculateUploadPartSize(filesize int64) (partSizeBytes int64, err error) {
+	// Calculate s3 upload part size using the source filesize
+	partSizeBytes = manager.DefaultUploadPartSize
+	if filesize > 0 {
+		minimumPartSize := float64(filesize) / float64(manager.MaxUploadParts)
+		// Round up to ensure large enough partsize
+		calculatedPartSizeBytes := int64(math.Ceil(minimumPartSize))
+		if calculatedPartSizeBytes > partSizeBytes {
+			partSizeBytes = calculatedPartSizeBytes
+		}
+	}
+
+	if minPartSize != 0 && partSizeBytes < minPartSize {
+		if minPartSize > MaxPartSize || minPartSize < manager.MinUploadPartSize { // 5GiB and 5MiB respectively
+			return 0, fmt.Errorf("%w, currently set to %s",
+				ErrPartSize, humanize.IBytes(uint64(minPartSize)),
+			)
+		}
+		partSizeBytes = int64(minPartSize)
+	}
+
+	return
 }
 
 // EndBackup is part of the backupstorage.BackupHandle interface.
@@ -488,16 +532,27 @@ func (bs *S3BackupStorage) client() (*s3.Client, error) {
 			return nil, err
 		}
 
-		bs._client = s3.NewFromConfig(cfg, func(o *s3.Options) {
-			o.UsePathStyle = forcePath
-			if retryCount >= 0 {
-				o.RetryMaxAttempts = retryCount
-				o.Retryer = &ClosedConnectionRetryer{}
-			}
-		})
+		options := []func(options *s3.Options){
+			func(o *s3.Options) {
+				o.UsePathStyle = forcePath
+				if retryCount >= 0 {
+					o.RetryMaxAttempts = retryCount
+					o.Retryer = &ClosedConnectionRetryer{
+						awsRetryer: retry.NewStandard(func(options *retry.StandardOptions) {
+							options.MaxAttempts = retryCount
+						}),
+					}
+				}
+			},
+		}
+		if endpoint != "" {
+			options = append(options, s3.WithEndpointResolverV2(newEndpointResolver()))
+		}
+
+		bs._client = s3.NewFromConfig(cfg, options...)
 
 		if len(bucket) == 0 {
-			return nil, fmt.Errorf("--s3_backup_storage_bucket required")
+			return nil, fmt.Errorf("--s3-backup-storage-bucket required")
 		}
 
 		if _, err := bs._client.HeadBucket(context.Background(), &s3.HeadBucketInput{Bucket: &bucket}); err != nil {

@@ -37,8 +37,8 @@ import (
 
 type (
 	InsertCommon struct {
-		// Insert needs tx handling
 		txNeeded
+		noFields
 
 		// Opcode is the execution opcode.
 		Opcode InsertOpcode
@@ -76,6 +76,8 @@ type (
 
 		// ColVindexes are the vindexes that will use the VindexValues
 		ColVindexes []*vindexes.ColumnVindex
+
+		FetchLastInsertID bool
 
 		// Prefix, Suffix are for sharded insert plans.
 		Prefix string
@@ -132,23 +134,8 @@ func (code InsertOpcode) MarshalJSON() ([]byte, error) {
 	return json.Marshal(insName[code])
 }
 
-// GetKeyspaceName specifies the Keyspace that this primitive routes to.
-func (ic *InsertCommon) GetKeyspaceName() string {
-	return ic.Keyspace.Name
-}
-
-// GetTableName specifies the table that this primitive routes to.
-func (ic *InsertCommon) GetTableName() string {
-	return ic.TableName
-}
-
-// GetFields fetches the field info.
-func (ic *InsertCommon) GetFields(context.Context, VCursor, map[string]*querypb.BindVariable) (*sqltypes.Result, error) {
-	return nil, vterrors.VT13001("unexpected fields call for insert query")
-}
-
 func (ins *InsertCommon) executeUnshardedTableQuery(ctx context.Context, vcursor VCursor, loggingPrimitive Primitive, bindVars map[string]*querypb.BindVariable, query string, insertID uint64) (*sqltypes.Result, error) {
-	rss, _, err := vcursor.ResolveDestinations(ctx, ins.Keyspace.Name, nil, []key.Destination{key.DestinationAllShards{}})
+	rss, _, err := vcursor.ResolveDestinations(ctx, ins.Keyspace.Name, nil, []key.ShardDestination{key.DestinationAllShards{}})
 	if err != nil {
 		return nil, err
 	}
@@ -159,7 +146,7 @@ func (ins *InsertCommon) executeUnshardedTableQuery(ctx context.Context, vcursor
 	if err != nil {
 		return nil, err
 	}
-	qr, err := execShard(ctx, loggingPrimitive, vcursor, query, bindVars, rss[0], true, !ins.PreventAutoCommit /* canAutocommit */)
+	qr, err := execShard(ctx, loggingPrimitive, vcursor, query, bindVars, rss[0], true, !ins.PreventAutoCommit /* canAutocommit */, ins.FetchLastInsertID)
 	if err != nil {
 		return nil, err
 	}
@@ -169,6 +156,7 @@ func (ins *InsertCommon) executeUnshardedTableQuery(ctx context.Context, vcursor
 	// values, we don't return an error because this behavior
 	// is required to support migration.
 	if insertID != 0 {
+		qr.InsertIDChanged = true
 		qr.InsertID = insertID
 	}
 	return qr, nil
@@ -230,14 +218,26 @@ func (ic *InsertCommon) processOwned(ctx context.Context, vcursor VCursor, vinde
 	var createIndexes []int
 	var createKeys []sqltypes.Row
 	var createKsids []ksID
+	var vindexNull []bool
 
 	for rowNum, rowColumnKeys := range vindexColumnsKeys {
 		if ksids[rowNum] == nil {
 			continue
 		}
+		keyContainsNull := false
+		for _, columnKey := range rowColumnKeys {
+			if columnKey.IsNull() {
+				// if any of the keys contains a null, we know the vindex will ignore this row,
+				// so it's safe to
+				keyContainsNull = true
+				break
+			}
+		}
+
 		createIndexes = append(createIndexes, rowNum)
 		createKeys = append(createKeys, rowColumnKeys)
 		createKsids = append(createKsids, ksids[rowNum])
+		vindexNull = append(vindexNull, keyContainsNull)
 	}
 	if createKeys == nil {
 		return nil
@@ -254,7 +254,7 @@ func (ic *InsertCommon) processOwned(ctx context.Context, vcursor VCursor, vinde
 		return err
 	}
 	for i, v := range verified {
-		if !v {
+		if !v && !vindexNull[i] {
 			ksids[createIndexes[i]] = nil
 		}
 	}
@@ -443,7 +443,7 @@ func (ic *InsertCommon) processGenerateFromValues(
 
 func (ic *InsertCommon) execGenerate(ctx context.Context, vcursor VCursor, loggingPrimitive Primitive, count int64) (int64, error) {
 	// If generation is needed, generate the requested number of values (as one call).
-	rss, _, err := vcursor.ResolveDestinations(ctx, ic.Generate.Keyspace.Name, nil, []key.Destination{key.DestinationAnyShard{}})
+	rss, _, err := vcursor.ResolveDestinations(ctx, ic.Generate.Keyspace.Name, nil, []key.ShardDestination{key.DestinationAnyShard{}})
 	if err != nil {
 		return 0, err
 	}
@@ -451,7 +451,7 @@ func (ic *InsertCommon) execGenerate(ctx context.Context, vcursor VCursor, loggi
 		return 0, vterrors.Errorf(vtrpcpb.Code_INVALID_ARGUMENT, "auto sequence generation can happen through single shard only, it is getting routed to %d shards", len(rss))
 	}
 	bindVars := map[string]*querypb.BindVariable{nextValBV: sqltypes.Int64BindVariable(count)}
-	qr, err := vcursor.ExecuteStandalone(ctx, loggingPrimitive, ic.Generate.Query, bindVars, rss[0])
+	qr, err := vcursor.ExecuteStandalone(ctx, loggingPrimitive, ic.Generate.Query, bindVars, rss[0], ic.FetchLastInsertID)
 	if err != nil {
 		return 0, err
 	}

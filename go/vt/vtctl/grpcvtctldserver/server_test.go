@@ -22,14 +22,18 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"path"
 	"slices"
 	"sort"
 	"strings"
 	"testing"
 	"time"
 
+	"google.golang.org/protobuf/proto"
+
 	_flag "vitess.io/vitess/go/internal/flag"
 	"vitess.io/vitess/go/vt/vtctl/reparentutil"
+	"vitess.io/vitess/go/vt/vtctl/reparentutil/policy"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -39,8 +43,10 @@ import (
 	"vitess.io/vitess/go/protoutil"
 	"vitess.io/vitess/go/sqltypes"
 	"vitess.io/vitess/go/test/utils"
+	"vitess.io/vitess/go/vt/callerid"
 	hk "vitess.io/vitess/go/vt/hook"
 	"vitess.io/vitess/go/vt/mysqlctl/backupstorage"
+	"vitess.io/vitess/go/vt/proto/vtrpc"
 	"vitess.io/vitess/go/vt/proto/vttime"
 	"vitess.io/vitess/go/vt/topo"
 	"vitess.io/vitess/go/vt/topo/memorytopo"
@@ -49,6 +55,7 @@ import (
 	"vitess.io/vitess/go/vt/vtctl/localvtctldclient"
 	"vitess.io/vitess/go/vt/vtctl/schematools"
 	"vitess.io/vitess/go/vt/vtenv"
+	"vitess.io/vitess/go/vt/vterrors"
 	"vitess.io/vitess/go/vt/vttablet/tmclient"
 	"vitess.io/vitess/go/vt/vttablet/tmclienttest"
 
@@ -607,15 +614,18 @@ func TestApplyVSchema(t *testing.T) {
 				},
 			})
 
-			origVSchema := &vschemapb.Keyspace{
-				Sharded: true,
-				Vindexes: map[string]*vschemapb.Vindex{
-					"v1": {
-						Type: "hash",
+			origVSchema := &topo.KeyspaceVSchemaInfo{
+				Name: tt.req.Keyspace,
+				Keyspace: &vschemapb.Keyspace{
+					Sharded: true,
+					Vindexes: map[string]*vschemapb.Vindex{
+						"v1": {
+							Type: "hash",
+						},
 					},
 				},
 			}
-			err := ts.SaveVSchema(ctx, tt.req.Keyspace, origVSchema)
+			err := ts.SaveVSchema(ctx, origVSchema)
 			require.NoError(t, err)
 
 			origSrvVSchema := &vschemapb.SrvVSchema{
@@ -939,6 +949,9 @@ func TestBackupShard(t *testing.T) {
 					"zone1-0000000100": {
 						Events: []*logutilpb.Event{{}, {}, {}},
 					},
+					"zone1-0000000101": {
+						Events: []*logutilpb.Event{{}, {}, {}},
+					},
 				},
 				PrimaryPositionResults: map[string]struct {
 					Position string
@@ -955,11 +968,18 @@ func TestBackupShard(t *testing.T) {
 					"zone1-0000000100": {
 						Position: &replicationdatapb.Status{
 							ReplicationLagSeconds: 0,
+							ReplicationLagUnknown: true,
+						},
+					},
+					"zone1-0000000101": {
+						Position: &replicationdatapb.Status{
+							ReplicationLagSeconds: 1,
 						},
 					},
 				},
 				SetReplicationSourceResults: map[string]error{
 					"zone1-0000000100": nil,
+					"zone1-0000000101": nil,
 				},
 			},
 			tablets: []*topodatapb.Tablet{
@@ -967,6 +987,15 @@ func TestBackupShard(t *testing.T) {
 					Alias: &topodatapb.TabletAlias{
 						Cell: "zone1",
 						Uid:  100,
+					},
+					Keyspace: "ks",
+					Shard:    "-",
+					Type:     topodatapb.TabletType_REPLICA,
+				},
+				{
+					Alias: &topodatapb.TabletAlias{
+						Cell: "zone1",
+						Uid:  101,
 					},
 					Keyspace: "ks",
 					Shard:    "-",
@@ -989,6 +1018,9 @@ func TestBackupShard(t *testing.T) {
 			assertion: func(t *testing.T, responses []*vtctldatapb.BackupResponse, err error) {
 				assert.ErrorIs(t, err, io.EOF, "expected Recv loop to end with io.EOF")
 				assert.Equal(t, 3, len(responses), "expected 3 messages from backupclient stream")
+				for _, resp := range responses {
+					assert.Equal(t, 101, int(resp.TabletAlias.Uid))
+				}
 			},
 		},
 		{
@@ -1254,13 +1286,27 @@ func TestBackupShard(t *testing.T) {
 	}
 }
 
+// requireCallerIDTMClient wraps the testutil TabletManagerClient and rejects ExecuteQuery calls
+// that do not have an effective caller id in their context, simulating strict table ACLs.
+type requireCallerIDTMClient struct {
+	*testutil.TabletManagerClient
+}
+
+// ExecuteQuery implements the tmclient.TabletManagerClient interface for requireCallerIDTMClient.
+func (tc *requireCallerIDTMClient) ExecuteQuery(ctx context.Context, tablet *topodatapb.Tablet, req *tabletmanagerdatapb.ExecuteQueryRequest) (*querypb.QueryResult, error) {
+	if callerid.EffectiveCallerIDFromContext(ctx) == nil {
+		return nil, vterrors.Errorf(vtrpc.Code_UNAUTHENTICATED, "missing caller id")
+	}
+	return tc.TabletManagerClient.ExecuteQuery(ctx, tablet, req)
+}
+
 func TestCancelSchemaMigration(t *testing.T) {
 	t.Parallel()
 
 	tests := []struct {
 		name      string
 		tablets   []*topodatapb.Tablet
-		tmc       *testutil.TabletManagerClient
+		tmc       tmclient.TabletManagerClient
 		req       *vtctldatapb.CancelSchemaMigrationRequest
 		expected  *vtctldatapb.CancelSchemaMigrationResponse
 		shouldErr bool
@@ -1322,6 +1368,30 @@ func TestCancelSchemaMigration(t *testing.T) {
 					"80-": 0,
 				},
 			},
+		},
+		{
+			name: "strict ACL requires caller id",
+			tablets: []*topodatapb.Tablet{
+				{Keyspace: "ks", Shard: "0", Alias: &topodatapb.TabletAlias{Cell: "zone1", Uid: 100}, Type: topodatapb.TabletType_PRIMARY},
+			},
+			tmc: &requireCallerIDTMClient{TabletManagerClient: &testutil.TabletManagerClient{
+				ExecuteQueryResults: map[string]struct {
+					Response *querypb.QueryResult
+					Error    error
+				}{
+					"zone1-0000000100": {Response: &querypb.QueryResult{RowsAffected: 1}},
+				},
+				PrimaryPositionResults: map[string]struct {
+					Position string
+					Error    error
+				}{
+					"zone1-0000000100": {},
+				},
+				ReloadSchemaResults: map[string]error{"zone1-0000000100": nil},
+			}},
+			req:       &vtctldatapb.CancelSchemaMigrationRequest{Keyspace: "ks", Uuid: "abc", CallerId: &vtrpc.CallerID{Principal: "strict"}},
+			expected:  &vtctldatapb.CancelSchemaMigrationResponse{RowsAffectedByShard: map[string]uint64{"0": 1}},
+			shouldErr: false,
 		},
 		{
 			name: "no shard primary",
@@ -1456,6 +1526,206 @@ func TestCancelSchemaMigration(t *testing.T) {
 			utils.MustMatch(t, test.expected, resp)
 		})
 	}
+}
+
+func TestChangeTabletTags(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name      string
+		cells     []string
+		tablet    *topodatapb.Tablet
+		req       *vtctldatapb.ChangeTabletTagsRequest
+		expected  *vtctldatapb.ChangeTabletTagsResponse
+		shouldErr bool
+	}{
+		{
+			name:  "success",
+			cells: []string{"zone1"},
+			tablet: &topodatapb.Tablet{
+				Alias: &topodatapb.TabletAlias{
+					Cell: "zone1",
+					Uid:  100,
+				},
+				Keyspace: "ks",
+				Shard:    "0",
+			},
+			req: &vtctldatapb.ChangeTabletTagsRequest{
+				TabletAlias: &topodatapb.TabletAlias{
+					Cell: "zone1",
+					Uid:  100,
+				},
+				Tags: map[string]string{
+					"test": t.Name(),
+				},
+			},
+			expected: &vtctldatapb.ChangeTabletTagsResponse{
+				AfterTags: map[string]string{
+					"test": t.Name(),
+				},
+			},
+			shouldErr: false,
+		},
+		{
+			name:  "success with existing",
+			cells: []string{"zone1"},
+			tablet: &topodatapb.Tablet{
+				Alias: &topodatapb.TabletAlias{
+					Cell: "zone1",
+					Uid:  100,
+				},
+				Keyspace: "ks",
+				Shard:    "0",
+				Tags: map[string]string{
+					"delete": "me",
+					"hello":  "world!",
+				},
+			},
+			req: &vtctldatapb.ChangeTabletTagsRequest{
+				TabletAlias: &topodatapb.TabletAlias{
+					Cell: "zone1",
+					Uid:  100,
+				},
+				Tags: map[string]string{
+					"delete": "",
+					"test":   t.Name(),
+				},
+			},
+			expected: &vtctldatapb.ChangeTabletTagsResponse{
+				BeforeTags: map[string]string{
+					"delete": "me",
+					"hello":  "world!",
+				},
+				AfterTags: map[string]string{
+					"hello": "world!",
+					"test":  t.Name(),
+				},
+			},
+			shouldErr: false,
+		},
+		{
+			name:  "success with replace",
+			cells: []string{"zone1"},
+			tablet: &topodatapb.Tablet{
+				Alias: &topodatapb.TabletAlias{
+					Cell: "zone1",
+					Uid:  100,
+				},
+				Keyspace: "ks",
+				Shard:    "0",
+				Tags: map[string]string{
+					"hello": "world!",
+				},
+			},
+			req: &vtctldatapb.ChangeTabletTagsRequest{
+				TabletAlias: &topodatapb.TabletAlias{
+					Cell: "zone1",
+					Uid:  100,
+				},
+				Tags: map[string]string{
+					"test": t.Name(),
+				},
+				Replace: true,
+			},
+			expected: &vtctldatapb.ChangeTabletTagsResponse{
+				BeforeTags: map[string]string{
+					"hello": "world!",
+				},
+				AfterTags: map[string]string{
+					"test": t.Name(),
+				},
+			},
+			shouldErr: false,
+		},
+		{
+			name:  "tablet not found",
+			cells: []string{"zone1"},
+			tablet: &topodatapb.Tablet{
+				Alias: &topodatapb.TabletAlias{
+					Cell: "zone1",
+					Uid:  200,
+				},
+				Keyspace: "ks",
+				Shard:    "0",
+			},
+			req: &vtctldatapb.ChangeTabletTagsRequest{
+				TabletAlias: &topodatapb.TabletAlias{
+					Cell: "zone1",
+					Uid:  100,
+				},
+				Tags: map[string]string{
+					"test": t.Name(),
+				},
+			},
+			expected:  nil,
+			shouldErr: true,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			ctx, cancel := context.WithCancel(context.Background())
+			defer cancel()
+			ts := memorytopo.NewServer(ctx, tt.cells...)
+			vtctld := testutil.NewVtctldServerWithTabletManagerClient(t, ts, &testutil.TabletManagerClient{
+				TopoServer: ts,
+			}, func(ts *topo.Server) vtctlservicepb.VtctldServer {
+				return NewVtctldServer(vtenv.NewTestEnv(), ts)
+			})
+
+			testutil.AddTablets(ctx, t, ts, &testutil.AddTabletOptions{
+				AlsoSetShardPrimary: true,
+			}, tt.tablet)
+
+			resp, err := vtctld.ChangeTabletTags(ctx, tt.req)
+			if tt.shouldErr {
+				assert.Error(t, err)
+				return
+			}
+			assert.NoError(t, err)
+			utils.MustMatch(t, tt.expected, resp)
+
+			tablet, err := ts.GetTablet(ctx, tt.req.TabletAlias)
+			assert.NoError(t, err)
+			utils.MustMatch(t, resp.AfterTags, tablet.Tags)
+		})
+	}
+
+	t.Run("tabletmanager failure", func(t *testing.T) {
+		t.Parallel()
+
+		ctx, cancel := context.WithCancel(context.Background())
+		defer cancel()
+		ts := memorytopo.NewServer(ctx, "zone1")
+		vtctld := testutil.NewVtctldServerWithTabletManagerClient(t, ts, &testutil.TabletManagerClient{
+			TopoServer: nil,
+		}, func(ts *topo.Server) vtctlservicepb.VtctldServer {
+			return NewVtctldServer(vtenv.NewTestEnv(), ts)
+		})
+
+		testutil.AddTablet(ctx, t, ts, &topodatapb.Tablet{
+			Alias: &topodatapb.TabletAlias{
+				Cell: "zone1",
+				Uid:  100,
+			},
+			Keyspace: "ks",
+			Shard:    "0",
+			Type:     topodatapb.TabletType_REPLICA,
+		}, nil)
+
+		_, err := vtctld.ChangeTabletTags(ctx, &vtctldatapb.ChangeTabletTagsRequest{
+			TabletAlias: &topodatapb.TabletAlias{
+				Cell: "zone1",
+				Uid:  100,
+			},
+			Tags: map[string]string{
+				"test": t.Name(),
+			},
+		})
+		assert.Error(t, err)
+	})
 }
 
 func TestChangeTabletType(t *testing.T) {
@@ -2376,12 +2646,12 @@ func TestCreateKeyspace(t *testing.T) {
 	tests := []struct {
 		name               string
 		topo               map[string]*topodatapb.Keyspace
-		vschemas           map[string]*vschemapb.Keyspace
+		vschemas           map[string]*topo.KeyspaceVSchemaInfo
 		req                *vtctldatapb.CreateKeyspaceRequest
 		expected           *vtctldatapb.CreateKeyspaceResponse
 		shouldErr          bool
 		vschemaShouldExist bool
-		expectedVSchema    *vschemapb.Keyspace
+		expectedVSchema    *topo.KeyspaceVSchemaInfo
 	}{
 		{
 			name: "normal keyspace",
@@ -2399,8 +2669,11 @@ func TestCreateKeyspace(t *testing.T) {
 				},
 			},
 			vschemaShouldExist: true,
-			expectedVSchema: &vschemapb.Keyspace{
-				Sharded: false,
+			expectedVSchema: &topo.KeyspaceVSchemaInfo{
+				Name: "testkeyspace",
+				Keyspace: &vschemapb.Keyspace{
+					Sharded: false,
+				},
 			},
 			shouldErr: false,
 		},
@@ -2411,12 +2684,15 @@ func TestCreateKeyspace(t *testing.T) {
 					KeyspaceType: topodatapb.KeyspaceType_NORMAL,
 				},
 			},
-			vschemas: map[string]*vschemapb.Keyspace{
+			vschemas: map[string]*topo.KeyspaceVSchemaInfo{
 				"testkeyspace": {
-					Sharded: true,
-					Vindexes: map[string]*vschemapb.Vindex{
-						"h1": {
-							Type: "hash",
+					Name: "testkeyspace",
+					Keyspace: &vschemapb.Keyspace{
+						Sharded: true,
+						Vindexes: map[string]*vschemapb.Vindex{
+							"h1": {
+								Type: "hash",
+							},
 						},
 					},
 				},
@@ -2442,14 +2718,17 @@ func TestCreateKeyspace(t *testing.T) {
 				},
 			},
 			vschemaShouldExist: true,
-			expectedVSchema: &vschemapb.Keyspace{
-				Sharded: true,
-				Vindexes: map[string]*vschemapb.Vindex{
-					"h1": {
-						Type: "hash",
+			expectedVSchema: &topo.KeyspaceVSchemaInfo{
+				Name: "testkeyspace",
+				Keyspace: &vschemapb.Keyspace{
+					Sharded: true,
+					Vindexes: map[string]*vschemapb.Vindex{
+						"h1": {
+							Type: "hash",
+						},
 					},
+					RequireExplicitRouting: true,
 				},
-				RequireExplicitRouting: true,
 			},
 			shouldErr: false,
 		},
@@ -2495,9 +2774,12 @@ func TestCreateKeyspace(t *testing.T) {
 				},
 			},
 			vschemaShouldExist: true,
-			expectedVSchema: &vschemapb.Keyspace{
-				Sharded:                false,
-				RequireExplicitRouting: true,
+			expectedVSchema: &topo.KeyspaceVSchemaInfo{
+				Name: "testsnapshot",
+				Keyspace: &vschemapb.Keyspace{
+					Sharded:                false,
+					RequireExplicitRouting: true,
+				},
 			},
 			shouldErr: false,
 		},
@@ -2547,8 +2829,11 @@ func TestCreateKeyspace(t *testing.T) {
 				},
 			},
 			vschemaShouldExist: true,
-			expectedVSchema: &vschemapb.Keyspace{
-				Sharded: false,
+			expectedVSchema: &topo.KeyspaceVSchemaInfo{
+				Name: "testkeyspace",
+				Keyspace: &vschemapb.Keyspace{
+					Sharded: false,
+				},
 			},
 			shouldErr: false,
 		},
@@ -2571,26 +2856,30 @@ func TestCreateKeyspace(t *testing.T) {
 			vschemaShouldExist: false,
 			expectedVSchema:    nil,
 			shouldErr:          false,
-		}, {
+		},
+		{
 			name: "keyspace with durability policy specified",
 			topo: nil,
 			req: &vtctldatapb.CreateKeyspaceRequest{
 				Name:             "testkeyspace",
 				Type:             topodatapb.KeyspaceType_NORMAL,
-				DurabilityPolicy: "semi_sync",
+				DurabilityPolicy: policy.DurabilitySemiSync,
 			},
 			expected: &vtctldatapb.CreateKeyspaceResponse{
 				Keyspace: &vtctldatapb.Keyspace{
 					Name: "testkeyspace",
 					Keyspace: &topodatapb.Keyspace{
 						KeyspaceType:     topodatapb.KeyspaceType_NORMAL,
-						DurabilityPolicy: "semi_sync",
+						DurabilityPolicy: policy.DurabilitySemiSync,
 					},
 				},
 			},
 			vschemaShouldExist: true,
-			expectedVSchema: &vschemapb.Keyspace{
-				Sharded: false,
+			expectedVSchema: &topo.KeyspaceVSchemaInfo{
+				Name: "testkeyspace",
+				Keyspace: &vschemapb.Keyspace{
+					Sharded: false,
+				},
 			},
 			shouldErr: false,
 		},
@@ -2619,7 +2908,7 @@ func TestCreateKeyspace(t *testing.T) {
 			}
 
 			for name, vs := range tt.vschemas {
-				require.NoError(t, ts.SaveVSchema(ctx, name, vs), "error in SaveVSchema(%v, %+v)", name, vs)
+				require.NoError(t, ts.SaveVSchema(ctx, vs), "error in SaveVSchema(%v, %+v)", name, vs)
 			}
 
 			// Create the keyspace and make some assertions
@@ -2628,7 +2917,6 @@ func TestCreateKeyspace(t *testing.T) {
 				assert.Error(t, err)
 				return
 			}
-
 			assert.NoError(t, err)
 			testutil.AssertKeyspacesEqual(t, tt.expected.Keyspace, resp.Keyspace, "%+v\n%+v\n", tt.expected.Keyspace, resp.Keyspace)
 
@@ -2657,7 +2945,7 @@ func TestCreateKeyspace(t *testing.T) {
 				return
 			}
 			assert.NoError(t, err)
-			utils.MustMatch(t, tt.expectedVSchema, vs)
+			require.True(t, proto.Equal(tt.expectedVSchema, vs), "expected vschema for %s: %+v, got: %+v", tt.req.Name, tt.expectedVSchema, vs)
 		})
 	}
 }
@@ -4381,7 +4669,7 @@ func TestDeleteTablets(t *testing.T) {
 
 				resp, err := vtctld.GetTablets(ctx, &vtctldatapb.GetTabletsRequest{})
 				assert.NoError(t, err, "cannot look up tablets from topo after issuing DeleteTablets request")
-				testutil.AssertSameTablets(t, tt.expectedRemainingTablets, resp.Tablets)
+				utils.MustMatch(t, tt.expectedRemainingTablets, resp.Tablets)
 			}
 
 			// Run the test
@@ -5170,6 +5458,16 @@ func TestExecuteHook(t *testing.T) {
 
 func TestGetUnresolvedTransactions(t *testing.T) {
 	ks := "testkeyspace"
+	shard1Target := &querypb.Target{
+		Keyspace:   ks,
+		Shard:      "-80",
+		TabletType: topodatapb.TabletType_PRIMARY,
+	}
+	shard2Target := &querypb.Target{
+		Keyspace:   ks,
+		Shard:      "80-",
+		TabletType: topodatapb.TabletType_PRIMARY,
+	}
 
 	tests := []struct {
 		name      string
@@ -5182,24 +5480,25 @@ func TestGetUnresolvedTransactions(t *testing.T) {
 			name: "unresolved transaction on both shards",
 			tmc: &testutil.TabletManagerClient{
 				GetUnresolvedTransactionsResults: map[string][]*querypb.TransactionMetadata{
-					"-80": {{Dtid: "aa"}},
-					"80-": {{Dtid: "bb"}},
+					"-80": {{Dtid: "aa", Participants: []*querypb.Target{shard2Target}}},
+					"80-": {{Dtid: "bb", Participants: []*querypb.Target{shard1Target}}},
 				},
 			},
 			keyspace: "testkeyspace",
 			expected: []*querypb.TransactionMetadata{
-				{Dtid: "aa"}, {Dtid: "bb"},
+				{Dtid: "aa", Participants: []*querypb.Target{shard2Target, shard1Target}},
+				{Dtid: "bb", Participants: []*querypb.Target{shard1Target, shard2Target}},
 			},
 		}, {
-			name: "unresolved transaction on one sharda",
+			name: "unresolved transaction on one shard",
 			tmc: &testutil.TabletManagerClient{
 				GetUnresolvedTransactionsResults: map[string][]*querypb.TransactionMetadata{
-					"80-": {{Dtid: "bb"}},
+					"80-": {{Dtid: "bb", Participants: []*querypb.Target{shard1Target}}},
 				},
 			},
 			keyspace: "testkeyspace",
 			expected: []*querypb.TransactionMetadata{
-				{Dtid: "bb"},
+				{Dtid: "bb", Participants: []*querypb.Target{shard1Target, shard2Target}},
 			},
 		},
 		{
@@ -5257,34 +5556,47 @@ func TestConcludeTransaction(t *testing.T) {
 		dtid        string
 		expErr      string
 		participant []*querypb.Target
-	}{
-		{
-			name:   "invalid dtid",
-			tmc:    &testutil.TabletManagerClient{},
-			dtid:   "dtid01",
-			expErr: "invalid parts in dtid: dtid01",
-		}, {
-			name:   "invalid transaction id",
-			tmc:    &testutil.TabletManagerClient{},
-			dtid:   "ks:80-:013c",
-			expErr: "invalid transaction id in dtid: ks:80-:013c",
-		}, {
-			name: "only dtid",
-			tmc:  &testutil.TabletManagerClient{},
-			dtid: "testkeyspace:80-:1234",
-		}, {
-			name:        "with participant",
-			tmc:         &testutil.TabletManagerClient{},
-			dtid:        "testkeyspace:80-:1234",
-			participant: []*querypb.Target{{Keyspace: ks, Shard: "-80"}},
-		}, {
-			name:        "call error",
-			tmc:         &testutil.TabletManagerClient{CallError: true},
-			dtid:        "testkeyspace:80-:1234",
-			participant: []*querypb.Target{{Keyspace: ks, Shard: "-80"}},
-			expErr:      "blocked call for ConcludeTransaction on fake TabletManagerClient",
+	}{{
+		name:   "invalid dtid",
+		tmc:    &testutil.TabletManagerClient{},
+		dtid:   "dtid01",
+		expErr: "invalid parts in dtid: dtid01",
+	}, {
+		name:   "invalid transaction id",
+		tmc:    &testutil.TabletManagerClient{},
+		dtid:   "ks:80-:013c",
+		expErr: "invalid transaction id in dtid: ks:80-:013c",
+	}, {
+		name: "only dtid",
+		tmc: &testutil.TabletManagerClient{
+			ReadTransactionResult: map[string]*querypb.TransactionMetadata{
+				"80-": {Dtid: "bb"},
+			},
 		},
-	}
+		dtid: "testkeyspace:80-:1234",
+	}, {
+		name: "only dtid - empty metadata",
+		tmc: &testutil.TabletManagerClient{
+			ReadTransactionResult: map[string]*querypb.TransactionMetadata{},
+		},
+		dtid: "testkeyspace:80-:1234",
+	}, {
+		name:   "only dtid - fail",
+		tmc:    &testutil.TabletManagerClient{},
+		dtid:   "testkeyspace:80-:1234",
+		expErr: "no ReadTransaction result on fake TabletManagerClient",
+	}, {
+		name:        "with participant",
+		tmc:         &testutil.TabletManagerClient{},
+		dtid:        "testkeyspace:80-:1234",
+		participant: []*querypb.Target{{Keyspace: ks, Shard: "-80"}},
+	}, {
+		name:        "call error",
+		tmc:         &testutil.TabletManagerClient{CallError: true},
+		dtid:        "testkeyspace:80-:1234",
+		participant: []*querypb.Target{{Keyspace: ks, Shard: "-80"}},
+		expErr:      "blocked call for ConcludeTransaction on fake TabletManagerClient",
+	}}
 
 	tablets := []*topodatapb.Tablet{{
 		Alias:    &topodatapb.TabletAlias{Cell: "zone1", Uid: 100},
@@ -5316,6 +5628,108 @@ func TestConcludeTransaction(t *testing.T) {
 			}
 
 			require.NoError(t, err)
+		})
+	}
+}
+
+func TestGetTransactionInfo(t *testing.T) {
+	ks := "testkeyspace"
+	tests := []struct {
+		name       string
+		tmc        *testutil.TabletManagerClient
+		dtid       string
+		expErr     string
+		respWanted *vtctldatapb.GetTransactionInfoResponse
+	}{
+		{
+			name:   "invalid dtid",
+			tmc:    &testutil.TabletManagerClient{},
+			dtid:   "dtid01",
+			expErr: "invalid parts in dtid: dtid01",
+		}, {
+			name:   "invalid transaction id",
+			tmc:    &testutil.TabletManagerClient{},
+			dtid:   "ks:80-:013c",
+			expErr: "invalid transaction id in dtid: ks:80-:013c",
+		}, {
+			name: "Success",
+			tmc: &testutil.TabletManagerClient{
+				ReadTransactionResult: map[string]*querypb.TransactionMetadata{
+					"80-": {
+						Dtid: "bb",
+						Participants: []*querypb.Target{
+							{Keyspace: ks, Shard: "-80", TabletType: topodatapb.TabletType_PRIMARY},
+						},
+					},
+				},
+				GetTransactionInfoResult: map[string]*tabletmanagerdatapb.GetTransactionInfoResponse{
+					"-80": {
+						State:      "FAILED",
+						Statements: []string{"stmt1", "stmt2"},
+					},
+					"80-": {}, // Empty result is expected when the transaction has been resolved on that shard or if its the resource manager.
+				},
+			},
+			dtid: "testkeyspace:80-:1234",
+			respWanted: &vtctldatapb.GetTransactionInfoResponse{
+				Metadata: &querypb.TransactionMetadata{
+					Dtid: "bb",
+					Participants: []*querypb.Target{
+						{Keyspace: ks, Shard: "-80", TabletType: topodatapb.TabletType_PRIMARY},
+						{Keyspace: ks, Shard: "80-", TabletType: topodatapb.TabletType_PRIMARY},
+					},
+				},
+				ShardStates: []*vtctldatapb.ShardTransactionState{
+					{
+						Shard:      "-80",
+						State:      "FAILED",
+						Statements: []string{"stmt1", "stmt2"},
+					},
+					{
+						Shard: "80-",
+					},
+				},
+			},
+		}, {
+			name: "Success - empty metadata",
+			tmc: &testutil.TabletManagerClient{
+				ReadTransactionResult: map[string]*querypb.TransactionMetadata{},
+			},
+			dtid:       "testkeyspace:80-:1234",
+			respWanted: nil, // We expected an empty response if the metadata is not found.
+		},
+	}
+
+	tablets := []*topodatapb.Tablet{{
+		Alias:    &topodatapb.TabletAlias{Cell: "zone1", Uid: 100},
+		Keyspace: ks,
+		Shard:    "-80",
+		Type:     topodatapb.TabletType_PRIMARY,
+	}, {
+		Alias:    &topodatapb.TabletAlias{Cell: "zone1", Uid: 200},
+		Keyspace: ks,
+		Shard:    "80-",
+		Type:     topodatapb.TabletType_PRIMARY,
+	}}
+	ts := memorytopo.NewServer(context.Background(), "zone1")
+	testutil.AddTablets(context.Background(), t, ts, &testutil.AddTabletOptions{AlsoSetShardPrimary: true}, tablets...)
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			ctx, cancel := context.WithCancel(context.Background())
+			defer cancel()
+
+			vtctld := testutil.NewVtctldServerWithTabletManagerClient(t, ts, tt.tmc, func(ts *topo.Server) vtctlservicepb.VtctldServer {
+				return NewVtctldServer(vtenv.NewTestEnv(), ts)
+			})
+			req := &vtctldatapb.GetTransactionInfoRequest{Dtid: tt.dtid}
+			resp, err := vtctld.GetTransactionInfo(ctx, req)
+			if tt.expErr != "" {
+				require.ErrorContains(t, err, tt.expErr)
+				return
+			}
+			require.NoError(t, err)
+			require.EqualValues(t, tt.respWanted, resp)
 		})
 	}
 }
@@ -7927,7 +8341,7 @@ func TestGetTablets(t *testing.T) {
 			}
 
 			assert.NoError(t, err)
-			testutil.AssertSameTablets(t, tt.expected, resp.Tablets)
+			utils.MustMatch(t, tt.expected, resp.Tablets)
 		})
 	}
 }
@@ -8055,11 +8469,14 @@ func TestGetVSchema(t *testing.T) {
 	})
 
 	t.Run("found", func(t *testing.T) {
-		err := ts.SaveVSchema(ctx, "testkeyspace", &vschemapb.Keyspace{
-			Sharded: true,
-			Vindexes: map[string]*vschemapb.Vindex{
-				"v1": {
-					Type: "hash",
+		err := ts.SaveVSchema(ctx, &topo.KeyspaceVSchemaInfo{
+			Name: "testkeyspace",
+			Keyspace: &vschemapb.Keyspace{
+				Sharded: true,
+				Vindexes: map[string]*vschemapb.Vindex{
+					"v1": {
+						Type: "hash",
+					},
 				},
 			},
 		})
@@ -11012,11 +11429,11 @@ func TestSetKeyspaceDurabilityPolicy(t *testing.T) {
 			},
 			req: &vtctldatapb.SetKeyspaceDurabilityPolicyRequest{
 				Keyspace:         "ks1",
-				DurabilityPolicy: "none",
+				DurabilityPolicy: policy.DurabilityNone,
 			},
 			expected: &vtctldatapb.SetKeyspaceDurabilityPolicyResponse{
 				Keyspace: &topodatapb.Keyspace{
-					DurabilityPolicy: "none",
+					DurabilityPolicy: policy.DurabilityNone,
 				},
 			},
 		},
@@ -12980,12 +13397,12 @@ func TestTabletExternallyReparented(t *testing.T) {
 				defer func() {
 					topofactory.SetError(nil)
 
-					ctx, cancel := context.WithTimeout(ctx, time.Millisecond*10)
+					ctx, cancel := context.WithTimeout(ctx, time.Second*10)
 					defer cancel()
 
 					resp, err := vtctld.GetTablets(ctx, &vtctldatapb.GetTabletsRequest{})
 					require.NoError(t, err, "cannot get all tablets in the topo")
-					testutil.AssertSameTablets(t, tt.expectedTopo, resp.Tablets)
+					utils.MustMatch(t, tt.expectedTopo, resp.Tablets)
 				}()
 			}
 
@@ -13555,11 +13972,11 @@ func TestValidateSchemaKeyspace(t *testing.T) {
 	}
 
 	tests := []*struct {
-		name      string
-		req       *vtctldatapb.ValidateSchemaKeyspaceRequest
-		expected  *vtctldatapb.ValidateSchemaKeyspaceResponse
-		setup     func()
-		shouldErr bool
+		name     string
+		req      *vtctldatapb.ValidateSchemaKeyspaceRequest
+		expected *vtctldatapb.ValidateSchemaKeyspaceResponse
+		setup    func()
+		err      string
 	}{
 		{
 			name: "valid schemas",
@@ -13582,7 +13999,6 @@ func TestValidateSchemaKeyspace(t *testing.T) {
 					Uid:  101,
 				}, schema1)
 			},
-			shouldErr: false,
 		},
 		{
 			name: "different schemas",
@@ -13605,7 +14021,6 @@ func TestValidateSchemaKeyspace(t *testing.T) {
 					Uid:  101,
 				}, schema2)
 			},
-			shouldErr: false,
 		},
 		{
 			name: "skip-no-primary: no primary",
@@ -13630,7 +14045,6 @@ func TestValidateSchemaKeyspace(t *testing.T) {
 					Uid:  201,
 				}, schema1)
 			},
-			shouldErr: false,
 		},
 	}
 
@@ -13638,8 +14052,8 @@ func TestValidateSchemaKeyspace(t *testing.T) {
 		t.Run(tt.name, func(t *testing.T) {
 			tt.setup()
 			resp, err := vtctld.ValidateSchemaKeyspace(ctx, tt.req)
-			if tt.shouldErr {
-				assert.Error(t, err)
+			if tt.err != "" {
+				assert.EqualError(t, err, tt.err)
 				return
 			}
 
@@ -13876,6 +14290,224 @@ func TestValidateVersionShard(t *testing.T) {
 			utils.MustMatch(t, tt.expected, resp)
 		})
 	}
+}
+
+func TestValidateKeyspace(t *testing.T) {
+	t.Parallel()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	tmc := &testutil.TabletManagerClient{
+		GetReplicasResults: map[string]struct {
+			Replicas []string
+			Error    error
+		}{
+			"zone1-0000000100": {
+				Replicas: []string{"11.21.31.41", "12.22.32.42"},
+			},
+		},
+		PingResults: map[string]error{
+			"zone1-0000000100": nil,
+			"zone1-0000000101": nil,
+			"zone1-0000000102": nil,
+		},
+	}
+
+	type testcase struct {
+		keyspaceName string
+		wantErr      string
+		noKeyspace   bool
+		noShard      bool
+		noPrimary    bool
+	}
+	tests := []testcase{
+		{
+			keyspaceName: "consistent",
+			wantErr:      "",
+		},
+		{
+			keyspaceName: "no_keyspace",
+			wantErr:      "TopologyServer.GetShardNames(no_keyspace) failed: node doesn't exist: keyspaces",
+			noKeyspace:   true,
+		},
+		{
+			keyspaceName: "no_shard",
+			wantErr:      "no shards found in keyspace no_shard",
+			noShard:      true,
+		},
+		{
+			keyspaceName: "no_primary",
+			wantErr:      "no primary for shard no_primary/0",
+			noPrimary:    true,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.keyspaceName, func(t *testing.T) {
+			ts := memorytopo.NewServer(ctx, "zone1")
+			vtctld := testutil.NewVtctldServerWithTabletManagerClient(t, ts, tmc, func(ts *topo.Server) vtctlservicepb.VtctldServer {
+				return NewVtctldServer(vtenv.NewTestEnv(), ts)
+			})
+			if !tt.noKeyspace {
+				_, err := vtctld.CreateKeyspace(ctx, &vtctldatapb.CreateKeyspaceRequest{
+					Name:              tt.keyspaceName,
+					AllowEmptyVSchema: true,
+				})
+				require.NoError(t, err)
+				if !tt.noShard {
+					err = ts.CreateShard(ctx, tt.keyspaceName, "0")
+					require.NoError(t, err)
+					if !tt.noPrimary {
+						alias := &topodatapb.TabletAlias{
+							Cell: "zone1",
+							Uid:  100,
+						}
+						err = ts.CreateTablet(ctx, &topodatapb.Tablet{
+							Alias:    alias,
+							Keyspace: tt.keyspaceName,
+							Shard:    "0",
+							Type:     topodatapb.TabletType_PRIMARY,
+						})
+						require.NoError(t, err)
+						_, err = ts.UpdateShardFields(ctx, tt.keyspaceName, "0", func(si *topo.ShardInfo) error {
+							si.PrimaryAlias = alias
+							si.PrimaryTermStartTime = &vttime.Time{
+								Seconds: 100,
+							}
+							return nil
+						})
+						require.NoError(t, err)
+					}
+				}
+			}
+
+			req := &vtctldatapb.ValidateKeyspaceRequest{
+				Keyspace: tt.keyspaceName,
+			}
+			resp, err := vtctld.ValidateKeyspace(ctx, req)
+			require.NoError(t, err)
+			var gotErrors []string
+			gotErrors = append(gotErrors, resp.Results...)
+			for _, result := range resp.ResultsByShard {
+				gotErrors = append(gotErrors, result.Results...)
+			}
+			if tt.wantErr != "" {
+				assert.Contains(t, strings.Join(gotErrors, ", "), tt.wantErr)
+			} else {
+				require.Empty(t, gotErrors)
+			}
+		})
+	}
+}
+
+// This test validates the bug described in https://github.com/vitessio/vitess/issues/18113.
+func TestValidateKeyspaceErrors(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	cell := "zone-1"
+	ks := "ks"
+	shard := "-"
+	// Setup the topo server and the vtctld server.
+	ts := memorytopo.NewServer(ctx, cell)
+	tmc := &testutil.TabletManagerClient{}
+	vtctldServer := NewTestVtctldServer(ts, tmc)
+	conn, err := ts.ConnForCell(ctx, cell)
+	require.NoError(t, err)
+
+	// Create the keyspace and shard record
+	_, err = ts.GetOrCreateShard(ctx, ks, shard)
+	require.NoError(t, err)
+
+	// verify ValidateKeyspace finds all the issues without hanging
+	resp := validateKeyspace(t, vtctldServer, ctx, ks)
+	// We expect two results -
+	// 1. no primary for shard ks/-
+	// 2. no primary in shard record ks/-
+	require.Len(t, resp.GetResultsByShard()[shard].Results, 2)
+
+	// Next we test the worst case for ValidateKeyspace wherein everything creates
+	// issues to ensure we never block on writing to the results field.
+
+	// We first create all tablets. We intentionally create a mismatch in the tablet alias
+	// file name and the tablet alias actually stored so that we see the error in Validate.
+	numTablets := 10
+	tablets := make([]*topodatapb.Tablet, numTablets)
+	for i := 0; i < numTablets; i++ {
+		typ := topodatapb.TabletType_REPLICA
+		if i == 0 {
+			typ = topodatapb.TabletType_PRIMARY
+		}
+		tablets[i] = &topodatapb.Tablet{
+			Keyspace: ks,
+			Shard:    shard,
+			Type:     typ,
+			Alias: &topodatapb.TabletAlias{
+				Cell: cell,
+				Uid:  uint32(100 + i),
+			},
+		}
+		err = ts.CreateTablet(ctx, tablets[i])
+		require.NoError(t, err)
+
+		// We're explicitly messing up the record, so we can't use
+		// the UpdateTablet function as it doesn't not allow this.
+		tabletPath := path.Join(topo.TabletsPath, topoproto.TabletAliasString(tablets[i].Alias), topo.TabletFile)
+		tablets[i].Alias.Uid += 100
+		data, err := tablets[i].MarshalVT()
+		require.NoError(t, err)
+		_, err = conn.Update(ctx, tabletPath, data, nil)
+		require.NoError(t, err)
+		// Reset the values for later use.
+		tablets[i].Alias.Uid -= 100
+	}
+
+	// verify ValidateKeyspace finds all the issues without hanging
+	resp = validateKeyspace(t, vtctldServer, ctx, ks)
+	// This time we expect the following results -
+	// 1. primary mismatch for shard ks/-: found zone-1-0000000100, expected <nil>
+	// 2. no primary in shard record ks/-
+	// 3. topo.Validate for all numTablets tablets.
+	// 4. tabletmanager ping for all numTablets tablets with a general error.
+	require.Len(t, resp.GetResultsByShard()[shard].Results, 2*numTablets+2, strings.Join(resp.GetResultsByShard()[shard].Results, ","))
+
+	// We now fix the shard record so that we can get even more errors.
+	_, err = ts.UpdateShardFields(ctx, ks, shard, func(info *topo.ShardInfo) error {
+		info.PrimaryAlias = tablets[0].Alias
+		return nil
+	})
+	require.NoError(t, err)
+
+	tmc.GetReplicasResults = map[string]struct {
+		Replicas []string
+		Error    error
+	}{
+		"zone-1-0000000200": {
+			// We return numTablets-1 values for the replica tablets.
+			Replicas: make([]string, numTablets-1),
+		},
+	}
+
+	// verify ValidateKeyspace finds all the issues without hanging
+	resp = validateKeyspace(t, vtctldServer, ctx, ks)
+	// This time we expect the following results results -
+	// 1. topo.Validate for all numTablets tablets.
+	// 2. Failure in resolving the hostname for all numTablets tablets.
+	// 3. Replicas not being in the replication graph (since we couldn't get their hostnames). This is for all the replicas -> numTablets - 1
+	// 4. Resolving hostname again for all the replicas -> numTablets - 1
+	// 5. tabletmanager ping for all numTablets tablets with a general error.
+	require.Len(t, resp.GetResultsByShard()[shard].Results, 5*numTablets-2, strings.Join(resp.GetResultsByShard()[shard].Results, ","))
+}
+
+// validateKeyspace is a helper function for testing.
+func validateKeyspace(t *testing.T, vtctldServer *VtctldServer, ctx context.Context, ks string) *vtctldatapb.ValidateKeyspaceResponse {
+	t.Helper()
+	resp, err := vtctldServer.ValidateKeyspace(ctx, &vtctldatapb.ValidateKeyspaceRequest{
+		Keyspace:    ks,
+		PingTablets: true,
+	})
+	require.NoError(t, err)
+	require.NotNil(t, resp)
+	require.NotNil(t, resp.GetResultsByShard())
+	return resp
 }
 
 func TestValidateShard(t *testing.T) {

@@ -25,7 +25,6 @@ import (
 	"vitess.io/vitess/go/sqltypes"
 	"vitess.io/vitess/go/vt/key"
 	querypb "vitess.io/vitess/go/vt/proto/query"
-	topodatapb "vitess.io/vitess/go/vt/proto/topodata"
 	vtrpcpb "vitess.io/vitess/go/vt/proto/vtrpc"
 	"vitess.io/vitess/go/vt/sqlparser"
 	"vitess.io/vitess/go/vt/srvtopo"
@@ -60,7 +59,7 @@ type Insert struct {
 	Alias string
 }
 
-// newQueryInsert creates an Insert with a query string.
+// newQueryInsert creates an Insert with a query string. Used in testing.
 func newQueryInsert(opcode InsertOpcode, keyspace *vindexes.Keyspace, query string) *Insert {
 	return &Insert{
 		InsertCommon: InsertCommon{
@@ -71,13 +70,13 @@ func newQueryInsert(opcode InsertOpcode, keyspace *vindexes.Keyspace, query stri
 	}
 }
 
-// newInsert creates a new Insert.
+// newInsert creates a new Insert. Used in testing.
 func newInsert(
 	opcode InsertOpcode,
 	ignore bool,
 	keyspace *vindexes.Keyspace,
 	vindexValues [][][]evalengine.Expr,
-	table *vindexes.Table,
+	table *vindexes.BaseTable,
 	prefix string,
 	mid sqlparser.Values,
 	suffix sqlparser.OnDup,
@@ -103,11 +102,6 @@ func newInsert(
 		}
 	}
 	return ins
-}
-
-// RouteType returns a description of the query routing type used by the primitive
-func (ins *Insert) RouteType() string {
-	return insName[ins.Opcode]
 }
 
 // TryExecute performs a non-streaming exec.
@@ -169,13 +163,14 @@ func (ins *Insert) executeInsertQueries(
 	if err != nil {
 		return nil, err
 	}
-	result, errs := vcursor.ExecuteMultiShard(ctx, ins, rss, queries, true /* rollbackOnError */, autocommit)
+	result, errs := vcursor.ExecuteMultiShard(ctx, ins, rss, queries, true /*rollbackOnError*/, autocommit, ins.FetchLastInsertID)
 	if errs != nil {
 		return nil, vterrors.Aggregate(errs)
 	}
 
 	if insertID != 0 {
 		result.InsertID = insertID
+		result.InsertIDChanged = true
 	}
 	return result, nil
 }
@@ -237,7 +232,7 @@ func (ins *Insert) getInsertShardedQueries(
 	// each RSS.  So we pass the ksid indexes in as ids, and get them back
 	// as values. We also skip nil KeyspaceIds, no need to resolve them.
 	var indexes []*querypb.Value
-	var destinations []key.Destination
+	var destinations []key.ShardDestination
 	for i, ksid := range keyspaceIDs {
 		if ksid != nil {
 			indexes = append(indexes, &querypb.Value{
@@ -347,7 +342,6 @@ func (ins *Insert) buildVindexRowsValues(ctx context.Context, vcursor VCursor, b
 func (ins *Insert) description() PrimitiveDescription {
 	other := ins.commonDesc()
 	other["Query"] = ins.Query
-	other["TableName"] = ins.GetTableName()
 
 	if len(ins.VindexValues) > 0 {
 		valuesOffsets := map[string]string{}
@@ -383,12 +377,15 @@ func (ins *Insert) description() PrimitiveDescription {
 		}
 	}
 
+	if ins.FetchLastInsertID {
+		other["FetchLastInsertID"] = true
+	}
+
 	return PrimitiveDescription{
-		OperatorType:     "Insert",
-		Keyspace:         ins.Keyspace,
-		Variant:          ins.Opcode.String(),
-		TargetTabletType: topodatapb.TabletType_PRIMARY,
-		Other:            other,
+		OperatorType: "Insert",
+		Keyspace:     ins.Keyspace,
+		Variant:      ins.Opcode.String(),
+		Other:        other,
 	}
 }
 

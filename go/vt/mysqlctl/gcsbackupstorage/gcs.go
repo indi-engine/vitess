@@ -32,8 +32,10 @@ import (
 	"google.golang.org/api/iterator"
 	"google.golang.org/api/option"
 
+	"vitess.io/vitess/go/vt/mysqlctl/errors"
+	"vitess.io/vitess/go/vt/utils"
+
 	"vitess.io/vitess/go/trace"
-	"vitess.io/vitess/go/vt/concurrency"
 	"vitess.io/vitess/go/vt/mysqlctl/backupstorage"
 	"vitess.io/vitess/go/vt/servenv"
 )
@@ -47,8 +49,8 @@ var (
 )
 
 func registerFlags(fs *pflag.FlagSet) {
-	fs.StringVar(&bucket, "gcs_backup_storage_bucket", "", "Google Cloud Storage bucket to use for backups.")
-	fs.StringVar(&root, "gcs_backup_storage_root", "", "Root prefix for all backup-related object names.")
+	utils.SetFlagStringVar(fs, &bucket, "gcs-backup-storage-bucket", "", "Google Cloud Storage bucket to use for backups.")
+	utils.SetFlagStringVar(fs, &root, "gcs-backup-storage-root", "", "Root prefix for all backup-related object names.")
 }
 
 func init() {
@@ -65,22 +67,7 @@ type GCSBackupHandle struct {
 	dir      string
 	name     string
 	readOnly bool
-	errors   concurrency.AllErrorRecorder
-}
-
-// RecordError is part of the concurrency.ErrorRecorder interface.
-func (bh *GCSBackupHandle) RecordError(err error) {
-	bh.errors.RecordError(err)
-}
-
-// HasErrors is part of the concurrency.ErrorRecorder interface.
-func (bh *GCSBackupHandle) HasErrors() bool {
-	return bh.errors.HasErrors()
-}
-
-// Error is part of the concurrency.ErrorRecorder interface.
-func (bh *GCSBackupHandle) Error() error {
-	return bh.errors.Error()
+	errors.PerFileErrorRecorder
 }
 
 // Directory implements BackupHandle.
@@ -285,7 +272,7 @@ func (bs *GCSBackupStorage) client(ctx context.Context) (*storage.Client, error)
 
 // objName joins path parts into an object name.
 // Unlike path.Join, it doesn't collapse ".." or strip trailing slashes.
-// It also adds the value of the --gcs_backup_storage_root flag if set.
+// It also adds the value of the --gcs-backup-storage-root flag if set.
 func objName(parts ...string) string {
 	if root != "" {
 		return root + "/" + strings.Join(parts, "/")

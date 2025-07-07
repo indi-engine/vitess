@@ -30,6 +30,7 @@ var (
 	_ Reversible      = (*Binary)(nil)
 	_ Hashing         = (*Binary)(nil)
 	_ ParamValidating = (*Binary)(nil)
+	_ Sequential      = (*Binary)(nil)
 )
 
 // Binary is a vindex that converts binary bits to a keyspace id.
@@ -79,9 +80,9 @@ func (vind *Binary) Verify(ctx context.Context, vcursor VCursor, ids []sqltypes.
 	return out, nil
 }
 
-// Map can map ids to key.Destination objects.
-func (vind *Binary) Map(ctx context.Context, vcursor VCursor, ids []sqltypes.Value) ([]key.Destination, error) {
-	out := make([]key.Destination, 0, len(ids))
+// Map can map ids to key.ShardDestination objects.
+func (vind *Binary) Map(ctx context.Context, vcursor VCursor, ids []sqltypes.Value) ([]key.ShardDestination, error) {
+	out := make([]key.ShardDestination, 0, len(ids))
 	for _, id := range ids {
 		idBytes, err := vind.Hash(id)
 		if err != nil {
@@ -106,6 +107,20 @@ func (*Binary) ReverseMap(_ VCursor, ksids [][]byte) ([]sqltypes.Value, error) {
 		reverseIds[rownum] = sqltypes.MakeTrusted(sqltypes.VarBinary, keyspaceID)
 	}
 	return reverseIds, nil
+}
+
+// RangeMap can map ids to key.ShardDestination objects.
+func (vind *Binary) RangeMap(ctx context.Context, vcursor VCursor, startId sqltypes.Value, endId sqltypes.Value) ([]key.ShardDestination, error) {
+	startKsId, err := vind.Hash(startId)
+	if err != nil {
+		return nil, err
+	}
+	endKsId, err := vind.Hash(endId)
+	if err != nil {
+		return nil, err
+	}
+	out := []key.ShardDestination{&key.DestinationKeyRange{KeyRange: key.NewKeyRange(startKsId, endKsId)}}
+	return out, nil
 }
 
 // UnknownParams implements the ParamValidating interface.

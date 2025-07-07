@@ -41,7 +41,9 @@ import (
 var testNow = time.Now()
 
 func TestStateManagerStateByName(t *testing.T) {
-	sm := &stateManager{}
+	sm := &stateManager{
+		diskHealthMonitor: newNoopDiskHealthMonitor(),
+	}
 
 	sm.replHealthy = true
 	sm.wantState = StateServing
@@ -77,7 +79,6 @@ func TestStateManagerServePrimary(t *testing.T) {
 	assert.Equal(t, testNow, sm.ptsTimestamp)
 
 	verifySubcomponent(t, 1, sm.watcher, testStateClosed)
-
 	verifySubcomponent(t, 2, sm.se, testStateOpen)
 	verifySubcomponent(t, 3, sm.vstreamer, testStateOpen)
 	verifySubcomponent(t, 4, sm.qe, testStateOpen)
@@ -145,6 +146,38 @@ func TestStateManagerUnservePrimary(t *testing.T) {
 
 	assert.Equal(t, topodatapb.TabletType_PRIMARY, sm.target.TabletType)
 	assert.Equal(t, StateNotServing, sm.state)
+}
+
+type testDiskMonitor struct {
+	mu            sync.Mutex
+	isDiskStalled bool
+}
+
+func (t *testDiskMonitor) IsDiskStalled() bool {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	return t.isDiskStalled
+}
+
+func (t *testDiskMonitor) setDiskStalled(ds bool) {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	t.isDiskStalled = ds
+}
+
+// TestIsServing tests IsServing() functionality.
+func TestIsServing(t *testing.T) {
+	sm := newTestStateManager()
+	defer sm.StopService()
+	tdm := &testDiskMonitor{isDiskStalled: false}
+	sm.diskHealthMonitor = tdm
+
+	err := sm.SetServingType(topodatapb.TabletType_REPLICA, testNow, StateServing, "")
+	require.NoError(t, err)
+	require.True(t, sm.IsServing())
+
+	tdm.setDiskStalled(true)
+	require.False(t, sm.IsServing())
 }
 
 func TestStateManagerUnserveNonPrimary(t *testing.T) {
@@ -480,18 +513,14 @@ func TestStateManagerCheckMySQL(t *testing.T) {
 	sm.checkMySQL()
 
 	// Wait for closeAll to get under way.
-	for {
-		if order.Load() >= 1 {
-			break
-		}
+	for order.Load() < 1 {
+
 		time.Sleep(10 * time.Millisecond)
 	}
 
 	// Wait to get out of transitioning state.
-	for {
-		if !sm.isTransitioning() {
-			break
-		}
+	for sm.isTransitioning() {
+
 		time.Sleep(10 * time.Millisecond)
 	}
 
@@ -669,6 +698,45 @@ func TestStateManagerNotify(t *testing.T) {
 	sm.StopService()
 }
 
+func TestDemotePrimaryStalled(t *testing.T) {
+	sm := newTestStateManager()
+	defer sm.StopService()
+	err := sm.SetServingType(topodatapb.TabletType_PRIMARY, testNow, StateServing, "")
+	require.NoError(t, err)
+	// Stopping the ticker so that we don't get unexpected health streams.
+	sm.hcticks.Stop()
+
+	ch := make(chan *querypb.StreamHealthResponse, 5)
+	var wg sync.WaitGroup
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		err := sm.hs.Stream(context.Background(), func(shr *querypb.StreamHealthResponse) error {
+			ch <- shr
+			return nil
+		})
+		assert.Contains(t, err.Error(), "tabletserver is shutdown")
+	}()
+	defer wg.Wait()
+
+	// Send a broadcast message and check we have no error there.
+	sm.Broadcast()
+	gotshr := <-ch
+	require.Empty(t, gotshr.RealtimeStats.HealthError)
+
+	// If demote primary is stalled, then we should get an error.
+	sm.demotePrimaryStalled = true
+	sm.Broadcast()
+	gotshr = <-ch
+	require.EqualValues(t, "VT09031: Primary demotion is stalled", gotshr.RealtimeStats.HealthError)
+	// Verify that we can't start a new request once we have a demote primary stalled.
+	err = sm.StartRequest(context.Background(), &querypb.Target{TabletType: topodatapb.TabletType_PRIMARY}, false)
+	require.ErrorContains(t, err, "operation not allowed in state NOT_SERVING")
+
+	// Stop the state manager.
+	sm.StopService()
+}
+
 func TestRefreshReplHealthLocked(t *testing.T) {
 	sm := newTestStateManager()
 	defer sm.StopService()
@@ -739,23 +807,24 @@ func newTestStateManager() *stateManager {
 	parser := sqlparser.NewTestParser()
 	env := tabletenv.NewEnv(vtenv.NewTestEnv(), cfg, "StateManagerTest")
 	sm := &stateManager{
-		statelessql: NewQueryList("stateless", parser),
-		statefulql:  NewQueryList("stateful", parser),
-		olapql:      NewQueryList("olap", parser),
-		hs:          newHealthStreamer(env, &topodatapb.TabletAlias{}, schema.NewEngine(env)),
-		se:          &testSchemaEngine{},
-		rt:          &testReplTracker{lag: 1 * time.Second},
-		vstreamer:   &testSubcomponent{},
-		tracker:     &testSubcomponent{},
-		watcher:     &testSubcomponent{},
-		qe:          &testQueryEngine{},
-		txThrottler: &testTxThrottler{},
-		te:          &testTxEngine{},
-		messager:    &testSubcomponent{},
-		ddle:        &testOnlineDDLExecutor{},
-		throttler:   &testLagThrottler{},
-		tableGC:     &testTableGC{},
-		rw:          newRequestsWaiter(),
+		statelessql:       NewQueryList("stateless", parser),
+		statefulql:        NewQueryList("stateful", parser),
+		olapql:            NewQueryList("olap", parser),
+		hs:                newHealthStreamer(env, &topodatapb.TabletAlias{}, schema.NewEngine(env)),
+		se:                &testSchemaEngine{},
+		rt:                &testReplTracker{lag: 1 * time.Second},
+		vstreamer:         &testSubcomponent{},
+		tracker:           &testSubcomponent{},
+		watcher:           &testSubcomponent{},
+		qe:                &testQueryEngine{},
+		txThrottler:       &testTxThrottler{},
+		te:                &testTxEngine{},
+		messager:          &testSubcomponent{},
+		ddle:              &testOnlineDDLExecutor{},
+		diskHealthMonitor: newNoopDiskHealthMonitor(),
+		throttler:         &testLagThrottler{},
+		tableGC:           &testTableGC{},
+		rw:                newRequestsWaiter(),
 	}
 	sm.Init(env, &querypb.Target{})
 	sm.hs.InitDBConfig(&querypb.Target{})
@@ -809,7 +878,7 @@ type testSchemaEngine struct {
 	failMySQL bool
 }
 
-func (te *testSchemaEngine) EnsureConnectionAndDB(tabletType topodatapb.TabletType) error {
+func (te *testSchemaEngine) EnsureConnectionAndDB(topodatapb.TabletType, bool) error {
 	if te.failMySQL {
 		te.failMySQL = false
 		return errors.New("intentional error")

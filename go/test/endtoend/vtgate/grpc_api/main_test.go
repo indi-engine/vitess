@@ -24,6 +24,7 @@ import (
 	"testing"
 
 	"vitess.io/vitess/go/test/endtoend/cluster"
+	"vitess.io/vitess/go/vt/utils"
 )
 
 var (
@@ -75,7 +76,6 @@ var (
 )
 
 func TestMain(m *testing.M) {
-	defer cluster.PanicHandler(nil)
 	flag.Parse()
 
 	exitcode := func() int {
@@ -107,11 +107,10 @@ func TestMain(m *testing.M) {
 
 		// Configure vtgate to use static auth
 		clusterInstance.VtGateExtraArgs = []string{
-			"--grpc_auth_mode", "static",
-			"--grpc_auth_static_password_file", grpcServerAuthStaticPath,
-			"--grpc_use_effective_callerid",
-			"--grpc-use-static-authentication-callerid",
-			"--grpc-send-session-in-streaming",
+			utils.GetFlagVariantForTests("--grpc-auth-mode"), "static",
+			utils.GetFlagVariantForTests("--grpc-auth-static-password-file"), grpcServerAuthStaticPath,
+			utils.GetFlagVariantForTests("--grpc-use-effective-callerid"),
+			utils.GetFlagVariantForTests("--grpc-use-static-authentication-callerid"),
 		}
 
 		// Configure vttablet to use table ACL

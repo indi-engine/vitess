@@ -28,8 +28,8 @@ import (
 
 	"vitess.io/vitess/go/mysql"
 	"vitess.io/vitess/go/sqltypes"
+	"vitess.io/vitess/go/test/endtoend/cluster"
 	"vitess.io/vitess/go/vt/log"
-	vttablet "vitess.io/vitess/go/vt/vttablet/common"
 
 	binlogdatapb "vitess.io/vitess/go/vt/proto/binlogdata"
 )
@@ -40,12 +40,10 @@ const testWorkflowFlavor = workflowFlavorVtctld
 // It inserts initial data, then simulates load. We insert both child rows with foreign keys and those without,
 // i.e. with foreign_key_checks=0.
 func TestFKWorkflow(t *testing.T) {
+	setSidecarDBName("_vt")
 	extraVTTabletArgs = []string{
 		// Ensure that there are multiple copy phase cycles per table.
 		"--vstream_packet_size=256",
-		// Test VPlayer batching mode.
-		fmt.Sprintf("--vreplication_experimental_flags=%d",
-			vttablet.VReplicationExperimentalFlagAllowNoBlobBinlogRowImage|vttablet.VReplicationExperimentalFlagOptimizeInserts|vttablet.VReplicationExperimentalFlagVPlayerBatching),
 	}
 	defer func() { extraVTTabletArgs = nil }()
 
@@ -106,11 +104,11 @@ func TestFKWorkflow(t *testing.T) {
 	targetTab := targetKs.Shards["0"].Tablets[fmt.Sprintf("%s-%d", cellName, targetTabletId)].Vttablet
 	require.NotNil(t, targetTab)
 	catchup(t, targetTab, workflowName, "MoveTables")
-	vdiff(t, targetKeyspace, workflowName, cellName, true, false, nil)
+	vdiff(t, targetKeyspace, workflowName, cellName, nil)
 	if withLoad {
 		ls.waitForAdditionalRows(200)
 	}
-	vdiff(t, targetKeyspace, workflowName, cellName, true, false, nil)
+	vdiff(t, targetKeyspace, workflowName, cellName, nil)
 	if withLoad {
 		cancel()
 		<-ch
@@ -132,11 +130,16 @@ func TestFKWorkflow(t *testing.T) {
 	vtgateConn, closeConn := getVTGateConn()
 	defer closeConn()
 
-	t11Count := getRowCount(t, vtgateConn, "t11")
-	t12Count := getRowCount(t, vtgateConn, "t12")
-	require.Greater(t, t11Count, 1)
-	require.Greater(t, t12Count, 1)
-	require.Equal(t, t11Count, t12Count)
+	if withLoad {
+		t11Count := getRowCount(t, vtgateConn, "t11")
+		t12Count := getRowCount(t, vtgateConn, "t12")
+		require.Greater(t, t11Count, 1)
+		require.Greater(t, t12Count, 1)
+		require.Equal(t, t11Count, t12Count)
+		// Check for the secondary key
+		confirmTablesHaveSecondaryKeys(t, []*cluster.VttabletProcess{targetTab}, targetKeyspace, "parent")
+	}
+
 }
 
 func insertInitialFKData(t *testing.T) {

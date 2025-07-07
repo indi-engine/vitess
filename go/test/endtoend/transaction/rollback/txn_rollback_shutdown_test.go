@@ -31,6 +31,7 @@ import (
 
 	"vitess.io/vitess/go/mysql"
 	"vitess.io/vitess/go/test/endtoend/cluster"
+	vtutils "vitess.io/vitess/go/vt/utils"
 )
 
 var (
@@ -48,7 +49,6 @@ var (
 )
 
 func TestMain(m *testing.M) {
-	defer cluster.PanicHandler(nil)
 	flag.Parse()
 
 	exitCode := func() int {
@@ -75,7 +75,7 @@ func TestMain(m *testing.M) {
 		}
 
 		// Set a short onterm timeout so the test goes faster.
-		clusterInstance.VtGateExtraArgs = []string{"--onterm_timeout", "1s"}
+		clusterInstance.VtGateExtraArgs = []string{vtutils.GetFlagVariantForTests("--onterm-timeout"), "1s"}
 		err = clusterInstance.StartVtgate()
 		if err != nil {
 			panic(err)
@@ -87,7 +87,6 @@ func TestMain(m *testing.M) {
 }
 
 func TestTransactionRollBackWhenShutDown(t *testing.T) {
-	defer cluster.PanicHandler(t)
 	ctx := context.Background()
 	conn, err := mysql.Connect(ctx, &vtParams)
 	require.NoError(t, err)
@@ -122,7 +121,6 @@ func TestTransactionRollBackWhenShutDown(t *testing.T) {
 }
 
 func TestErrorInAutocommitSession(t *testing.T) {
-	defer cluster.PanicHandler(t)
 	ctx := context.Background()
 	conn, err := mysql.Connect(ctx, &vtParams)
 	require.NoError(t, err)

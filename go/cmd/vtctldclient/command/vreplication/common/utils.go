@@ -19,6 +19,7 @@ package common
 import (
 	"bytes"
 	"context"
+	"encoding/json"
 	"fmt"
 	"strings"
 	"time"
@@ -27,6 +28,7 @@ import (
 
 	"vitess.io/vitess/go/cmd/vtctldclient/cli"
 	"vitess.io/vitess/go/vt/key"
+	"vitess.io/vitess/go/vt/sqlparser"
 	"vitess.io/vitess/go/vt/topo"
 	"vitess.io/vitess/go/vt/topo/topoproto"
 	"vitess.io/vitess/go/vt/vtctl/vtctldclient"
@@ -68,6 +70,7 @@ var (
 		MySQLServerVersion           string
 		TruncateUILen                int
 		TruncateErrLen               int
+		ReferenceTables              []string
 		ConfigOverrides              []string
 	}{}
 )
@@ -140,6 +143,50 @@ func ParseTabletTypes(cmd *cobra.Command) error {
 		return fmt.Errorf("invalid tablet-types value, at least one valid tablet type must be specified")
 	}
 	return nil
+}
+
+func ParseTableMaterializeSettings(tableSettings string, parser *sqlparser.Parser) ([]*vtctldatapb.TableMaterializeSettings, error) {
+	tableMaterializeSettings := make([]*vtctldatapb.TableMaterializeSettings, 0)
+	err := json.Unmarshal([]byte(tableSettings), &tableMaterializeSettings)
+	if err != nil {
+		return tableMaterializeSettings, fmt.Errorf("table-settings is not valid JSON")
+	}
+	if len(tableMaterializeSettings) == 0 {
+		return tableMaterializeSettings, fmt.Errorf("empty table-settings")
+	}
+
+	// Validate the provided queries.
+	seenSourceTables := make(map[string]bool)
+	for _, tms := range tableMaterializeSettings {
+		if tms.TargetTable == "" || tms.SourceExpression == "" {
+			return tableMaterializeSettings, fmt.Errorf("missing target_table or source_expression")
+		}
+		// Validate that the query is valid.
+		stmt, err := parser.Parse(tms.SourceExpression)
+		if err != nil {
+			return tableMaterializeSettings, fmt.Errorf("invalid source_expression: %q", tms.SourceExpression)
+		}
+		// Validate that each source-expression uses a different table.
+		// If any of them query the same table the materialize workflow
+		// will fail.
+		err = sqlparser.Walk(func(node sqlparser.SQLNode) (kontinue bool, err error) {
+			switch node := node.(type) {
+			case sqlparser.TableName:
+				if node.Name.NotEmpty() {
+					if seenSourceTables[node.Name.String()] {
+						return false, fmt.Errorf("multiple source_expression queries use the same table: %q", node.Name.String())
+					}
+					seenSourceTables[node.Name.String()] = true
+				}
+			}
+			return true, nil
+		}, stmt)
+		if err != nil {
+			return tableMaterializeSettings, err
+		}
+	}
+
+	return tableMaterializeSettings, nil
 }
 
 func validateOnDDL(cmd *cobra.Command) error {
@@ -252,7 +299,7 @@ func AddCommonCreateFlags(cmd *cobra.Command) {
 	cmd.Flags().Var((*topoproto.TabletTypeListFlag)(&CreateOptions.TabletTypes), "tablet-types", "Source tablet types to replicate table data from (e.g. PRIMARY,REPLICA,RDONLY).")
 	cmd.Flags().BoolVar(&CreateOptions.TabletTypesInPreferenceOrder, "tablet-types-in-preference-order", true, "When performing source tablet selection, look for candidates in the type order as they are listed in the tablet-types flag.")
 	cmd.Flags().StringVar(&CreateOptions.OnDDL, "on-ddl", onDDLDefault, "What to do when DDL is encountered in the VReplication stream. Possible values are IGNORE, STOP, EXEC, and EXEC_IGNORE.")
-	cmd.Flags().BoolVar(&CreateOptions.DeferSecondaryKeys, "defer-secondary-keys", false, "Defer secondary index creation for a table until after it has been copied.")
+	cmd.Flags().BoolVar(&CreateOptions.DeferSecondaryKeys, "defer-secondary-keys", true, "Defer secondary index creation for a table until after it has been copied.")
 	cmd.Flags().BoolVar(&CreateOptions.AutoStart, "auto-start", true, "Start the workflow after creating it.")
 	cmd.Flags().BoolVar(&CreateOptions.StopAfterCopy, "stop-after-copy", false, "Stop the workflow after it's finished copying the existing rows and before it starts replicating changes.")
 	cmd.Flags().StringSliceVar(&CreateOptions.ConfigOverrides, "config-overrides", []string{}, "Specify one or more VReplication config flags to override as a comma-separated list of key=value pairs.")
@@ -286,7 +333,7 @@ func AddCommonSwitchTrafficFlags(cmd *cobra.Command, initializeTargetSequences b
 	cmd.Flags().BoolVar(&SwitchTrafficOptions.DryRun, "dry-run", false, "Print the actions that would be taken and report any known errors that would have occurred.")
 	cmd.Flags().BoolVar(&SwitchTrafficOptions.Force, "force", false, "Force the traffic switch even if some potentially non-critical actions cannot be performed; for example the tablet refresh fails on some tablets in the keyspace. WARNING: this should be used with extreme caution and only in emergency situations!")
 	if initializeTargetSequences {
-		cmd.Flags().BoolVar(&SwitchTrafficOptions.InitializeTargetSequences, "initialize-target-sequences", false, "When moving tables from an unsharded keyspace to a sharded keyspace, initialize any sequences that are being used on the target when switching writes.")
+		cmd.Flags().BoolVar(&SwitchTrafficOptions.InitializeTargetSequences, "initialize-target-sequences", false, "When moving tables from an unsharded keyspace to a sharded keyspace, initialize any sequences that are being used on the target when switching writes. If the sequence table is not found, and the sequence table reference was fully qualified OR a value was specified for --global-keyspace, then we will attempt to create the sequence table in that keyspace.")
 	}
 }
 

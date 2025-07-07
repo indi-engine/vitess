@@ -25,6 +25,7 @@ import (
 	"time"
 
 	"vitess.io/vitess/go/vt/sidecardb"
+	"vitess.io/vitess/go/vt/utils"
 
 	"github.com/stretchr/testify/require"
 
@@ -73,7 +74,6 @@ var (
 )
 
 func TestMain(m *testing.M) {
-	defer cluster.PanicHandler(nil)
 	flag.Parse()
 
 	exitCode := func() int {
@@ -130,8 +130,8 @@ func getTablet(tabletGrpcPort int) *tabletpb.Tablet {
 func resurrectTablet(t *testing.T, tab cluster.Vttablet) {
 	// initialize config again to regenerate the my.cnf file which has the port to use
 	_, err := tab.MysqlctlProcess.ExecuteCommandWithOutput("--log_dir", tab.MysqlctlProcess.LogDirectory,
-		"--tablet_uid", fmt.Sprintf("%d", tab.MysqlctlProcess.TabletUID),
-		"--mysql_port", fmt.Sprintf("%d", tab.MysqlctlProcess.MySQLPort),
+		utils.GetFlagVariantForTests("--tablet-uid"), fmt.Sprintf("%d", tab.MysqlctlProcess.TabletUID),
+		utils.GetFlagVariantForTests("--mysql-port"), fmt.Sprintf("%d", tab.MysqlctlProcess.MySQLPort),
 		"init_config")
 	require.NoError(t, err)
 
@@ -204,4 +204,14 @@ func TestReplicationRepairAfterPrimaryTabletChange(t *testing.T) {
 	require.NoError(t, err)
 	// sidecardb should find the desired _vt schema and not apply any new creates or upgrades when the tablet comes up again
 	require.Equal(t, sidecarDDLCount, int64(0))
+}
+
+func TestReparentJournalInfo(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	for _, vttablet := range clusterInstance.Keyspaces[0].Shards[0].Vttablets {
+		length, err := tmClient.ReadReparentJournalInfo(ctx, getTablet(vttablet.GrpcPort))
+		require.NoError(t, err)
+		require.EqualValues(t, 1, length)
+	}
 }

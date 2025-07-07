@@ -29,6 +29,7 @@ import (
 	"vitess.io/vitess/go/vt/callerid"
 	"vitess.io/vitess/go/vt/grpcclient"
 	"vitess.io/vitess/go/vt/servenv"
+	"vitess.io/vitess/go/vt/utils"
 	"vitess.io/vitess/go/vt/vttablet/queryservice"
 	"vitess.io/vitess/go/vt/vttablet/tabletconn"
 
@@ -49,11 +50,11 @@ var (
 )
 
 func registerFlags(fs *pflag.FlagSet) {
-	fs.StringVar(&cert, "tablet_grpc_cert", cert, "the cert to use to connect")
-	fs.StringVar(&key, "tablet_grpc_key", key, "the key to use to connect")
-	fs.StringVar(&ca, "tablet_grpc_ca", ca, "the server ca to use to validate servers when connecting")
-	fs.StringVar(&crl, "tablet_grpc_crl", crl, "the server crl to use to validate server certificates when connecting")
-	fs.StringVar(&name, "tablet_grpc_server_name", name, "the server name to use to validate server certificate")
+	utils.SetFlagStringVar(fs, &cert, "tablet-grpc-cert", cert, "the cert to use to connect")
+	utils.SetFlagStringVar(fs, &key, "tablet-grpc-key", key, "the key to use to connect")
+	utils.SetFlagStringVar(fs, &ca, "tablet-grpc-ca", ca, "the server ca to use to validate servers when connecting")
+	utils.SetFlagStringVar(fs, &crl, "tablet-grpc-crl", crl, "the server crl to use to validate server certificates when connecting")
+	utils.SetFlagStringVar(fs, &name, "tablet-grpc-server-name", name, "the server name to use to validate server certificate")
 }
 
 func init() {
@@ -351,11 +352,12 @@ func (conn *gRPCQueryClient) CreateTransaction(ctx context.Context, target *quer
 
 // StartCommit atomically commits the transaction along with the
 // decision to commit the associated 2pc transaction.
-func (conn *gRPCQueryClient) StartCommit(ctx context.Context, target *querypb.Target, transactionID int64, dtid string) error {
+func (conn *gRPCQueryClient) StartCommit(ctx context.Context, target *querypb.Target, transactionID int64, dtid string) (querypb.StartCommitState, error) {
 	conn.mu.RLock()
 	defer conn.mu.RUnlock()
 	if conn.cc == nil {
-		return tabletconn.ConnClosed
+		// This can be marked as fail as not other process will try to commit this transaction.
+		return querypb.StartCommitState_Fail, tabletconn.ConnClosed
 	}
 
 	req := &querypb.StartCommitRequest{
@@ -365,11 +367,12 @@ func (conn *gRPCQueryClient) StartCommit(ctx context.Context, target *querypb.Ta
 		TransactionId:     transactionID,
 		Dtid:              dtid,
 	}
-	_, err := conn.c.StartCommit(ctx, req)
-	if err != nil {
-		return tabletconn.ErrorFromGRPC(err)
+	resp, err := conn.c.StartCommit(ctx, req)
+	err = tabletconn.ErrorFromGRPC(err)
+	if resp != nil {
+		return resp.State, err
 	}
-	return nil
+	return querypb.StartCommitState_Unknown, err
 }
 
 // SetRollback transitions the 2pc transaction to the Rollback state.
@@ -439,7 +442,7 @@ func (conn *gRPCQueryClient) ReadTransaction(ctx context.Context, target *queryp
 }
 
 // UnresolvedTransactions returns all unresolved distributed transactions.
-func (conn *gRPCQueryClient) UnresolvedTransactions(ctx context.Context, target *querypb.Target) ([]*querypb.TransactionMetadata, error) {
+func (conn *gRPCQueryClient) UnresolvedTransactions(ctx context.Context, target *querypb.Target, abandonAgeSeconds int64) ([]*querypb.TransactionMetadata, error) {
 	conn.mu.RLock()
 	defer conn.mu.RUnlock()
 	if conn.cc == nil {
@@ -450,6 +453,7 @@ func (conn *gRPCQueryClient) UnresolvedTransactions(ctx context.Context, target 
 		Target:            target,
 		EffectiveCallerId: callerid.EffectiveCallerIDFromContext(ctx),
 		ImmediateCallerId: callerid.ImmediateCallerIDFromContext(ctx),
+		AbandonAge:        abandonAgeSeconds,
 	}
 	response, err := conn.c.UnresolvedTransactions(ctx, req)
 	if err != nil {

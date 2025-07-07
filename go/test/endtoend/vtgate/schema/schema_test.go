@@ -31,6 +31,7 @@ import (
 	"github.com/stretchr/testify/require"
 
 	"vitess.io/vitess/go/test/endtoend/cluster"
+	"vitess.io/vitess/go/vt/utils"
 )
 
 var (
@@ -55,7 +56,6 @@ var (
 )
 
 func TestMain(m *testing.M) {
-	defer cluster.PanicHandler(nil)
 	flag.Parse()
 
 	exitcode, err := func() (int, error) {
@@ -69,9 +69,9 @@ func TestMain(m *testing.M) {
 		}
 
 		clusterInstance.VtctldExtraArgs = []string{
-			"--schema_change_dir", schemaChangeDirectory,
-			"--schema_change_controller", "local",
-			"--schema_change_check_interval", "1s",
+			"--schema-change-dir", schemaChangeDirectory,
+			"--schema-change-controller", "local",
+			"--schema-change-check-interval", "1s",
 		}
 
 		if err := clusterInstance.StartTopo(); err != nil {
@@ -101,7 +101,6 @@ func TestMain(m *testing.M) {
 }
 
 func TestSchemaChange(t *testing.T) {
-	defer cluster.PanicHandler(t)
 	testWithInitialSchema(t)
 	testWithAlterSchema(t)
 	testWithAlterDatabase(t)
@@ -220,7 +219,7 @@ func testDropNonExistentTables(t *testing.T) {
 func testCreateInvalidView(t *testing.T) {
 	for _, ddlStrategy := range []string{"direct", "direct -allow-zero-in-date"} {
 		createInvalidView := "CREATE OR REPLACE VIEW invalid_view AS SELECT * FROM nonexistent_table;"
-		output, err := clusterInstance.VtctldClientProcess.ExecuteCommandWithOutput("ApplySchema", "--ddl-strategy", ddlStrategy, "--sql", createInvalidView, keyspaceName)
+		output, err := clusterInstance.VtctldClientProcess.ExecuteCommandWithOutput("ApplySchema", utils.GetFlagVariantForTests("--ddl-strategy"), ddlStrategy, "--sql", createInvalidView, keyspaceName)
 		require.Error(t, err)
 		assert.Contains(t, output, "doesn't exist (errno 1146)")
 	}
@@ -241,7 +240,7 @@ func testApplySchemaBatch(t *testing.T) {
 	}
 	{
 		sqls := "create table batch1(id int primary key);create table batch2(id int primary key);create table batch3(id int primary key);create table batch4(id int primary key);create table batch5(id int primary key);"
-		_, err := clusterInstance.VtctldClientProcess.ExecuteCommandWithOutput("ApplySchema", "--ddl-strategy", "direct --allow-zero-in-date", "--sql", sqls, "--batch-size", "2", keyspaceName)
+		_, err := clusterInstance.VtctldClientProcess.ExecuteCommandWithOutput("ApplySchema", utils.GetFlagVariantForTests("--ddl-strategy"), "direct --allow-zero-in-date", "--sql", sqls, "--batch-size", "2", keyspaceName)
 		require.NoError(t, err)
 		checkTables(t, totalTableCount+5)
 	}
@@ -259,12 +258,12 @@ func testUnsafeAllowForeignKeys(t *testing.T) {
 		create table t12 (id int primary key, i int, constraint f1201 foreign key (i) references t11 (id) on delete set null);
 	`
 	{
-		_, err := clusterInstance.VtctldClientProcess.ExecuteCommandWithOutput("ApplySchema", "--ddl-strategy", "direct --allow-zero-in-date", "--sql", sqls, keyspaceName)
+		_, err := clusterInstance.VtctldClientProcess.ExecuteCommandWithOutput("ApplySchema", utils.GetFlagVariantForTests("--ddl-strategy"), "direct --allow-zero-in-date", "--sql", sqls, keyspaceName)
 		assert.Error(t, err)
 		checkTables(t, totalTableCount)
 	}
 	{
-		_, err := clusterInstance.VtctldClientProcess.ExecuteCommandWithOutput("ApplySchema", "--ddl-strategy", "direct --unsafe-allow-foreign-keys --allow-zero-in-date", "--sql", sqls, keyspaceName)
+		_, err := clusterInstance.VtctldClientProcess.ExecuteCommandWithOutput("ApplySchema", utils.GetFlagVariantForTests("--ddl-strategy"), "direct --unsafe-allow-foreign-keys --allow-zero-in-date", "--sql", sqls, keyspaceName)
 		require.NoError(t, err)
 		checkTables(t, totalTableCount+2)
 	}
@@ -296,7 +295,7 @@ func testCopySchemaShards(t *testing.T, source string, shard int) {
 	checkTablesCount(t, clusterInstance.Keyspaces[0].Shards[shard].Vttablets[1], 0)
 	// Run the command twice to make sure it's idempotent.
 	for i := 0; i < 2; i++ {
-		err := clusterInstance.VtctlclientProcess.ExecuteCommand("CopySchemaShard", source, fmt.Sprintf("%s/%d", keyspaceName, shard))
+		err := clusterInstance.VtctldClientProcess.ExecuteCommand("CopySchemaShard", source, fmt.Sprintf("%s/%d", keyspaceName, shard))
 		require.Nil(t, err)
 	}
 	// shard2 primary should look the same as the replica we copied from
@@ -331,7 +330,7 @@ func testCopySchemaShardWithDifferentDB(t *testing.T, shard int) {
 	err = clusterInstance.VtctldClientProcess.ExecuteCommand("ExecuteFetchAsDBA", "--json", tabletAlias, "ALTER DATABASE vt_ks CHARACTER SET latin1")
 	require.Nil(t, err)
 
-	output, err := clusterInstance.VtctlclientProcess.ExecuteCommandWithOutput("CopySchemaShard", source, fmt.Sprintf("%s/%d", keyspaceName, shard))
+	output, err := clusterInstance.VtctldClientProcess.ExecuteCommandWithOutput("CopySchemaShard", source, fmt.Sprintf("%s/%d", keyspaceName, shard))
 	require.Error(t, err)
 	assert.True(t, strings.Contains(output, "schemas are different"))
 

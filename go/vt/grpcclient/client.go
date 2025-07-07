@@ -21,12 +21,14 @@ package grpcclient
 import (
 	"context"
 	"crypto/tls"
+	"net"
 	"sync"
 	"time"
 
 	grpc_middleware "github.com/grpc-ecosystem/go-grpc-middleware"
 	grpc_prometheus "github.com/grpc-ecosystem/go-grpc-prometheus"
 	"github.com/spf13/pflag"
+	"golang.org/x/sync/semaphore"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/credentials"
 	"google.golang.org/grpc/credentials/insecure"
@@ -36,6 +38,7 @@ import (
 	"vitess.io/vitess/go/vt/grpccommon"
 	"vitess.io/vitess/go/vt/log"
 	"vitess.io/vitess/go/vt/servenv"
+	"vitess.io/vitess/go/vt/utils"
 	"vitess.io/vitess/go/vt/vttls"
 )
 
@@ -45,6 +48,10 @@ var (
 	keepaliveTimeout      = 10 * time.Second
 	initialConnWindowSize int
 	initialWindowSize     int
+
+	// `dialConcurrencyLimit` tells us how many tablet grpc connections can be dialed concurrently.
+	// This should be less than the golang max thread limit of 10000.
+	dialConcurrencyLimit int64 = 1024
 
 	// every vitess binary that makes grpc client-side calls.
 	grpcclientBinaries = []string{
@@ -65,18 +72,25 @@ var (
 )
 
 func RegisterFlags(fs *pflag.FlagSet) {
-	fs.DurationVar(&keepaliveTime, "grpc_keepalive_time", keepaliveTime, "After a duration of this time, if the client doesn't see any activity, it pings the server to see if the transport is still alive.")
-	fs.DurationVar(&keepaliveTimeout, "grpc_keepalive_timeout", keepaliveTimeout, "After having pinged for keepalive check, the client waits for a duration of Timeout and if no activity is seen even after that the connection is closed.")
-	fs.IntVar(&initialConnWindowSize, "grpc_initial_conn_window_size", initialConnWindowSize, "gRPC initial connection window size")
-	fs.IntVar(&initialWindowSize, "grpc_initial_window_size", initialWindowSize, "gRPC initial window size")
-	fs.StringVar(&compression, "grpc_compression", compression, "Which protocol to use for compressing gRPC. Default: nothing. Supported: snappy")
 
-	fs.StringVar(&credsFile, "grpc_auth_static_client_creds", credsFile, "When using grpc_static_auth in the server, this file provides the credentials to use to authenticate with server.")
+	utils.SetFlagDurationVar(fs, &keepaliveTime, "grpc-keepalive-time", keepaliveTime, "After a duration of this time, if the client doesn't see any activity, it pings the server to see if the transport is still alive.")
+	utils.SetFlagDurationVar(fs, &keepaliveTimeout, "grpc-keepalive-timeout", keepaliveTimeout, "After having pinged for keepalive check, the client waits for a duration of Timeout and if no activity is seen even after that the connection is closed.")
+	utils.SetFlagIntVar(fs, &initialConnWindowSize, "grpc-initial-conn-window-size", initialConnWindowSize, "gRPC initial connection window size")
+	utils.SetFlagIntVar(fs, &initialWindowSize, "grpc-initial-window-size", initialWindowSize, "gRPC initial window size")
+	utils.SetFlagStringVar(fs, &compression, "grpc-compression", compression, "Which protocol to use for compressing gRPC. Default: nothing. Supported: snappy")
+
+	utils.SetFlagStringVar(fs, &credsFile, "grpc-auth-static-client-creds", credsFile, "When using grpc_static_auth in the server, this file provides the credentials to use to authenticate with server.")
+}
+
+func RegisterDialConcurrencyFlags(fs *pflag.FlagSet) {
+	utils.SetFlagInt64Var(fs, &dialConcurrencyLimit, "grpc-dial-concurrency-limit", 1024, "Maximum concurrency of grpc dial operations. This should be less than the golang max thread limit of 10000.")
 }
 
 func init() {
 	for _, cmd := range grpcclientBinaries {
 		servenv.OnParseFor(cmd, RegisterFlags)
+
+		servenv.OnParseFor(cmd, RegisterDialConcurrencyFlags)
 	}
 }
 
@@ -129,6 +143,10 @@ func DialContext(ctx context.Context, target string, failFast FailFast, opts ...
 		newopts = append(newopts, grpc.WithInitialWindowSize(int32(initialWindowSize)))
 	}
 
+	if dialConcurrencyLimit > 0 {
+		newopts = append(newopts, dialConcurrencyLimitOption())
+	}
+
 	newopts = append(newopts, opts...)
 	var err error
 	grpcDialOptionsMu.Lock()
@@ -173,6 +191,35 @@ func SecureDialOption(cert, key, ca, crl, name string) (grpc.DialOption, error) 
 	// Create the creds server options.
 	creds := credentials.NewTLS(config)
 	return grpc.WithTransportCredentials(creds), nil
+}
+
+var dialConcurrencyLimitOpt grpc.DialOption
+
+// withDialerContextOnce ensures grpc.WithDialContext() is added once to the options.
+var dialConcurrencyLimitOnce sync.Once
+
+func dialConcurrencyLimitOption() grpc.DialOption {
+	dialConcurrencyLimitOnce.Do(func() {
+		// This semaphore is used to limit how many grpc connections can be dialed to tablets simultanously.
+		// This does not limit how many tablet connections can be open at the same time.
+		sem := semaphore.NewWeighted(dialConcurrencyLimit)
+
+		dialConcurrencyLimitOpt = grpc.WithContextDialer(func(ctx context.Context, addr string) (net.Conn, error) {
+			// Limit the number of grpc connections opened in parallel to avoid high OS-thread
+			// usage due to blocking networking syscalls (eg: DNS lookups, TCP connection opens,
+			// etc). Without this limit it is possible for vtgates watching >10k tablets to hit
+			// the panic: 'runtime: program exceeds 10000-thread limit'.
+			if err := sem.Acquire(ctx, 1); err != nil {
+				return nil, err
+			}
+			defer sem.Release(1)
+
+			var dialer net.Dialer
+			return dialer.DialContext(ctx, "tcp", addr)
+		})
+	})
+
+	return dialConcurrencyLimitOpt
 }
 
 // Allows for building a chain of interceptors without knowing the total size up front

@@ -202,7 +202,7 @@ func InitTabletMap(
 	// Do this before any tablets are created so that they respect the protocol,
 	// otherwise it defaults to grpc.
 	//
-	// main() forces the --tablet_manager_protocol flag to this value.
+	// main() forces the --tablet-manager-protocol flag to this value.
 	tmclient.RegisterTabletManagerClientFactory("internal", func() tmclient.TabletManagerClient {
 		return &internalTabletManagerClient{}
 	})
@@ -223,7 +223,7 @@ func InitTabletMap(
 		return 0, fmt.Errorf("RebuildVSchemaGraph failed: %v", err)
 	}
 
-	// Register the tablet dialer for tablet server. main() forces the --tablet_protocol
+	// Register the tablet dialer for tablet server. main() forces the --tablet-protocol
 	// flag to this value.
 	tabletconn.RegisterDialer("internal", dialer)
 
@@ -410,7 +410,11 @@ func CreateKs(
 			if err != nil {
 				return 0, fmt.Errorf("BuildKeyspace(%v) failed: %v", keyspace, err)
 			}
-			if err := ts.SaveVSchema(ctx, keyspace, formal); err != nil {
+			ksvs := &topo.KeyspaceVSchemaInfo{
+				Name:     keyspace,
+				Keyspace: formal,
+			}
+			if err := ts.SaveVSchema(ctx, ksvs); err != nil {
 				return 0, fmt.Errorf("SaveVSchema(%v) failed: %v", keyspace, err)
 			}
 		} else {
@@ -539,9 +543,9 @@ func (itc *internalTabletConn) CreateTransaction(
 }
 
 // StartCommit is part of queryservice.QueryService
-func (itc *internalTabletConn) StartCommit(ctx context.Context, target *querypb.Target, transactionID int64, dtid string) error {
-	err := itc.tablet.qsc.QueryService().StartCommit(ctx, target, transactionID, dtid)
-	return tabletconn.ErrorFromGRPC(vterrors.ToGRPC(err))
+func (itc *internalTabletConn) StartCommit(ctx context.Context, target *querypb.Target, transactionID int64, dtid string) (querypb.StartCommitState, error) {
+	state, err := itc.tablet.qsc.QueryService().StartCommit(ctx, target, transactionID, dtid)
+	return state, tabletconn.ErrorFromGRPC(vterrors.ToGRPC(err))
 }
 
 // SetRollback is part of queryservice.QueryService
@@ -563,8 +567,8 @@ func (itc *internalTabletConn) ReadTransaction(ctx context.Context, target *quer
 }
 
 // UnresolvedTransactions is part of queryservice.QueryService
-func (itc *internalTabletConn) UnresolvedTransactions(ctx context.Context, target *querypb.Target) (transactions []*querypb.TransactionMetadata, err error) {
-	transactions, err = itc.tablet.qsc.QueryService().UnresolvedTransactions(ctx, target)
+func (itc *internalTabletConn) UnresolvedTransactions(ctx context.Context, target *querypb.Target, abandonAgeSeconds int64) (transactions []*querypb.TransactionMetadata, err error) {
+	transactions, err = itc.tablet.qsc.QueryService().UnresolvedTransactions(ctx, target, abandonAgeSeconds)
 	return transactions, tabletconn.ErrorFromGRPC(vterrors.ToGRPC(err))
 }
 
@@ -811,6 +815,20 @@ func (itmc *internalTabletManagerClient) SetReadWrite(ctx context.Context, table
 	return fmt.Errorf("not implemented in vtcombo")
 }
 
+func (itmc *internalTabletManagerClient) ChangeTags(ctx context.Context, tablet *topodatapb.Tablet, tabletTags map[string]string, replace bool) (*tabletmanagerdatapb.ChangeTagsResponse, error) {
+	t, ok := tabletMap[tablet.Alias.Uid]
+	if !ok {
+		return nil, fmt.Errorf("tmclient: cannot find tablet %v", tablet.Alias.Uid)
+	}
+	afterTags, err := t.tm.ChangeTags(ctx, tabletTags, replace)
+	if err != nil {
+		return nil, err
+	}
+	return &tabletmanagerdatapb.ChangeTagsResponse{
+		Tags: afterTags,
+	}, nil
+}
+
 func (itmc *internalTabletManagerClient) ChangeType(ctx context.Context, tablet *topodatapb.Tablet, dbType topodatapb.TabletType, semiSync bool) error {
 	t, ok := tabletMap[tablet.Alias.Uid]
 	if !ok {
@@ -894,12 +912,24 @@ func (itmc *internalTabletManagerClient) ExecuteFetchAsApp(context.Context, *top
 	return nil, fmt.Errorf("not implemented in vtcombo")
 }
 
-func (itmc *internalTabletManagerClient) GetUnresolvedTransactions(ctx context.Context, tablet *topodatapb.Tablet) ([]*querypb.TransactionMetadata, error) {
+func (itmc *internalTabletManagerClient) GetUnresolvedTransactions(ctx context.Context, tablet *topodatapb.Tablet, abandonAge int64) ([]*querypb.TransactionMetadata, error) {
 	return nil, fmt.Errorf("not implemented in vtcombo")
 }
 
 func (itmc *internalTabletManagerClient) ConcludeTransaction(ctx context.Context, tablet *topodatapb.Tablet, dtid string, mm bool) error {
 	return fmt.Errorf("not implemented in vtcombo")
+}
+
+func (itmc *internalTabletManagerClient) MysqlHostMetrics(context.Context, *topodatapb.Tablet, *tabletmanagerdatapb.MysqlHostMetricsRequest) (*tabletmanagerdatapb.MysqlHostMetricsResponse, error) {
+	return nil, fmt.Errorf("not implemented in vtcombo")
+}
+
+func (itmc *internalTabletManagerClient) ReadTransaction(ctx context.Context, tablet *topodatapb.Tablet, dtid string) (*querypb.TransactionMetadata, error) {
+	return nil, fmt.Errorf("not implemented in vtcombo")
+}
+
+func (itmc *internalTabletManagerClient) GetTransactionInfo(ctx context.Context, tablet *topodatapb.Tablet, dtid string) (*tabletmanagerdatapb.GetTransactionInfoResponse, error) {
+	return nil, fmt.Errorf("not implemented in vtcombo")
 }
 
 func (itmc *internalTabletManagerClient) PrimaryStatus(context.Context, *topodatapb.Tablet) (*replicationdatapb.PrimaryStatus, error) {
@@ -922,6 +952,10 @@ func (itmc *internalTabletManagerClient) CreateVReplicationWorkflow(context.Cont
 	return nil, fmt.Errorf("not implemented in vtcombo")
 }
 
+func (itmc *internalTabletManagerClient) DeleteTableData(context.Context, *topodatapb.Tablet, *tabletmanagerdatapb.DeleteTableDataRequest) (*tabletmanagerdatapb.DeleteTableDataResponse, error) {
+	return nil, fmt.Errorf("not implemented in vtcombo")
+}
+
 func (itmc *internalTabletManagerClient) DeleteVReplicationWorkflow(context.Context, *topodatapb.Tablet, *tabletmanagerdatapb.DeleteVReplicationWorkflowRequest) (*tabletmanagerdatapb.DeleteVReplicationWorkflowResponse, error) {
 	return nil, fmt.Errorf("not implemented in vtcombo")
 }
@@ -935,6 +969,10 @@ func (itmc *internalTabletManagerClient) ReadVReplicationWorkflows(context.Conte
 }
 
 func (itmc *internalTabletManagerClient) ReadVReplicationWorkflow(context.Context, *topodatapb.Tablet, *tabletmanagerdatapb.ReadVReplicationWorkflowRequest) (*tabletmanagerdatapb.ReadVReplicationWorkflowResponse, error) {
+	return nil, fmt.Errorf("not implemented in vtcombo")
+}
+
+func (itmc *internalTabletManagerClient) ValidateVReplicationPermissions(context.Context, *topodatapb.Tablet, *tabletmanagerdatapb.ValidateVReplicationPermissionsRequest) (*tabletmanagerdatapb.ValidateVReplicationPermissionsResponse, error) {
 	return nil, fmt.Errorf("not implemented in vtcombo")
 }
 
@@ -954,6 +992,14 @@ func (itmc *internalTabletManagerClient) UpdateVReplicationWorkflows(context.Con
 	return nil, fmt.Errorf("not implemented in vtcombo")
 }
 
+func (itmc *internalTabletManagerClient) UpdateSequenceTables(ctx context.Context, tablet *topodatapb.Tablet, request *tabletmanagerdatapb.UpdateSequenceTablesRequest) (*tabletmanagerdatapb.UpdateSequenceTablesResponse, error) {
+	return nil, fmt.Errorf("not implemented in vtcombo")
+}
+
+func (itmc *internalTabletManagerClient) GetMaxValueForSequences(ctx context.Context, tablet *topodatapb.Tablet, request *tabletmanagerdatapb.GetMaxValueForSequencesRequest) (*tabletmanagerdatapb.GetMaxValueForSequencesResponse, error) {
+	return nil, fmt.Errorf("not implemented in vtcombo")
+}
+
 func (itmc *internalTabletManagerClient) ResetReplication(context.Context, *topodatapb.Tablet) error {
 	return fmt.Errorf("not implemented in vtcombo")
 }
@@ -964,6 +1010,11 @@ func (itmc *internalTabletManagerClient) InitPrimary(context.Context, *topodatap
 
 func (itmc *internalTabletManagerClient) PopulateReparentJournal(context.Context, *topodatapb.Tablet, int64, string, *topodatapb.TabletAlias, string) error {
 	return fmt.Errorf("not implemented in vtcombo")
+}
+
+// ReadReparentJournalInfo is part of the tmclient.TabletManagerClient interface.
+func (itmc *internalTabletManagerClient) ReadReparentJournalInfo(ctx context.Context, tablet *topodatapb.Tablet) (int32, error) {
+	return 0, fmt.Errorf("not implemented in vtcombo")
 }
 
 func (itmc *internalTabletManagerClient) DemotePrimary(context.Context, *topodatapb.Tablet) (*replicationdatapb.PrimaryStatus, error) {

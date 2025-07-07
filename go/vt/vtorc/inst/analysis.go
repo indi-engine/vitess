@@ -38,6 +38,7 @@ const (
 	DeadPrimaryAndSomeReplicas             AnalysisCode = "DeadPrimaryAndSomeReplicas"
 	PrimaryHasPrimary                      AnalysisCode = "PrimaryHasPrimary"
 	PrimaryIsReadOnly                      AnalysisCode = "PrimaryIsReadOnly"
+	PrimaryCurrentTypeMismatch             AnalysisCode = "PrimaryCurrentTypeMismatch"
 	PrimarySemiSyncMustBeSet               AnalysisCode = "PrimarySemiSyncMustBeSet"
 	PrimarySemiSyncMustNotBeSet            AnalysisCode = "PrimarySemiSyncMustNotBeSet"
 	ReplicaIsWritable                      AnalysisCode = "ReplicaIsWritable"
@@ -55,7 +56,9 @@ const (
 	AllPrimaryReplicasNotReplicatingOrDead AnalysisCode = "AllPrimaryReplicasNotReplicatingOrDead"
 	LockedSemiSyncPrimaryHypothesis        AnalysisCode = "LockedSemiSyncPrimaryHypothesis"
 	LockedSemiSyncPrimary                  AnalysisCode = "LockedSemiSyncPrimary"
+	PrimarySemiSyncBlocked                 AnalysisCode = "PrimarySemiSyncBlocked"
 	ErrantGTIDDetected                     AnalysisCode = "ErrantGTIDDetected"
+	PrimaryDiskStalled                     AnalysisCode = "PrimaryDiskStalled"
 )
 
 type StructureAnalysisCode string
@@ -86,12 +89,12 @@ type ReplicationAnalysis struct {
 	AnalyzedInstanceAlias        string
 	AnalyzedInstancePrimaryAlias string
 	TabletType                   topodatapb.TabletType
+	CurrentTabletType            topodatapb.TabletType
 	PrimaryTimeStamp             time.Time
-	ClusterDetails               ClusterInfo
 	AnalyzedKeyspace             string
 	AnalyzedShard                string
 	// ShardPrimaryTermTimestamp is the primary term start time stored in the shard record.
-	ShardPrimaryTermTimestamp                 string
+	ShardPrimaryTermTimestamp                 time.Time
 	AnalyzedInstanceBinlogCoordinates         BinlogCoordinates
 	IsPrimary                                 bool
 	IsClusterPrimary                          bool
@@ -108,13 +111,13 @@ type ReplicationAnalysis struct {
 	Description                               string
 	StructureAnalysis                         []StructureAnalysisCode
 	OracleGTIDImmediateTopology               bool
-	MariaDBGTIDImmediateTopology              bool
 	BinlogServerImmediateTopology             bool
 	SemiSyncPrimaryEnabled                    bool
 	SemiSyncPrimaryStatus                     bool
 	SemiSyncPrimaryWaitForReplicaCount        uint
 	SemiSyncPrimaryClients                    uint
 	SemiSyncReplicaEnabled                    bool
+	SemiSyncBlocked                           bool
 	CountSemiSyncReplicasEnabled              uint
 	CountLoggingReplicas                      uint
 	CountStatementBasedLoggingReplicas        uint
@@ -130,6 +133,7 @@ type ReplicationAnalysis struct {
 	MaxReplicaGTIDMode                        string
 	MaxReplicaGTIDErrant                      string
 	IsReadOnly                                bool
+	IsDiskStalled                             bool
 }
 
 func (replicationAnalysis *ReplicationAnalysis) MarshalJSON() ([]byte, error) {
@@ -144,5 +148,5 @@ func (replicationAnalysis *ReplicationAnalysis) MarshalJSON() ([]byte, error) {
 // ValidSecondsFromSeenToLastAttemptedCheck returns the maximum allowed elapsed time
 // between last_attempted_check to last_checked before we consider the instance as invalid.
 func ValidSecondsFromSeenToLastAttemptedCheck() uint {
-	return config.Config.InstancePollSeconds + 1
+	return config.GetInstancePollSeconds()
 }

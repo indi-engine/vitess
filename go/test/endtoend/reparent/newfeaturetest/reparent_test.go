@@ -19,23 +19,30 @@ package newfeaturetest
 import (
 	"context"
 	"fmt"
+	"os"
+	"os/exec"
+	"strings"
+	"sync"
 	"testing"
+	"time"
 
+	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
 	"vitess.io/vitess/go/mysql"
 	"vitess.io/vitess/go/test/endtoend/cluster"
 	"vitess.io/vitess/go/test/endtoend/reparent/utils"
+	"vitess.io/vitess/go/vt/log"
+	"vitess.io/vitess/go/vt/vtctl/reparentutil/policy"
 )
 
 // TestRecoverWithMultipleVttabletFailures tests that ERS succeeds with the default values
 // even when there are multiple vttablet failures. In this test we use the semi_sync policy
 // to allow multiple failures to happen and still be recoverable.
 // The test takes down the vttablets of the primary and a rdonly tablet and runs ERS with the
-// default values of remote_operation_timeout, lock-timeout flags and wait_replicas_timeout subflag.
+// default values of remote-operation-timeout, lock-timeout flags and wait_replicas_timeout subflag.
 func TestRecoverWithMultipleVttabletFailures(t *testing.T) {
-	defer cluster.PanicHandler(t)
-	clusterInstance := utils.SetupReparentCluster(t, "semi_sync")
+	clusterInstance := utils.SetupReparentCluster(t, policy.DurabilitySemiSync)
 	defer utils.TeardownCluster(clusterInstance)
 	tablets := clusterInstance.Keyspaces[0].Shards[0].Vttablets
 	utils.ConfirmReplication(t, tablets[0], []*cluster.Vttablet{tablets[1], tablets[2], tablets[3]})
@@ -66,8 +73,7 @@ func TestRecoverWithMultipleVttabletFailures(t *testing.T) {
 // and ERS succeeds.
 func TestSingleReplicaERS(t *testing.T) {
 	// Set up a cluster with none durability policy
-	defer cluster.PanicHandler(t)
-	clusterInstance := utils.SetupReparentCluster(t, "none")
+	clusterInstance := utils.SetupReparentCluster(t, policy.DurabilityNone)
 	defer utils.TeardownCluster(clusterInstance)
 	tablets := clusterInstance.Keyspaces[0].Shards[0].Vttablets
 	// Confirm that the replication is setup correctly in the beginning.
@@ -102,8 +108,7 @@ func TestSingleReplicaERS(t *testing.T) {
 
 // TestTabletRestart tests that a running tablet can be  restarted and everything is still fine
 func TestTabletRestart(t *testing.T) {
-	defer cluster.PanicHandler(t)
-	clusterInstance := utils.SetupReparentCluster(t, "semi_sync")
+	clusterInstance := utils.SetupReparentCluster(t, policy.DurabilitySemiSync)
 	defer utils.TeardownCluster(clusterInstance)
 	tablets := clusterInstance.Keyspaces[0].Shards[0].Vttablets
 
@@ -115,8 +120,7 @@ func TestTabletRestart(t *testing.T) {
 
 // Tests ensures that ChangeTabletType works even when semi-sync plugins are not loaded.
 func TestChangeTypeWithoutSemiSync(t *testing.T) {
-	defer cluster.PanicHandler(t)
-	clusterInstance := utils.SetupReparentCluster(t, "none")
+	clusterInstance := utils.SetupReparentCluster(t, policy.DurabilityNone)
 	defer utils.TeardownCluster(clusterInstance)
 	tablets := clusterInstance.Keyspaces[0].Shards[0].Vttablets
 
@@ -161,8 +165,7 @@ func TestChangeTypeWithoutSemiSync(t *testing.T) {
 // TestERSWithWriteInPromoteReplica tests that ERS doesn't fail even if there is a
 // write that happens when PromoteReplica is called.
 func TestERSWithWriteInPromoteReplica(t *testing.T) {
-	defer cluster.PanicHandler(t)
-	clusterInstance := utils.SetupReparentCluster(t, "semi_sync")
+	clusterInstance := utils.SetupReparentCluster(t, policy.DurabilitySemiSync)
 	defer utils.TeardownCluster(clusterInstance)
 	tablets := clusterInstance.Keyspaces[0].Shards[0].Vttablets
 	utils.ConfirmReplication(t, tablets[0], []*cluster.Vttablet{tablets[1], tablets[2], tablets[3]})
@@ -176,4 +179,159 @@ func TestERSWithWriteInPromoteReplica(t *testing.T) {
 	}, tablets[3])
 	_, err := utils.Ers(clusterInstance, tablets[3], "60s", "30s")
 	require.NoError(t, err, "ERS should not fail even if there is a sidecardb change")
+}
+
+func TestBufferingWithMultipleDisruptions(t *testing.T) {
+	clusterInstance := utils.SetupShardedReparentCluster(t, policy.DurabilitySemiSync, nil)
+	defer utils.TeardownCluster(clusterInstance)
+
+	// Stop all VTOrc instances, so that they don't interfere with the test.
+	for _, vtorc := range clusterInstance.VTOrcProcesses {
+		err := vtorc.TearDown()
+		require.NoError(t, err)
+	}
+
+	// Start by reparenting all the shards to the first tablet.
+	keyspace := clusterInstance.Keyspaces[0]
+	shards := keyspace.Shards
+	for _, shard := range shards {
+		err := clusterInstance.VtctldClientProcess.PlannedReparentShard(keyspace.Name, shard.Name, shard.Vttablets[0].Alias)
+		require.NoError(t, err)
+	}
+
+	// We simulate start of external reparent or a PRS where the healthcheck update from the tablet gets lost in transit
+	// to vtgate by just setting the primary read only. This is also why we needed to shutdown all VTOrcs, so that they don't
+	// fix this.
+	utils.RunSQL(context.Background(), t, "set global read_only=1", shards[0].Vttablets[0])
+	utils.RunSQL(context.Background(), t, "set global read_only=1", shards[1].Vttablets[0])
+
+	wg := sync.WaitGroup{}
+	rowCount := 10
+	vtParams := clusterInstance.GetVTParams(keyspace.Name)
+	// We now spawn writes for a bunch of go routines.
+	// The ones going to shard 1 and shard 2 should block, since
+	// they're in the midst of a reparenting operation (as seen by the buffering code).
+	for i := 1; i <= rowCount; i++ {
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			conn, err := mysql.Connect(context.Background(), &vtParams)
+			if err != nil {
+				return
+			}
+			defer conn.Close()
+			_, err = conn.ExecuteFetch(utils.GetInsertQuery(i), 0, false)
+			require.NoError(t, err)
+		}(i)
+	}
+
+	// Now, run a PRS call on the last shard. This shouldn't unbuffer the queries that are buffered for shards 1 and 2
+	// since the disruption on the two shards hasn't stopped.
+	err := clusterInstance.VtctldClientProcess.PlannedReparentShard(keyspace.Name, shards[2].Name, shards[2].Vttablets[1].Alias)
+	require.NoError(t, err)
+	// We wait a second just to make sure the PRS changes are processed by the buffering logic in vtgate.
+	time.Sleep(1 * time.Second)
+	// Finally, we'll now make the 2 shards healthy again by running PRS.
+	err = clusterInstance.VtctldClientProcess.PlannedReparentShard(keyspace.Name, shards[0].Name, shards[0].Vttablets[1].Alias)
+	require.NoError(t, err)
+	err = clusterInstance.VtctldClientProcess.PlannedReparentShard(keyspace.Name, shards[1].Name, shards[1].Vttablets[1].Alias)
+	require.NoError(t, err)
+	// Wait for all the writes to have succeeded.
+	wg.Wait()
+}
+
+// TestSemiSyncBlockDueToDisruption tests that Vitess can recover from a situation
+// where a primary is stuck waiting for semi-sync ACKs due to a network issue,
+// even if no new writes from the user arrives.
+func TestSemiSyncBlockDueToDisruption(t *testing.T) {
+	// This is always set to "true" on GitHub Actions runners:
+	// https://docs.github.com/en/actions/learn-github-actions/variables#default-environment-variables
+	ci, ok := os.LookupEnv("CI")
+	if ok && strings.ToLower(ci) == "true" {
+		t.Skip("Test not meant to be run on CI")
+	}
+	clusterInstance := utils.SetupReparentCluster(t, policy.DurabilitySemiSync)
+	defer utils.TeardownCluster(clusterInstance)
+	tablets := clusterInstance.Keyspaces[0].Shards[0].Vttablets
+	utils.ConfirmReplication(t, tablets[0], []*cluster.Vttablet{tablets[1], tablets[2], tablets[3]})
+
+	// stop heartbeats on all the replicas
+	for idx, tablet := range tablets {
+		if idx == 0 {
+			continue
+		}
+		utils.RunSQLs(context.Background(), t, []string{
+			"stop slave;",
+			"change master to MASTER_HEARTBEAT_PERIOD = 0;",
+			"start slave;",
+		}, tablet)
+	}
+
+	// Take a backup of the pf.conf file
+	runCommandWithSudo(t, "cp", "/etc/pf.conf", "/etc/pf.conf.backup")
+	defer func() {
+		// Restore the file from backup
+		runCommandWithSudo(t, "mv", "/etc/pf.conf.backup", "/etc/pf.conf")
+		runCommandWithSudo(t, "pfctl", "-f", "/etc/pf.conf")
+	}()
+	// Disrupt the network between the primary and the replicas
+	runCommandWithSudo(t, "sh", "-c", fmt.Sprintf("echo 'block in proto tcp from any to any port %d' | sudo tee -a /etc/pf.conf > /dev/null", tablets[0].MySQLPort))
+
+	// This following command is only required if pfctl is not already enabled
+	//runCommandWithSudo(t, "pfctl", "-e")
+	runCommandWithSudo(t, "pfctl", "-f", "/etc/pf.conf")
+	rules := runCommandWithSudo(t, "pfctl", "-s", "rules")
+	log.Errorf("Rules enforced - %v", rules)
+
+	// Start a write that will be blocked by the primary waiting for semi-sync ACKs
+	ch := make(chan any)
+	go func() {
+		defer func() {
+			close(ch)
+		}()
+		utils.ConfirmReplication(t, tablets[0], []*cluster.Vttablet{tablets[1], tablets[2], tablets[3]})
+	}()
+
+	// Starting VTOrc later now, because we don't want it to fix the heartbeat interval
+	// on the replica's before the disruption has been introduced.
+	err := clusterInstance.StartVTOrc(clusterInstance.Keyspaces[0].Name)
+	require.NoError(t, err)
+	go func() {
+		for {
+			select {
+			case <-ch:
+				return
+			case <-time.After(1 * time.Second):
+				str, isPresent := tablets[0].VttabletProcess.GetVars()["SemiSyncMonitorWritesBlocked"]
+				if isPresent {
+					log.Errorf("SemiSyncMonitorWritesBlocked - %v", str)
+				}
+			}
+		}
+	}()
+	// If the network disruption is too long lived, then we will end up running ERS from VTOrc.
+	networkDisruptionDuration := 43 * time.Second
+	time.Sleep(networkDisruptionDuration)
+
+	// Restore the network
+	runCommandWithSudo(t, "cp", "/etc/pf.conf.backup", "/etc/pf.conf")
+	runCommandWithSudo(t, "pfctl", "-f", "/etc/pf.conf")
+
+	// We expect the problem to be resolved in less than 30 seconds.
+	select {
+	case <-time.After(30 * time.Second):
+		t.Errorf("Timed out waiting for semi-sync to be unblocked")
+	case <-ch:
+		log.Errorf("Woohoo, write finished!")
+	}
+}
+
+// runCommandWithSudo runs the provided command with sudo privileges
+// when the command is run, it prompts the user for the password, and it must be
+// entered for the program to resume.
+func runCommandWithSudo(t *testing.T, args ...string) string {
+	cmd := exec.Command("sudo", args...)
+	out, err := cmd.CombinedOutput()
+	assert.NoError(t, err, string(out))
+	return string(out)
 }

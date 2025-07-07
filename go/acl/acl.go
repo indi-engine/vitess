@@ -23,7 +23,7 @@ limitations under the License.
 // own policy as a package that calls RegisterPolicy(), and compile it into all
 // Vitess binaries that you use.
 //
-// By default (when no security_policy is specified), everyone is allowed to do
+// By default (when no security-policy is specified), everyone is allowed to do
 // anything.
 //
 // For convenience, there are two other built-in policies that also do NOT do
@@ -43,6 +43,7 @@ import (
 	"github.com/spf13/pflag"
 
 	"vitess.io/vitess/go/vt/log"
+	"vitess.io/vitess/go/vt/utils"
 )
 
 // This is a list of predefined roles. Applications are free
@@ -64,16 +65,13 @@ var (
 // Policy defines the interface that needs to be satisfied by
 // ACL policy implementors.
 type Policy interface {
-	// CheckAccessActor can be called to verify if an actor
-	// has access to the role.
-	CheckAccessActor(actor, role string) error
 	// CheckAccessHTTP can be called to verify if an actor in
 	// the http request has access to the role.
 	CheckAccessHTTP(req *http.Request, role string) error
 }
 
 func RegisterFlags(fs *pflag.FlagSet) {
-	fs.StringVar(&securityPolicy, "security_policy", securityPolicy, "the name of a registered security policy to use for controlling access to URLs - empty means allow all for anyone (built-in policies: deny-all, read-only)")
+	utils.SetFlagStringVar(fs, &securityPolicy, "security-policy", securityPolicy, "the name of a registered security policy to use for controlling access to URLs - empty means allow all for anyone (built-in policies: deny-all, read-only)")
 }
 
 // RegisterPolicy registers a security policy. This function must be called
@@ -97,18 +95,8 @@ func savePolicy() {
 		currentPolicy = policy
 		return
 	}
-	log.Warningf("security_policy %q not found; using fallback policy (deny-all)", securityPolicy)
+	log.Warningf("security-policy %q not found; using fallback policy (deny-all)", securityPolicy)
 	currentPolicy = denyAllPolicy{}
-}
-
-// CheckAccessActor uses the current security policy to
-// verify if an actor has access to the role.
-func CheckAccessActor(actor, role string) error {
-	once.Do(savePolicy)
-	if currentPolicy != nil {
-		return currentPolicy.CheckAccessActor(actor, role)
-	}
-	return nil
 }
 
 // CheckAccessHTTP uses the current security policy to

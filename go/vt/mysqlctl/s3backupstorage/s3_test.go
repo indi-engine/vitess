@@ -53,7 +53,7 @@ func (sfc *s3FakeClient) PutObject(ctx context.Context, in *s3.PutObjectInput, o
 		_ = apiOption(stack)
 	}
 
-	handler := middleware.DecorateHandler(smithyhttp.NewClientHandler(&fakeClientDo{delay: sfc.delay}), stack)
+	handler := middleware.DecorateHandler(smithyhttp.NewClientHandlerWithOptions(&fakeClientDo{delay: sfc.delay}), stack)
 	_, _, err := handler.Handle(ctx, in)
 	if err != nil {
 		return nil, err
@@ -327,4 +327,69 @@ func TestWithParams(t *testing.T) {
 	assert.Equal(t, http.DefaultTransport.(*http.Transport).MaxIdleConns, s3.transport.MaxIdleConns)
 	assert.NotNil(t, s3.transport.DialContext)
 	assert.NotNil(t, s3.transport.Proxy)
+}
+
+func TestCalculateUploadPartSize(t *testing.T) {
+	originalMinimum := minPartSize
+	defer func() { minPartSize = originalMinimum }()
+
+	tests := []struct {
+		name            string
+		filesize        int64
+		minimumPartSize int64
+		want            int64
+		err             error
+	}{
+		{
+			name:            "minimum - 10 MiB",
+			filesize:        1024 * 1024 * 10, // 10 MiB
+			minimumPartSize: 1024 * 1024 * 5,  // 5 MiB
+			want:            1024 * 1024 * 5,  // 5 MiB,
+			err:             nil,
+		},
+		{
+			name:            "below minimum - 10 MiB",
+			filesize:        1024 * 1024 * 10, // 10 MiB
+			minimumPartSize: 1024 * 1024 * 8,  // 8 MiB
+			want:            1024 * 1024 * 8,  // 8 MiB,
+			err:             nil,
+		},
+		{
+			name:            "above minimum - 1 TiB",
+			filesize:        1024 * 1024 * 1024 * 1024, // 1 TiB
+			minimumPartSize: 1024 * 1024 * 5,           // 5 MiB
+			want:            109951163,                 // ~104 MiB
+			err:             nil,
+		},
+		{
+			name:            "below minimum - 1 TiB",
+			filesize:        1024 * 1024 * 1024 * 1024, // 1 TiB
+			minimumPartSize: 1024 * 1024 * 200,         // 200 MiB
+			want:            1024 * 1024 * 200,         // 200 MiB
+			err:             nil,
+		},
+		{
+			name:            "below S3 limits - 5 MiB",
+			filesize:        1024 * 1024 * 3, // 3 MiB
+			minimumPartSize: 1024 * 1024 * 4, // 4 MiB
+			want:            1024 * 1024 * 5, // 5 MiB - should always return the minimum
+			err:             nil,
+		},
+		{
+			name:            "above S3 limits - 5 GiB",
+			filesize:        1024 * 1024 * 1024 * 1024, // 1 TiB
+			minimumPartSize: 1024 * 1024 * 1024 * 6,    // 6 GiB
+			want:            0,
+			err:             ErrPartSize,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			minPartSize = tt.minimumPartSize
+			partSize, err := calculateUploadPartSize(tt.filesize)
+			require.ErrorIs(t, err, tt.err)
+			require.Equal(t, tt.want, partSize)
+		})
+	}
 }

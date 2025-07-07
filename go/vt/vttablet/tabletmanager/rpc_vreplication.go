@@ -21,20 +21,31 @@ import (
 	"fmt"
 	"sort"
 	"strings"
+	"sync"
+	"time"
 
 	"golang.org/x/exp/maps"
+	"golang.org/x/sync/errgroup"
 	"google.golang.org/protobuf/encoding/prototext"
 
+	"vitess.io/vitess/go/cmd/vtctldclient/command/vreplication/movetables"
 	"vitess.io/vitess/go/constants/sidecar"
+	"vitess.io/vitess/go/mysql/sqlerror"
 	"vitess.io/vitess/go/protoutil"
+	"vitess.io/vitess/go/sqlescape"
 	"vitess.io/vitess/go/sqltypes"
 	"vitess.io/vitess/go/textutil"
 	"vitess.io/vitess/go/vt/discovery"
+	"vitess.io/vitess/go/vt/log"
+	"vitess.io/vitess/go/vt/logutil"
+	"vitess.io/vitess/go/vt/mysqlctl/tmutils"
 	"vitess.io/vitess/go/vt/proto/vttime"
 	"vitess.io/vitess/go/vt/sqlparser"
 	"vitess.io/vitess/go/vt/topo/topoproto"
 	"vitess.io/vitess/go/vt/vtctl/workflow"
 	"vitess.io/vitess/go/vt/vterrors"
+	"vitess.io/vitess/go/vt/vttablet/tabletmanager/vreplication"
+	"vitess.io/vitess/go/vt/vttablet/tabletserver/throttle/throttlerapp"
 
 	binlogdatapb "vitess.io/vitess/go/vt/proto/binlogdata"
 	querypb "vitess.io/vitess/go/vt/proto/query"
@@ -56,12 +67,38 @@ const (
 	// Retrieve the current configuration values for a workflow's vreplication stream(s).
 	sqlSelectVReplicationWorkflowConfig = "select id, source, cell, tablet_types, state, message from %s.vreplication where workflow = %a"
 	// Update the configuration values for a workflow's vreplication stream.
-	sqlUpdateVReplicationWorkflowStreamConfig = "update %s.vreplication set state = %a, source = %a, cell = %a, tablet_types = %a %s where id = %a"
+	sqlUpdateVReplicationWorkflowStreamConfig = "update %s.vreplication set state = %a, source = %a, cell = %a, tablet_types = %a, message = %a %s where id = %a"
 	// Update field values for multiple workflows. The final format specifier is
 	// used to optionally add any additional predicates to the query.
 	sqlUpdateVReplicationWorkflows = "update /*vt+ ALLOW_UNSAFE_VREPLICATION_WRITE */ %s.vreplication set%s where db_name = '%s'%s"
 	// Check if workflow is still copying.
 	sqlGetVReplicationCopyStatus = "select distinct vrepl_id from %s.copy_state where vrepl_id = %d"
+	// Validate the minimum set of permissions needed to manage vreplication metadata.
+	// This is a simple check for a matching user rather than any specific user@host
+	// combination. Also checks for wildcards. Note the, seemingly reverse check, `%a LIKE d.db`,
+	// which is required since %a replaces the actual sidecar db name and
+	// d.db is where a (potential) wildcard match is specified in a privilege grant.
+	sqlValidateVReplicationPermissions = `
+select count(*)>0 as good from mysql.user as u
+  left join mysql.db as d on (u.user = d.user)
+  left join mysql.tables_priv as t on (u.user = t.user)
+where u.user = %a
+  and (
+    (u.select_priv = 'y' and u.insert_priv = 'y' and u.update_priv = 'y' and u.delete_priv = 'y') /* user has global privs */
+    or (%a LIKE d.db escape '\\' and d.select_priv = 'y' and d.insert_priv = 'y' and d.update_priv = 'y' and d.delete_priv = 'y') /* user has db privs */
+    or (%a LIKE t.db escape '\\' and t.table_name = 'vreplication'
+      and find_in_set('select', t.table_priv)
+      and find_in_set('insert', t.table_priv)
+      and find_in_set('update', t.table_priv)
+      and find_in_set('delete', t.table_priv)
+    )
+  )
+limit 1
+
+`
+	sqlGetMaxSequenceVal   = "select max(%a) as maxval from %a.%a"
+	sqlInitSequenceTable   = "insert into %a.%a (id, next_id, cache) values (0, %d, 1000) on duplicate key update next_id = if(next_id < %d, %d, next_id)"
+	sqlCreateSequenceTable = "create table if not exists %a (id int, next_id bigint, cache bigint, primary key(id)) comment 'vitess_sequence'"
 )
 
 var (
@@ -117,6 +154,99 @@ func (tm *TabletManager) CreateVReplicationWorkflow(ctx context.Context, req *ta
 		res.RowsAffected += streamres.RowsAffected
 	}
 	return &tabletmanagerdatapb.CreateVReplicationWorkflowResponse{Result: sqltypes.ResultToProto3(res)}, nil
+}
+
+// DeleteTableData will delete data from the given tables (keys in the
+// req.Tabletfilters map) using the given filter or WHERE clauses (values
+// in the map). It will perform this work in batches of req.BatchSize
+// until all matching rows have been deleted in all tables, or the context
+// expires.
+func (tm *TabletManager) DeleteTableData(ctx context.Context, req *tabletmanagerdatapb.DeleteTableDataRequest) (*tabletmanagerdatapb.DeleteTableDataResponse, error) {
+	if req == nil {
+		return nil, vterrors.Errorf(vtrpcpb.Code_INVALID_ARGUMENT, "invalid nil request")
+	}
+
+	if len(req.TableFilters) == 0 { // Nothing to do
+		return &tabletmanagerdatapb.DeleteTableDataResponse{}, nil
+	}
+
+	// So that we do them in a predictable and uniform order.
+	tables := maps.Keys(req.TableFilters)
+	sort.Strings(tables)
+
+	batchSize := req.BatchSize
+	if batchSize < 1 {
+		batchSize = movetables.DefaultDeleteBatchSize
+	}
+	limit := &sqlparser.Limit{Rowcount: sqlparser.NewIntLiteral(fmt.Sprintf("%d", batchSize))}
+	// We will log some progress info every 100 delete batches.
+	progressRows := uint64(batchSize * 100)
+
+	throttledLogger := logutil.NewThrottledLogger("DeleteTableData", 1*time.Minute)
+	checkIfCanceled := func() error {
+		select {
+		case <-ctx.Done():
+			return vterrors.Wrap(ctx.Err(), "context expired while deleting data")
+		default:
+			return nil
+		}
+	}
+
+	for _, table := range tables {
+		stmt, err := tm.Env.Parser().Parse(fmt.Sprintf("delete from %s %s", table, req.TableFilters[table]))
+		if err != nil {
+			return nil, vterrors.Wrapf(err, "unable to build delete query for table %s", table)
+		}
+		del, ok := stmt.(*sqlparser.Delete)
+		if !ok {
+			return nil, vterrors.Wrapf(err, "unable to build delete query for table %s", table)
+		}
+		del.Limit = limit
+		query := sqlparser.String(del)
+		rowsDeleted := uint64(0)
+		// Delete all of the matching rows from the table, in batches, until we've
+		// deleted them all.
+		log.Infof("Starting deletion of data from table %s using query %q", table, query)
+		for {
+			// Back off if we're causing too much load on the database with these
+			// batch deletes.
+			if _, ok := tm.VREngine.ThrottlerClient().ThrottleCheckOKOrWaitAppName(ctx, throttlerapp.VReplicationName); !ok {
+				throttledLogger.Infof("throttling bulk data delete for table %s using query %q",
+					table, query)
+				if err := checkIfCanceled(); err != nil {
+					return nil, err
+				}
+				continue
+			}
+			res, err := tm.ExecuteFetchAsAllPrivs(ctx,
+				&tabletmanagerdatapb.ExecuteFetchAsAllPrivsRequest{
+					Query:  []byte(query),
+					DbName: tm.DBConfigs.DBName,
+				})
+			if err != nil {
+				return nil, vterrors.Errorf(vtrpcpb.Code_INTERNAL, "error deleting data using query %q: %v",
+					query, err)
+			}
+			rowsDeleted += res.RowsAffected
+			// Log some progress info periodically to give the operator some idea of
+			// how much work we've done, how much is left, and how long it may take
+			// (considering throttling, system performance, etc).
+			if rowsDeleted%progressRows == 0 {
+				log.Infof("Successfully deleted %d rows of data from table %s so far, using query %q",
+					rowsDeleted, table, query)
+			}
+			if res.RowsAffected == 0 { // We're done with this table
+				break
+			}
+			if err := checkIfCanceled(); err != nil {
+				return nil, err
+			}
+		}
+		log.Infof("Completed deletion of data (%d rows) from table %s using query %q",
+			rowsDeleted, table, query)
+	}
+
+	return &tabletmanagerdatapb.DeleteTableDataResponse{}, nil
 }
 
 func (tm *TabletManager) DeleteVReplicationWorkflow(ctx context.Context, req *tabletmanagerdatapb.DeleteVReplicationWorkflowRequest) (*tabletmanagerdatapb.DeleteVReplicationWorkflowResponse, error) {
@@ -450,6 +580,9 @@ func (tm *TabletManager) UpdateVReplicationWorkflow(ctx context.Context, req *ta
 		if !textutil.ValueIsSimulatedNull(req.TabletTypes) {
 			tabletTypes = req.TabletTypes
 		}
+		if req.Message != nil {
+			message = *req.Message
+		}
 		tabletTypesStr := topoproto.MakeStringTypeCSV(tabletTypes)
 		if req.TabletSelectionPreference != nil &&
 			((inorder && *req.TabletSelectionPreference == tabletmanagerdatapb.TabletSelectionPreference_UNKNOWN) ||
@@ -464,6 +597,7 @@ func (tm *TabletManager) UpdateVReplicationWorkflow(ctx context.Context, req *ta
 		if req.OnDdl != nil && *req.OnDdl != binlogdatapb.OnDDLAction(textutil.SimulatedNullInt) {
 			bls.OnDdl = *req.OnDdl
 		}
+		bls.Filter.Rules = append(bls.Filter.Rules, req.FilterRules...)
 		source, err = prototext.Marshal(bls)
 		if err != nil {
 			return nil, err
@@ -491,9 +625,10 @@ func (tm *TabletManager) UpdateVReplicationWorkflow(ctx context.Context, req *ta
 			"sc": sqltypes.StringBindVariable(string(source)),
 			"cl": sqltypes.StringBindVariable(strings.Join(cells, ",")),
 			"tt": sqltypes.StringBindVariable(tabletTypesStr),
+			"ms": sqltypes.StringBindVariable(message),
 			"id": sqltypes.Int64BindVariable(id),
 		}
-		parsed = sqlparser.BuildParsedQuery(sqlUpdateVReplicationWorkflowStreamConfig, sidecar.GetIdentifier(), ":st", ":sc", ":cl", ":tt", options, ":id")
+		parsed = sqlparser.BuildParsedQuery(sqlUpdateVReplicationWorkflowStreamConfig, sidecar.GetIdentifier(), ":st", ":sc", ":cl", ":tt", ":ms", options, ":id")
 		stmt, err = parsed.GenerateQuery(bindVars, nil)
 		if err != nil {
 			return nil, err
@@ -577,6 +712,174 @@ func (tm *TabletManager) UpdateVReplicationWorkflows(ctx context.Context, req *t
 		Result: &querypb.QueryResult{
 			RowsAffected: res.RowsAffected,
 		},
+	}, nil
+}
+
+func (tm *TabletManager) GetMaxValueForSequences(ctx context.Context, req *tabletmanagerdatapb.GetMaxValueForSequencesRequest) (*tabletmanagerdatapb.GetMaxValueForSequencesResponse, error) {
+	maxValues := make(map[string]int64, len(req.Sequences))
+	mu := sync.Mutex{}
+	initGroup, gctx := errgroup.WithContext(ctx)
+	for _, sm := range req.Sequences {
+		initGroup.Go(func() error {
+			maxId, err := tm.getMaxSequenceValue(gctx, sm)
+			if err != nil {
+				return err
+			}
+			mu.Lock()
+			defer mu.Unlock()
+			maxValues[sm.BackingTableName] = maxId
+			return nil
+		})
+	}
+	errs := initGroup.Wait()
+	if errs != nil {
+		return nil, errs
+	}
+	return &tabletmanagerdatapb.GetMaxValueForSequencesResponse{
+		MaxValuesBySequenceTable: maxValues,
+	}, nil
+}
+
+func (tm *TabletManager) getMaxSequenceValue(ctx context.Context, sm *tabletmanagerdatapb.GetMaxValueForSequencesRequest_SequenceMetadata) (int64, error) {
+	query := sqlparser.BuildParsedQuery(sqlGetMaxSequenceVal,
+		sm.UsingColEscaped,
+		sm.UsingTableDbNameEscaped,
+		sm.UsingTableNameEscaped,
+	)
+	qr, err := tm.ExecuteFetchAsApp(ctx, &tabletmanagerdatapb.ExecuteFetchAsAppRequest{
+		Query:   []byte(query.Query),
+		MaxRows: 1,
+	})
+	if err != nil || len(qr.Rows) != 1 {
+		return 0, vterrors.Errorf(vtrpcpb.Code_INTERNAL,
+			"failed to get the max used sequence value for target table %s in order to initialize the backing sequence table: %v", sm.UsingTableNameEscaped, err)
+	}
+	rawVal := sqltypes.Proto3ToResult(qr).Rows[0][0]
+	maxID := int64(0)
+	if !rawVal.IsNull() { // If it's NULL then there are no rows and 0 remains the max
+		maxID, err = rawVal.ToInt64()
+		if err != nil {
+			return 0, vterrors.Errorf(vtrpcpb.Code_INTERNAL, "failed to get the max used sequence value for target table %s in order to initialize the backing sequence table: %v", sm.UsingTableNameEscaped, err)
+		}
+	}
+	return maxID, nil
+}
+
+func (tm *TabletManager) UpdateSequenceTables(ctx context.Context, req *tabletmanagerdatapb.UpdateSequenceTablesRequest) (*tabletmanagerdatapb.UpdateSequenceTablesResponse, error) {
+	for _, sm := range req.Sequences {
+		if err := tm.updateSequenceValue(ctx, sm); err != nil {
+			return nil, err
+		}
+	}
+	return &tabletmanagerdatapb.UpdateSequenceTablesResponse{}, nil
+}
+
+func (tm *TabletManager) updateSequenceValue(ctx context.Context, seq *tabletmanagerdatapb.UpdateSequenceTablesRequest_SequenceMetadata) error {
+	nextVal := seq.MaxValue + 1
+	if tm.Tablet().DbNameOverride != "" {
+		seq.BackingTableDbName = tm.Tablet().DbNameOverride
+	}
+	backingTableNameEscaped, err := sqlescape.EnsureEscaped(seq.BackingTableName)
+	if err != nil {
+		return vterrors.Errorf(vtrpcpb.Code_INVALID_ARGUMENT, "invalid table name %s specified for sequence backing table: %v",
+			seq.BackingTableName, err)
+	}
+	log.Infof("Updating sequence %s.%s to %d", seq.BackingTableDbName, seq.BackingTableName, nextVal)
+	initQuery := sqlparser.BuildParsedQuery(sqlInitSequenceTable,
+		seq.BackingTableDbName,
+		seq.BackingTableName,
+		nextVal,
+		nextVal,
+		nextVal,
+	)
+	const maxTries = 2
+
+	for i := 0; i < maxTries; i++ {
+		// Attempt to initialize the sequence.
+		_, err = tm.ExecuteFetchAsApp(ctx, &tabletmanagerdatapb.ExecuteFetchAsAppRequest{
+			Query:   []byte(initQuery.Query),
+			MaxRows: 1,
+		})
+		if err == nil {
+			return nil
+		}
+
+		// If the table doesn't exist, try creating it.
+		sqlErr, ok := sqlerror.NewSQLErrorFromError(err).(*sqlerror.SQLError)
+		if !ok || (sqlErr.Num != sqlerror.ERNoSuchTable && sqlErr.Num != sqlerror.ERBadTable) {
+			return vterrors.Errorf(
+				vtrpcpb.Code_INTERNAL,
+				"failed to initialize the backing sequence table %s.%s: %v",
+				seq.BackingTableDbName, seq.BackingTableName, err,
+			)
+		}
+
+		if err := tm.createSequenceTable(ctx, backingTableNameEscaped); err != nil {
+			return vterrors.Errorf(vtrpcpb.Code_INTERNAL,
+				"failed to create the backing sequence table %s in the global-keyspace %s: %v",
+				backingTableNameEscaped, tm.Tablet().Keyspace, err)
+		}
+		// Table has been created, so we fall through and try again on the next loop iteration.
+	}
+
+	return vterrors.Errorf(
+		vtrpcpb.Code_INTERNAL, "failed to initialize the backing sequence table %s.%s after retries. Last error: %v",
+		seq.BackingTableDbName, backingTableNameEscaped, err)
+}
+
+func (tm *TabletManager) createSequenceTable(ctx context.Context, escapedTableName string) error {
+	stmt := sqlparser.BuildParsedQuery(sqlCreateSequenceTable, escapedTableName)
+	_, err := tm.ApplySchema(ctx, &tmutils.SchemaChange{
+		SQL:                     stmt.Query,
+		Force:                   false,
+		AllowReplication:        true,
+		SQLMode:                 vreplication.SQLMode,
+		DisableForeignKeyChecks: true,
+	})
+	return err
+}
+
+// ValidateVReplicationPermissions validates that the --db_filtered_user has
+// the minimum permissions required on the sidecardb vreplication table
+// needed in order to manage vreplication metadata.
+func (tm *TabletManager) ValidateVReplicationPermissions(ctx context.Context, req *tabletmanagerdatapb.ValidateVReplicationPermissionsRequest) (*tabletmanagerdatapb.ValidateVReplicationPermissionsResponse, error) {
+	query, err := sqlparser.ParseAndBind(sqlValidateVReplicationPermissions,
+		sqltypes.StringBindVariable(tm.DBConfigs.Filtered.User),
+		sqltypes.StringBindVariable(sidecar.GetName()),
+		sqltypes.StringBindVariable(sidecar.GetName()),
+	)
+	if err != nil {
+		return nil, err
+	}
+	log.Infof("Validating VReplication permissions on %s using query %s", tm.tabletAlias, query)
+	conn, err := tm.MysqlDaemon.GetAllPrivsConnection(ctx)
+	if err != nil {
+		return nil, err
+	}
+	defer conn.Close()
+	qr, err := conn.ExecuteFetch(query, 1, false)
+	if err != nil {
+		return nil, err
+	}
+	if len(qr.Rows) != 1 { // Should never happen
+		return nil, vterrors.Errorf(vtrpcpb.Code_INTERNAL, "unexpected response to query %s: expected 1 row with 1 column, got: %+v",
+			query, qr)
+	}
+	val, err := qr.Rows[0][0].ToBool()
+	if err != nil { // Should never happen
+		return nil, vterrors.Errorf(vtrpcpb.Code_INTERNAL, "unexpected result for query %s: expected boolean-like value, got: %q",
+			query, qr.Rows[0][0].ToString())
+	}
+	var errorString string
+	if !val {
+		errorString = fmt.Sprintf("user %s does not have the required set of permissions (select,insert,update,delete) on the %s.vreplication table on tablet %s",
+			tm.DBConfigs.Filtered.User, sidecar.GetName(), topoproto.TabletAliasString(tm.tabletAlias))
+		log.Errorf("validateVReplicationPermissions returning error: %s. Permission query run was %s", errorString, query)
+	}
+	return &tabletmanagerdatapb.ValidateVReplicationPermissionsResponse{
+		User:  tm.DBConfigs.Filtered.User,
+		Ok:    val,
+		Error: errorString,
 	}, nil
 }
 

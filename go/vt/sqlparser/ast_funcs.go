@@ -517,6 +517,70 @@ func (node *ComparisonExpr) IsImpossible() bool {
 	return false
 }
 
+func (op ComparisonExprOperator) Inverse() ComparisonExprOperator {
+	switch op {
+	case EqualOp:
+		return NotEqualOp
+	case LessThanOp:
+		return GreaterEqualOp
+	case GreaterThanOp:
+		return LessEqualOp
+	case LessEqualOp:
+		return GreaterThanOp
+	case GreaterEqualOp:
+		return LessThanOp
+	case NotEqualOp:
+		return EqualOp
+	case NullSafeEqualOp:
+		return NotEqualOp
+	case InOp:
+		return NotInOp
+	case NotInOp:
+		return InOp
+	case LikeOp:
+		return NotLikeOp
+	case NotLikeOp:
+		return LikeOp
+	case RegexpOp:
+		return NotRegexpOp
+	case NotRegexpOp:
+		return RegexpOp
+	}
+	panic("unreachable")
+}
+
+// SwitchSides returns the reversed comparison operator if applicable, along with a boolean indicating success.
+// For symmetric operators like '=', '!=', and '<=>', it returns the same operator and true.
+// For directional comparison operators ('<', '>', '<=', '>='), it returns the opposite operator and true.
+// For operators that imply directionality or cannot be logically reversed (such as 'IN', 'LIKE', 'REGEXP'),
+// it returns the original operator and false, indicating that switching sides is not valid.
+func (op ComparisonExprOperator) SwitchSides() (ComparisonExprOperator, bool) {
+	switch op {
+	case EqualOp, NotEqualOp, NullSafeEqualOp:
+		// These operators are symmetric, so switching sides has no effect
+		return op, true
+	case LessThanOp:
+		return GreaterThanOp, true
+	case GreaterThanOp:
+		return LessThanOp, true
+	case LessEqualOp:
+		return GreaterEqualOp, true
+	case GreaterEqualOp:
+		return LessEqualOp, true
+	default:
+		return op, false
+	}
+}
+
+func (op ComparisonExprOperator) IsCommutative() bool {
+	switch op {
+	case EqualOp, NotEqualOp, NullSafeEqualOp:
+		return true
+	default:
+		return false
+	}
+}
+
 // NewStrLiteral builds a new StrVal.
 func NewStrLiteral(in string) *Literal {
 	return &Literal{Type: StrVal, Val: in}
@@ -574,6 +638,26 @@ func NewArgument(in string) *Argument {
 func parseBindVariable(yylex yyLexer, bvar string) *Argument {
 	markBindVariable(yylex, bvar)
 	return NewArgument(bvar)
+}
+
+func setIntoIfPossible(lexer yyLexer, tblSubquery TableStatement, into *SelectInto) {
+	selStmt, ok := tblSubquery.(SelectStatement)
+	if !ok {
+		lexer.Error("VALUES does not support INTO")
+		return
+	}
+
+	selStmt.SetInto(into)
+}
+
+func setLockIfPossible(lexer yyLexer, tblSubquery TableStatement, lock Lock) {
+	selStmt, ok := tblSubquery.(SelectStatement)
+	if !ok {
+		lexer.Error("VALUES does not support LOCK")
+		return
+	}
+
+	selStmt.SetLock(lock)
 }
 
 func NewTypedArgument(in string, t sqltypes.Type) *Argument {
@@ -691,12 +775,12 @@ func NewTableNameWithQualifier(name, qualifier string) TableName {
 }
 
 // NewSubquery makes a new Subquery
-func NewSubquery(selectStatement SelectStatement) *Subquery {
+func NewSubquery(selectStatement TableStatement) *Subquery {
 	return &Subquery{Select: selectStatement}
 }
 
 // NewDerivedTable makes a new DerivedTable
-func NewDerivedTable(lateral bool, selectStatement SelectStatement) *DerivedTable {
+func NewDerivedTable(lateral bool, selectStatement TableStatement) *DerivedTable {
 	return &DerivedTable{
 		Lateral: lateral,
 		Select:  selectStatement,
@@ -806,7 +890,7 @@ func NewLimitWithoutOffset(rowCount int) *Limit {
 // NewSelect is used to create a select statement
 func NewSelect(
 	comments Comments,
-	exprs SelectExprs,
+	exprs *SelectExprs,
 	selectOptions []string,
 	into *SelectInto,
 	from TableExprs,
@@ -1111,8 +1195,25 @@ func compliantName(in string) string {
 	return buf.String()
 }
 
-func (node *Select) AddSelectExprs(selectExprs SelectExprs) {
-	node.SelectExprs = append(node.SelectExprs, selectExprs...)
+func (node *Select) AddSelectExprs(selectExprs *SelectExprs) {
+	if node.SelectExprs == nil {
+		node.SelectExprs = &SelectExprs{}
+	}
+	node.SelectExprs.Exprs = append(node.SelectExprs.Exprs, selectExprs.Exprs...)
+}
+
+func (node *Select) AddSelectExpr(expr SelectExpr) {
+	if node.SelectExprs == nil {
+		node.SelectExprs = &SelectExprs{}
+	}
+	node.SelectExprs.Exprs = append(node.SelectExprs.Exprs, expr)
+}
+
+func (node *Select) SetSelectExprs(exprs ...SelectExpr) {
+	if node.SelectExprs == nil {
+		node.SelectExprs = &SelectExprs{}
+	}
+	node.SelectExprs.Exprs = exprs
 }
 
 // AddOrder adds an order by element
@@ -1172,12 +1273,18 @@ func (node *Select) IsDistinct() bool {
 
 // GetColumnCount return SelectExprs count.
 func (node *Select) GetColumnCount() int {
-	return len(node.SelectExprs)
+	if node.SelectExprs == nil {
+		return 0
+	}
+	return len(node.SelectExprs.Exprs)
 }
 
 // GetColumns gets the columns
-func (node *Select) GetColumns() SelectExprs {
-	return node.SelectExprs
+func (node *Select) GetColumns() []SelectExpr {
+	if node.SelectExprs == nil {
+		return nil
+	}
+	return node.SelectExprs.Exprs
 }
 
 // SetComments implements the Commented interface
@@ -1278,7 +1385,7 @@ func (node *Union) GetLimit() *Limit {
 }
 
 // GetColumns gets the columns
-func (node *Union) GetColumns() SelectExprs {
+func (node *Union) GetColumns() []SelectExpr {
 	return node.Left.GetColumns()
 }
 
@@ -1327,7 +1434,7 @@ func (node *Union) GetParsedComments() *ParsedComments {
 	return node.Left.GetParsedComments()
 }
 
-func requiresParen(stmt SelectStatement) bool {
+func requiresParen(stmt TableStatement) bool {
 	switch node := stmt.(type) {
 	case *Union:
 		return len(node.OrderBy) != 0 || node.Lock != 0 || node.Into != nil || node.Limit != nil
@@ -1336,10 +1443,6 @@ func requiresParen(stmt SelectStatement) bool {
 	}
 
 	return false
-}
-
-func setLockInSelect(stmt SelectStatement, lock Lock) {
-	stmt.SetLock(lock)
 }
 
 // ToString returns the string associated with the DDLAction Enum
@@ -1355,6 +1458,8 @@ func (action DDLAction) ToString() string {
 		return RenameStr
 	case TruncateDDLAction:
 		return TruncateStr
+	case CreateProcedureAction:
+		return CreateProcStr
 	case CreateVindexDDLAction:
 		return CreateVindexStr
 	case DropVindexDDLAction:
@@ -1377,6 +1482,66 @@ func (action DDLAction) ToString() string {
 		return DropAutoIncStr
 	default:
 		return "Unknown DDL Action"
+	}
+}
+
+// ToString returns the string associated with the ProcParameterMode Enum
+func (action ProcParameterMode) ToString() string {
+	switch action {
+	case InMode:
+		return InStr
+	case OutMode:
+		return OutStr
+	case InoutMode:
+		return InoutStr
+	default:
+		return "Unknown Proc Parameter Mode"
+	}
+}
+
+// ToString returns the type as a string
+func (scn SignalConditionName) ToString() string {
+	switch scn {
+	case ClassOriginType:
+		return ClassOriginTypeStr
+	case SubclassOriginType:
+		return SubclassOriginTypeStr
+	case MessageTextType:
+		return MessageTextTypeStr
+	case MySQLErrNoType:
+		return MySQLErrNoTypeStr
+	case ConstraintCatalogType:
+		return ConstraintCatalogTypeStr
+	case ConstraintSchemaType:
+		return ConstraintSchemaTypeStr
+	case ConstraintNameType:
+		return ConstraintNameTypeStr
+	case CatalogNameType:
+		return CatalogNameTypeStr
+	case SchemaNameType:
+		return SchemaNameTypeStr
+	case TableNameType:
+		return TableNameTypeStr
+	case ColumnNameType:
+		return ColumnNameTypeStr
+	case CursorNameType:
+		return CursorNameTypeStr
+	default:
+		return "Unknown SignalConditionName"
+	}
+}
+
+// ToString returns the string associated with the HandlerAction Enum
+func (ha HandlerAction) ToString() string {
+	switch ha {
+	case ContinueAction:
+		return ContinueStr
+	case ExitAction:
+		return ExitStr
+	case UndoAction:
+		return UndoStr
+	default:
+		return "Unknown Handler Action"
 	}
 }
 
@@ -1498,6 +1663,65 @@ func (op ComparisonExprOperator) ToString() string {
 	}
 }
 
+func ComparisonExprOperatorFromJson(s string) (ComparisonExprOperator, error) {
+	switch s {
+	case EqualStr:
+		return EqualOp, nil
+	case JsonLessThanStr:
+		return LessThanOp, nil
+	case JsonGreaterThanStr:
+		return GreaterThanOp, nil
+	case JsonLessThanOrEqualStr:
+		return LessEqualOp, nil
+	case JsonGreaterThanOrEqualStr:
+		return GreaterEqualOp, nil
+	case NotEqualStr:
+		return NotEqualOp, nil
+	case NullSafeEqualStr:
+		return NullSafeEqualOp, nil
+	case InStr:
+		return InOp, nil
+	case NotInStr:
+		return NotInOp, nil
+	case LikeStr:
+		return LikeOp, nil
+	case NotLikeStr:
+		return NotLikeOp, nil
+	case RegexpStr:
+		return RegexpOp, nil
+	case NotRegexpStr:
+		return NotRegexpOp, nil
+	default:
+		return 0, fmt.Errorf("unknown ComparisonExpOperator: %s", s)
+	}
+}
+
+const (
+	JsonGreaterThanStr        = "gt"
+	JsonLessThanStr           = "lt"
+	JsonGreaterThanOrEqualStr = "ge"
+	JsonLessThanOrEqualStr    = "le"
+)
+
+// JSONString returns a string representation for this operator that does not need escaping in JSON
+func (op ComparisonExprOperator) JSONString() string {
+	switch op {
+	case EqualOp, NotEqualOp, NullSafeEqualOp, InOp, NotInOp, LikeOp, NotLikeOp, RegexpOp, NotRegexpOp:
+		// These operators are safe for JSON output, so we delegate to ToString
+		return op.ToString()
+	case LessThanOp:
+		return JsonLessThanStr
+	case GreaterThanOp:
+		return JsonGreaterThanStr
+	case LessEqualOp:
+		return JsonLessThanOrEqualStr
+	case GreaterEqualOp:
+		return JsonGreaterThanOrEqualStr
+	default:
+		panic("unreachable")
+	}
+}
+
 // ToString returns the operator as a string
 func (op IsExprOperator) ToString() string {
 	switch op {
@@ -1543,10 +1767,6 @@ func (op BinaryExprOperator) ToString() string {
 		return ShiftLeftStr
 	case ShiftRightOp:
 		return ShiftRightStr
-	case JSONExtractOp:
-		return JSONExtractOpStr
-	case JSONUnquoteExtractOp:
-		return JSONUnquoteExtractOpStr
 	default:
 		return "Unknown BinaryExprOperator"
 	}
@@ -1925,6 +2145,8 @@ func (ty VExplainType) ToString() string {
 		return AllVExplainStr
 	case TraceVExplainType:
 		return TraceStr
+	case KeysVExplainType:
+		return KeysStr
 	default:
 		return "Unknown VExplainType"
 	}
@@ -2124,6 +2346,8 @@ func (columnFormat ColumnFormat) ToString() string {
 		return keywordStrings[DYNAMIC]
 	case DefaultFormat:
 		return keywordStrings[DEFAULT]
+	case CompressedFormat:
+		return keywordStrings[COMPRESSED]
 	default:
 		return "Unknown column format type"
 	}
@@ -2215,7 +2439,7 @@ func ContainsAggregation(e SQLNode) bool {
 }
 
 // setFuncArgs sets the arguments for the aggregation function, while checking that there is only one argument
-func setFuncArgs(aggr AggrFunc, exprs Exprs, name string) error {
+func setFuncArgs(aggr AggrFunc, exprs []Expr, name string) error {
 	if len(exprs) != 1 {
 		return vterrors.VT03001(name)
 	}
@@ -2224,26 +2448,30 @@ func setFuncArgs(aggr AggrFunc, exprs Exprs, name string) error {
 }
 
 // GetFirstSelect gets the first select statement
-func GetFirstSelect(selStmt SelectStatement) *Select {
+func GetFirstSelect(selStmt TableStatement) (*Select, error) {
 	if selStmt == nil {
-		return nil
+		return nil, nil
 	}
 	switch node := selStmt.(type) {
 	case *Select:
-		return node
+		return node, nil
+	case *ValuesStatement:
+		return nil, vterrors.VT12001("first table_reference as VALUES")
 	case *Union:
 		return GetFirstSelect(node.Left)
 	}
-	panic("[BUG]: unknown type for SelectStatement")
+	return nil, vterrors.VT13001(fmt.Sprintf("unknown type for SelectStatement: %T", selStmt))
 }
 
 // GetAllSelects gets all the select statement s
-func GetAllSelects(selStmt SelectStatement) []*Select {
+func GetAllSelects(selStmt TableStatement) []TableStatement {
 	switch node := selStmt.(type) {
 	case *Select:
-		return []*Select{node}
+		return []TableStatement{node}
 	case *Union:
 		return append(GetAllSelects(node.Left), GetAllSelects(node.Right)...)
+	case *ValuesStatement:
+		return []TableStatement{node}
 	}
 	panic("[BUG]: unknown type for SelectStatement")
 }
@@ -2267,8 +2495,8 @@ func (ae *AliasedExpr) ColumnName() string {
 }
 
 // AllAggregation returns true if all the expressions contain aggregation
-func (s SelectExprs) AllAggregation() bool {
-	for _, k := range s {
+func (s *SelectExprs) AllAggregation() bool {
+	for _, k := range s.Exprs {
 		if !ContainsAggregation(k) {
 			return false
 		}
@@ -2288,35 +2516,61 @@ func RemoveKeyspaceInCol(in SQLNode) {
 	}, in)
 }
 
-// RemoveKeyspaceInTables removes the Qualifier on all TableNames in the AST
-func RemoveKeyspaceInTables(in SQLNode) {
-	// Walk will only return an error if we return an error from the inner func. safe to ignore here
-	Rewrite(in, nil, func(cursor *Cursor) bool {
-		if tbl, ok := cursor.Node().(TableName); ok && tbl.Qualifier.NotEmpty() {
-			tbl.Qualifier = NewIdentifierCS("")
-			cursor.Replace(tbl)
-		}
-
-		return true
+// RemoveKeyspace removes the keyspace qualifier from all ColName and TableName
+func RemoveKeyspace(in SQLNode) {
+	removeKeyspace(in, func(_ string) bool {
+		return true // Always remove
 	})
 }
 
-// RemoveKeyspace removes the Qualifier.Qualifier on all ColNames and Qualifier on all TableNames in the AST
-func RemoveKeyspace(in SQLNode) {
+// RemoveSpecificKeyspace removes the keyspace qualifier from all ColName and TableName
+// when it matches the keyspace provided
+func RemoveSpecificKeyspace(in SQLNode, keyspace string) {
+	removeKeyspace(in, func(qualifier string) bool {
+		return qualifier == keyspace // Remove only if it matches the provided keyspace
+	})
+}
+
+// RemoveKeyspaceIgnoreSysSchema removes the keyspace qualifier from all ColName and TableName
+// except for the system schema qualifier.
+func RemoveKeyspaceIgnoreSysSchema(in SQLNode) {
+	removeKeyspace(in, func(qualifier string) bool {
+		return qualifier != "" && !SystemSchema(qualifier) // Remove if it's not empty and not a system schema
+	})
+}
+
+func removeKeyspace(in SQLNode, shouldRemove func(qualifier string) bool) {
 	Rewrite(in, nil, func(cursor *Cursor) bool {
 		switch expr := cursor.Node().(type) {
 		case *ColName:
-			if expr.Qualifier.Qualifier.NotEmpty() {
+			if shouldRemove(expr.Qualifier.Qualifier.String()) {
 				expr.Qualifier.Qualifier = NewIdentifierCS("")
 			}
 		case TableName:
-			if expr.Qualifier.NotEmpty() {
+			if shouldRemove(expr.Qualifier.String()) {
 				expr.Qualifier = NewIdentifierCS("")
 				cursor.Replace(expr)
 			}
 		}
 		return true
 	})
+}
+
+// AddKeyspace adds the keyspace qualifier to TableName if it's not already present
+func AddKeyspace(in SQLNode, ks string) {
+	Rewrite(in, func(cursor *Cursor) bool {
+		switch expr := cursor.Node().(type) {
+		case *ColName:
+			// ignore it
+			return false
+		case TableName:
+			if expr.Qualifier.IsEmpty() {
+				expr.Qualifier = NewIdentifierCS(ks)
+				cursor.Replace(expr)
+			}
+		}
+		return true
+	}, nil)
 }
 
 func convertStringToInt(integer string) int {
@@ -2632,7 +2886,7 @@ func MakeColumns(colNames ...string) Columns {
 	return cols
 }
 
-func VisitAllSelects(in SelectStatement, f func(p *Select, idx int) error) error {
+func VisitAllSelects(in TableStatement, f func(p *Select, idx int) error) error {
 	v := visitor{}
 	return v.visitAllSelects(in, f)
 }
@@ -2641,7 +2895,7 @@ type visitor struct {
 	idx int
 }
 
-func (v *visitor) visitAllSelects(in SelectStatement, f func(p *Select, idx int) error) error {
+func (v *visitor) visitAllSelects(in TableStatement, f func(p *Select, idx int) error) error {
 	switch sel := in.(type) {
 	case *Select:
 		err := f(sel, v.idx)
@@ -2733,6 +2987,30 @@ func (node *Update) AddOrder(order *Order) {
 
 func (node *Update) SetLimit(limit *Limit) {
 	node.Limit = limit
+}
+
+func (node *Update) GetOrderBy() OrderBy {
+	return node.OrderBy
+}
+
+func (node *Update) SetOrderBy(by OrderBy) {
+	node.OrderBy = by
+}
+
+func (node *Update) GetLimit() *Limit {
+	return node.Limit
+}
+
+func (node *Delete) GetOrderBy() OrderBy {
+	return node.OrderBy
+}
+
+func (node *Delete) SetOrderBy(by OrderBy) {
+	node.OrderBy = by
+}
+
+func (node *Delete) GetLimit() *Limit {
+	return node.Limit
 }
 
 func (node *Delete) AddOrder(order *Order) {
@@ -2840,4 +3118,64 @@ func ExtractAllTables(stmt Statement) []string {
 		return true, nil
 	}, stmt)
 	return tables
+}
+
+var _ TableStatement = (*ValuesStatement)(nil)
+
+func (node *ValuesStatement) iTableStatement() {}
+
+func (node *ValuesStatement) SetWith(with *With) {
+	node.With = with
+}
+
+func (node *ValuesStatement) GetOrderBy() OrderBy {
+	return node.Order
+}
+
+func (node *ValuesStatement) SetOrderBy(by OrderBy) {
+	node.Order = by
+}
+
+func (node *ValuesStatement) GetLimit() *Limit {
+	return node.Limit
+}
+
+func (node *ValuesStatement) AddOrder(order *Order) {
+	node.Order = append(node.Order, order)
+}
+
+func (node *ValuesStatement) SetLimit(limit *Limit) {
+	node.Limit = limit
+}
+
+func (node *ValuesStatement) GetColumnCount() int {
+	if len(node.Rows) > 0 {
+		return len(node.Rows[0])
+	}
+	panic("no columns available") // TODO: we need a better solution than a panic
+}
+
+func (node *ValuesStatement) GetColumns() []SelectExpr {
+	var sel []SelectExpr
+	columnCount := node.GetColumnCount()
+	for i := range columnCount {
+		sel = append(sel, &AliasedExpr{Expr: NewColName(fmt.Sprintf("column_%d", i))})
+	}
+	_ = sel
+	panic("no columns available") // TODO: we need a better solution than a panic
+}
+
+func (node *ValuesStatement) SetComments(comments Comments) {}
+
+func (node *ValuesStatement) GetParsedComments() *ParsedComments { return nil }
+
+func NewFuncExpr(name string, exprs ...Expr) *FuncExpr {
+	return &FuncExpr{
+		Name:  NewIdentifierCI(name),
+		Exprs: exprs,
+	}
+}
+
+func NewExprs(exprs ...Expr) *Exprs {
+	return &Exprs{Exprs: exprs}
 }

@@ -3,20 +3,18 @@ This page lists all active maintainers and their areas of expertise. This can be
 The following is the full list, alphabetically ordered.
 
 * Andres Taylor ([systay](https://github.com/systay)) andres@planetscale.com
-* Andrew Mason ([amason](https://github.com/ajm188)) amason@hey.com
 * Arthur Schreiber ([arthurschreiber](https://github.com/arthurschreiber)) arthurschreiber@github.com
 * Deepthi Sigireddi ([deepthi](https://github.com/deepthi)) deepthi@planetscale.com
 * Derek Perkins ([derekperkins](https://github.com/derekperkins)) derek@nozzle.io
 * Dirkjan Bussink ([dbussink](https://github.com/dbussink)) dbussink@planetscale.com
 * Florent Poinsard ([frouioui](https://github.com/frouioui)) florent@planetscale.com
-* Frances Thai ([notfelineit](https://github.com/notfelineit)) frances@planetscale.com
+* Frances Thai ([notfelineit](https://github.com/notfelineit)) notfelineit@gmail.com
 * Harshit Gangal ([harshit-gangal](https://github.com/harshit-gangal)) harshit.gangal@gmail.com
 * Manan Gupta ([GuptaManan100](https://github.com/GuptaManan100)) manan@planetscale.com
-* Matt Lord ([mattlord](https://github.com/mattlord)) mlord@planetscale.com
+* Matt Lord ([mattlord](https://github.com/mattlord)) mattalord@gmail.com
 * Rohit Nayak ([rohit-nayak-ps](https://github.com/rohit-nayak-ps)) rohit@planetscale.com
 * Shlomi Noach ([shlomi-noach](https://github.com/shlomi-noach)) shlomi@planetscale.com
 * Tim Vaillancourt ([timvaillancourt](https://github.com/timvaillancourt)) tim@timvaillancourt.com
-* Vicent Marti ([vmg](https://github.com/vmg)) vmg@planetscale.com
 
 ## Areas of expertise
 
@@ -24,7 +22,7 @@ The following is the full list, alphabetically ordered.
 deepthi, mattlord, derekperkins
 
 ### Builds
-shlomi-noach, ajm188, vmg, GuptaManan100, frouioui
+shlomi-noach, GuptaManan100, frouioui
 
 ### Resharding
 rohit-nayak-ps, deepthi, mattlord
@@ -33,22 +31,19 @@ rohit-nayak-ps, deepthi, mattlord
 systay, harshit-gangal, vmg, GuptaManan100, dbussink
 
 ### Evaluation Engine
-vmg
+dbussink, systay
 
 ### Planner
 systay, harshit-gangal, GuptaManan100, frouioui 
 
 ### Query Serving
-systay, harshit-gangal, GuptaManan100, frouioui, vmg, dbussink
+systay, harshit-gangal, GuptaManan100, frouioui, dbussink
 
 ### Online DDL
 shlomi-noach, dbussink
 
-### Performance
-vmg
-
 ### Cluster Management
-deepthi, ajm188, GuptaManan100, dbussink
+deepthi, GuptaManan100, dbussink
 
 ### Java
 harshit-gangal
@@ -57,7 +52,7 @@ harshit-gangal
 derekperkins, GuptaManan100, frouioui
 
 ### VTAdmin
-ajm188, notfelineit
+notfelineit, rohit-nayak-ps
 
 ### Messaging
 derekperkins, mattlord
@@ -67,6 +62,7 @@ We thank the following past maintainers for their contributions.
 
 * Alain Jobart ([alainjobart](https://github.com/alainjobart))
 * Alkin Tezuysal ([askdba](https://github.com/askdba))
+* Andrew Mason ([ajm188](https://github.com/ajm188))
 * Anthony Yeh ([enisoc](https://github.com/enisoc))
 * Dan Kozlowski ([dkhenry](https://github.com/dkhenry))
 * David Weitzman ([dweitzman](https://github.com/dweitzman))
@@ -81,3 +77,4 @@ We thank the following past maintainers for their contributions.
 * Rafael Chacon ([rafael](https://github.com/rafael))
 * Sara Bee ([doeg](https://github.com/doeg))
 * Sugu Sougoumarane ([sougou](https://github.com/sougou))
+* Vicent Marti ([vmg](https://github.com/vmg))

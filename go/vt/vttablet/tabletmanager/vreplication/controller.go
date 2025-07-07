@@ -47,6 +47,9 @@ const (
 	// give up and return an error message that the user
 	// can see and act upon if needed.
 	tabletPickerRetries = 5
+
+	// Prepended to the message to indicate that it is a terminal error.
+	TerminalErrorIndicator = "terminal error"
 )
 
 // controller is created by Engine. Members are initialized upfront.
@@ -112,7 +115,6 @@ func newController(ctx context.Context, params map[string]string, dbClientFactor
 	}
 	blpStats.WorkflowConfig = workflowConfig.String()
 	ct.sourceTablet.Store(&topodatapb.TabletAlias{})
-	log.Infof("creating controller with cell: %v, tabletTypes: %v, and params: %v", cell, tabletTypesStr, params)
 
 	id, err := strconv.ParseInt(params["id"], 10, 32)
 	if err != nil {
@@ -120,6 +122,8 @@ func newController(ctx context.Context, params map[string]string, dbClientFactor
 	}
 	ct.id = int32(id)
 	ct.workflow = params["workflow"]
+	log.Infof("creating controller with id: %v, name: %v, cell: %v, tabletTypes: %v", ct.id, ct.workflow, cell, tabletTypesStr)
+
 	ct.lastWorkflowError = vterrors.NewLastError(fmt.Sprintf("VReplication controller %d for workflow %q", ct.id, ct.workflow), workflowConfig.MaxTimeToRetryError)
 
 	state := params["state"]
@@ -305,7 +309,7 @@ func (ct *controller) runBlp(ctx context.Context) (err error) {
 		if (err != nil && vr.WorkflowSubType == int32(binlogdatapb.VReplicationWorkflowSubType_AtomicCopy)) ||
 			isUnrecoverableError(err) ||
 			!ct.lastWorkflowError.ShouldRetry() {
-
+			err = vterrors.Wrapf(err, TerminalErrorIndicator)
 			if errSetState := vr.setState(binlogdatapb.VReplicationWorkflowState_Error, err.Error()); errSetState != nil {
 				log.Errorf("INTERNAL: unable to setState() in controller: %v. Could not set error text to: %v.", errSetState, err)
 				return err // yes, err and not errSetState.

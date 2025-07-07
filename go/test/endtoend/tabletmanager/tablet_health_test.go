@@ -35,11 +35,11 @@ import (
 	"vitess.io/vitess/go/test/endtoend/utils"
 	querypb "vitess.io/vitess/go/vt/proto/query"
 	topodatapb "vitess.io/vitess/go/vt/proto/topodata"
+	vtutils "vitess.io/vitess/go/vt/utils"
 )
 
 // TabletReshuffle test if a vttablet can be pointed at an existing mysql
 func TestTabletReshuffle(t *testing.T) {
-	defer cluster.PanicHandler(t)
 	ctx := context.Background()
 
 	conn, err := mysql.Connect(ctx, &primaryTabletParams)
@@ -58,16 +58,15 @@ func TestTabletReshuffle(t *testing.T) {
 	// Create new tablet
 	rTablet := clusterInstance.NewVttabletInstance("replica", 0, "")
 
-	// mycnf_server_id prevents vttablet from reading the mycnf
+	// mycnf-server-id prevents vttablet from reading the mycnf
 	// Pointing to primaryTablet's socket file
 	// We have to disable active reparenting to prevent the tablet from trying to fix replication.
 	// We also have to disable replication reporting because we're pointed at the primary.
 	clusterInstance.VtTabletExtraArgs = []string{
-		"--lock_tables_timeout", "5s",
-		"--mycnf_server_id", fmt.Sprintf("%d", rTablet.TabletUID),
-		"--db_socket", fmt.Sprintf("%s/mysql.sock", primaryTablet.VttabletProcess.Directory),
-		"--disable_active_reparents",
-		"--enable_replication_reporter=false",
+		vtutils.GetFlagVariantForTests("--lock-tables-timeout"), "5s",
+		vtutils.GetFlagVariantForTests("--mycnf-server-id"), fmt.Sprintf("%d", rTablet.TabletUID),
+		vtutils.GetFlagVariantForTests("--db-socket"), fmt.Sprintf("%s/mysql.sock", primaryTablet.VttabletProcess.Directory),
+		vtutils.GetFlagVariantForTests("--enable-replication-reporter") + "=false",
 	}
 	defer func() { clusterInstance.VtTabletExtraArgs = []string{} }()
 
@@ -92,7 +91,6 @@ func TestTabletReshuffle(t *testing.T) {
 
 func TestHealthCheck(t *testing.T) {
 	// Add one replica that starts not initialized
-	defer cluster.PanicHandler(t)
 	ctx := context.Background()
 	clusterInstance.DisableVTOrcRecoveries(t)
 	defer clusterInstance.EnableVTOrcRecoveries(t)
@@ -200,7 +198,6 @@ func TestHealthCheck(t *testing.T) {
 // TestHealthCheckSchemaChangeSignal tests the tables and views, which report their schemas have changed in the output of a StreamHealth.
 func TestHealthCheckSchemaChangeSignal(t *testing.T) {
 	// Add one replica that starts not initialized
-	defer cluster.PanicHandler(t)
 	ctx := context.Background()
 
 	vtParams := clusterInstance.GetVTParams(keyspaceName)
@@ -381,7 +378,6 @@ func TestHealthCheckDrainedStateDoesNotShutdownQueryService(t *testing.T) {
 	// - the query service won't be shutdown
 
 	// Wait if tablet is not in service state
-	defer cluster.PanicHandler(t)
 	clusterInstance.DisableVTOrcRecoveries(t)
 	defer clusterInstance.EnableVTOrcRecoveries(t)
 	err := rdonlyTablet.VttabletProcess.WaitForTabletStatus("SERVING")

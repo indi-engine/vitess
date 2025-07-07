@@ -19,14 +19,13 @@ package discovery
 import (
 	"context"
 	"fmt"
-	"net"
 	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
 
 	"vitess.io/vitess/go/vt/grpcclient"
-	"vitess.io/vitess/go/vt/log"
+	"vitess.io/vitess/go/vt/logutil"
 	"vitess.io/vitess/go/vt/proto/vtrpc"
 	"vitess.io/vitess/go/vt/topo/topoproto"
 	"vitess.io/vitess/go/vt/topotools"
@@ -34,15 +33,11 @@ import (
 	"vitess.io/vitess/go/vt/vttablet/queryservice"
 	"vitess.io/vitess/go/vt/vttablet/tabletconn"
 
-	"google.golang.org/grpc"
 	"google.golang.org/protobuf/proto"
 
 	"vitess.io/vitess/go/vt/proto/query"
 	"vitess.io/vitess/go/vt/proto/topodata"
 )
-
-// withDialerContextOnce ensures grpc.WithDialContext() is added once to the options.
-var withDialerContextOnce sync.Once
 
 // tabletHealthCheck maintains the health status of a tablet. A map of this
 // structure is maintained in HealthCheck.
@@ -76,6 +71,8 @@ type tabletHealthCheck struct {
 	// possibly delete both these
 	loggedServingState    bool
 	lastResponseTimestamp time.Time // timestamp of the last healthcheck response
+	// logger is used to log messages.
+	logger logutil.Logger
 }
 
 // String is defined because we want to print a []*tabletHealthCheck array nicely.
@@ -112,7 +109,7 @@ func (thc *tabletHealthCheck) setServingState(serving bool, reason string) {
 	if !thc.loggedServingState || (serving != thc.Serving) {
 		// Emit the log from a separate goroutine to avoid holding
 		// the th lock while logging is happening
-		log.Infof("HealthCheckUpdate(Serving State): tablet: %v serving %v => %v for %v/%v (%v) reason: %s",
+		thc.logger.Infof("HealthCheckUpdate(Serving State): tablet: %v serving %v => %v for %v/%v (%v) reason: %s",
 			topotools.TabletIdent(thc.Tablet),
 			thc.Serving,
 			serving,
@@ -127,8 +124,8 @@ func (thc *tabletHealthCheck) setServingState(serving bool, reason string) {
 }
 
 // stream streams healthcheck responses to callback.
-func (thc *tabletHealthCheck) stream(ctx context.Context, hc *HealthCheckImpl, callback func(*query.StreamHealthResponse) error) error {
-	conn := thc.Connection(ctx, hc)
+func (thc *tabletHealthCheck) stream(ctx context.Context, callback func(*query.StreamHealthResponse) error) error {
+	conn := thc.Connection(ctx)
 	if conn == nil {
 		// This signals the caller to retry
 		return nil
@@ -141,34 +138,14 @@ func (thc *tabletHealthCheck) stream(ctx context.Context, hc *HealthCheckImpl, c
 	return err
 }
 
-func (thc *tabletHealthCheck) Connection(ctx context.Context, hc *HealthCheckImpl) queryservice.QueryService {
+func (thc *tabletHealthCheck) Connection(ctx context.Context) queryservice.QueryService {
 	thc.connMu.Lock()
 	defer thc.connMu.Unlock()
-	return thc.connectionLocked(ctx, hc)
+	return thc.connectionLocked(ctx)
 }
 
-func healthCheckDialerFactory(hc *HealthCheckImpl) func(ctx context.Context, addr string) (net.Conn, error) {
-	return func(ctx context.Context, addr string) (net.Conn, error) {
-		// Limit the number of healthcheck connections opened in parallel to avoid high OS-thread
-		// usage due to blocking networking syscalls (eg: DNS lookups, TCP connection opens,
-		// etc). Without this limit it is possible for vtgates watching >10k tablets to hit
-		// the panic: 'runtime: program exceeds 10000-thread limit'.
-		if err := hc.healthCheckDialSem.Acquire(ctx, 1); err != nil {
-			return nil, err
-		}
-		defer hc.healthCheckDialSem.Release(1)
-		var dialer net.Dialer
-		return dialer.DialContext(ctx, "tcp", addr)
-	}
-}
-
-func (thc *tabletHealthCheck) connectionLocked(ctx context.Context, hc *HealthCheckImpl) queryservice.QueryService {
+func (thc *tabletHealthCheck) connectionLocked(ctx context.Context) queryservice.QueryService {
 	if thc.Conn == nil {
-		withDialerContextOnce.Do(func() {
-			grpcclient.RegisterGRPCDialOptions(func(opts []grpc.DialOption) ([]grpc.DialOption, error) {
-				return append(opts, grpc.WithContextDialer(healthCheckDialerFactory(hc))), nil
-			})
-		})
 		conn, err := tabletconn.GetDialer()(ctx, thc.Tablet, grpcclient.FailFast(true))
 		if err != nil {
 			thc.LastError = err
@@ -297,7 +274,7 @@ func (thc *tabletHealthCheck) checkConn(hc *HealthCheckImpl) {
 		}()
 
 		// Read stream health responses.
-		err := thc.stream(streamCtx, hc, func(shr *query.StreamHealthResponse) error {
+		err := thc.stream(streamCtx, func(shr *query.StreamHealthResponse) error {
 			// We received a message. Reset the back-off.
 			retryDelay = hc.retryDelay
 			// Don't block on send to avoid deadlocks.
@@ -319,7 +296,7 @@ func (thc *tabletHealthCheck) checkConn(hc *HealthCheckImpl) {
 			// the healthcheck cache again via the topology watcher.
 			// WARNING: Under no other circumstances should we be deleting the tablet here.
 			if strings.Contains(err.Error(), "health stats mismatch") {
-				log.Warningf("deleting tablet %v from healthcheck due to health stats mismatch", thc.Tablet)
+				thc.logger.Warningf("deleting tablet %v from healthcheck due to health stats mismatch", thc.Tablet)
 				hc.deleteTablet(thc.Tablet)
 				return
 			}
@@ -356,7 +333,7 @@ func (thc *tabletHealthCheck) checkConn(hc *HealthCheckImpl) {
 }
 
 func (thc *tabletHealthCheck) closeConnection(ctx context.Context, err error) {
-	log.Warningf("tablet %v healthcheck stream error: %v", thc.Tablet, err)
+	thc.logger.Warningf("tablet %v healthcheck stream error: %v", thc.Tablet, err)
 	thc.setServingState(false, err.Error())
 	thc.LastError = err
 	_ = thc.Conn.Close(ctx)

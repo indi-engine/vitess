@@ -87,18 +87,20 @@ type stateManager struct {
 	//
 	// If a transition fails, we set retrying to true and launch
 	// retryTransition which loops until the state converges.
-	mu             sync.Mutex
-	wantState      servingState
-	wantTabletType topodatapb.TabletType
-	state          servingState
-	target         *querypb.Target
-	ptsTimestamp   time.Time
-	retrying       bool
-	replHealthy    bool
-	lameduck       bool
-	alsoAllow      []topodatapb.TabletType
-	reason         string
-	transitionErr  error
+	mu                   sync.Mutex
+	wantState            servingState
+	wantTabletType       topodatapb.TabletType
+	state                servingState
+	target               *querypb.Target
+	ptsTimestamp         time.Time
+	retrying             bool
+	replHealthy          bool
+	demotePrimaryStalled bool
+	lameduck             bool
+	diskHealthMonitor    DiskHealthMonitor
+	alsoAllow            []topodatapb.TabletType
+	reason               string
+	transitionErr        error
 
 	rw *requestsWaiter
 
@@ -140,7 +142,7 @@ type stateManager struct {
 
 type (
 	schemaEngine interface {
-		EnsureConnectionAndDB(topodatapb.TabletType) error
+		EnsureConnectionAndDB(topodatapb.TabletType, bool) error
 		Open() error
 		MakeNonPrimary()
 		MakePrimary(bool)
@@ -387,7 +389,7 @@ func (sm *stateManager) StartRequest(ctx context.Context, target *querypb.Target
 	sm.mu.Lock()
 	defer sm.mu.Unlock()
 
-	if sm.state != StateServing || !sm.replHealthy {
+	if sm.state != StateServing || !sm.replHealthy || sm.demotePrimaryStalled {
 		// This specific error string needs to be returned for vtgate buffering to work.
 		return vterrors.New(vtrpcpb.Code_CLUSTER_EVENT, vterrors.NotServing)
 	}
@@ -447,7 +449,7 @@ func (sm *stateManager) verifyTargetLocked(ctx context.Context, target *querypb.
 func (sm *stateManager) servePrimary() error {
 	sm.watcher.Close()
 
-	if err := sm.connect(topodatapb.TabletType_PRIMARY); err != nil {
+	if err := sm.connect(topodatapb.TabletType_PRIMARY, true); err != nil {
 		return err
 	}
 
@@ -476,7 +478,7 @@ func (sm *stateManager) unservePrimary() error {
 
 	sm.watcher.Close()
 
-	if err := sm.connect(topodatapb.TabletType_PRIMARY); err != nil {
+	if err := sm.connect(topodatapb.TabletType_PRIMARY, false); err != nil {
 		return err
 	}
 
@@ -500,7 +502,7 @@ func (sm *stateManager) serveNonPrimary(wantTabletType topodatapb.TabletType) er
 	sm.se.MakeNonPrimary()
 	sm.hs.MakeNonPrimary()
 
-	if err := sm.connect(wantTabletType); err != nil {
+	if err := sm.connect(wantTabletType, true); err != nil {
 		return err
 	}
 
@@ -518,7 +520,7 @@ func (sm *stateManager) unserveNonPrimary(wantTabletType topodatapb.TabletType) 
 	sm.se.MakeNonPrimary()
 	sm.hs.MakeNonPrimary()
 
-	if err := sm.connect(wantTabletType); err != nil {
+	if err := sm.connect(wantTabletType, false); err != nil {
 		return err
 	}
 
@@ -528,8 +530,8 @@ func (sm *stateManager) unserveNonPrimary(wantTabletType topodatapb.TabletType) 
 	return nil
 }
 
-func (sm *stateManager) connect(tabletType topodatapb.TabletType) error {
-	if err := sm.se.EnsureConnectionAndDB(tabletType); err != nil {
+func (sm *stateManager) connect(tabletType topodatapb.TabletType, serving bool) error {
+	if err := sm.se.EnsureConnectionAndDB(tabletType, serving); err != nil {
 		return err
 	}
 	if err := sm.se.Open(); err != nil {
@@ -715,6 +717,10 @@ func (sm *stateManager) Broadcast() {
 	defer sm.mu.Unlock()
 
 	lag, err := sm.refreshReplHealthLocked()
+	if sm.demotePrimaryStalled {
+		// If we are stalled while demoting primary, we should send an error for it.
+		err = vterrors.VT09031()
+	}
 	sm.hs.ChangeState(sm.target.TabletType, sm.ptsTimestamp, lag, err, sm.isServingLocked())
 }
 
@@ -772,7 +778,7 @@ func (sm *stateManager) IsServing() bool {
 }
 
 func (sm *stateManager) isServingLocked() bool {
-	return sm.state == StateServing && sm.wantState == StateServing && sm.replHealthy && !sm.lameduck
+	return sm.state == StateServing && sm.wantState == StateServing && sm.replHealthy && !sm.demotePrimaryStalled && !sm.lameduck && !sm.diskHealthMonitor.IsDiskStalled()
 }
 
 func (sm *stateManager) AppendDetails(details []*kv) []*kv {

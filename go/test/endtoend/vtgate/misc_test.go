@@ -28,7 +28,6 @@ import (
 
 	"vitess.io/vitess/go/mysql"
 	"vitess.io/vitess/go/mysql/sqlerror"
-	"vitess.io/vitess/go/test/endtoend/cluster"
 	"vitess.io/vitess/go/test/endtoend/utils"
 )
 
@@ -754,9 +753,9 @@ func TestDescribeVindex(t *testing.T) {
 	_, err := conn.ExecuteFetch("describe hash", 1000, false)
 	require.Error(t, err)
 	mysqlErr := err.(*sqlerror.SQLError)
-	assert.Equal(t, sqlerror.ERNoSuchTable, mysqlErr.Num)
+	assert.Equal(t, sqlerror.ERUnknownTable, mysqlErr.Num)
 	assert.Equal(t, "42S02", mysqlErr.State)
-	assert.ErrorContains(t, mysqlErr, "NotFound desc")
+	assert.ErrorContains(t, mysqlErr, "VT05004: table 'hash' does not exist")
 }
 
 func TestEmptyQuery(t *testing.T) {
@@ -783,7 +782,6 @@ func TestJoinWithMergedRouteWithPredicate(t *testing.T) {
 func TestRowCountExceed(t *testing.T) {
 	conn, _ := start(t)
 	defer func() {
-		cluster.PanicHandler(t)
 		// needs special delete logic as it exceeds row count.
 		for i := 50; i <= 300; i += 50 {
 			utils.Exec(t, conn, fmt.Sprintf("delete from t1 where id1 < %d", i))
@@ -816,6 +814,81 @@ func TestDDLTargeted(t *testing.T) {
 	utils.AssertMatches(t, conn, `select id from ddl_targeted`, `[[INT64(1)]]`)
 }
 
+// TestDynamicConfig tests the dynamic configurations.
+func TestDynamicConfig(t *testing.T) {
+	t.Run("DiscoveryLowReplicationLag", func(t *testing.T) {
+		// Test initial config value
+		err := clusterInstance.VtgateProcess.WaitForConfig(`"discovery_low_replication_lag":30000000000`)
+		require.NoError(t, err)
+		defer func() {
+			// Restore default back.
+			clusterInstance.VtgateProcess.Config.DiscoveryLowReplicationLag = "30s"
+			err = clusterInstance.VtgateProcess.RewriteConfiguration()
+			require.NoError(t, err)
+		}()
+		clusterInstance.VtgateProcess.Config.DiscoveryLowReplicationLag = "15s"
+		err = clusterInstance.VtgateProcess.RewriteConfiguration()
+		require.NoError(t, err)
+		// Test final config value.
+		err = clusterInstance.VtgateProcess.WaitForConfig(`"discovery_low_replication_lag":"15s"`)
+		require.NoError(t, err)
+	})
+
+	t.Run("DiscoveryHighReplicationLag", func(t *testing.T) {
+		// Test initial config value
+		err := clusterInstance.VtgateProcess.WaitForConfig(`"discovery_high_replication_lag":7200000000000`)
+		require.NoError(t, err)
+		defer func() {
+			// Restore default back.
+			clusterInstance.VtgateProcess.Config.DiscoveryHighReplicationLag = "2h"
+			err = clusterInstance.VtgateProcess.RewriteConfiguration()
+			require.NoError(t, err)
+		}()
+		clusterInstance.VtgateProcess.Config.DiscoveryHighReplicationLag = "1h"
+		err = clusterInstance.VtgateProcess.RewriteConfiguration()
+		require.NoError(t, err)
+		// Test final config value.
+		err = clusterInstance.VtgateProcess.WaitForConfig(`"discovery_high_replication_lag":"1h"`)
+		require.NoError(t, err)
+	})
+
+	t.Run("DiscoveryMinServingVttablets", func(t *testing.T) {
+		// Test initial config value
+		err := clusterInstance.VtgateProcess.WaitForConfig(`"discovery_min_number_serving_vttablets":2`)
+		require.NoError(t, err)
+		defer func() {
+			// Restore default back.
+			clusterInstance.VtgateProcess.Config.DiscoveryMinServingVttablets = "2"
+			err = clusterInstance.VtgateProcess.RewriteConfiguration()
+			require.NoError(t, err)
+		}()
+		clusterInstance.VtgateProcess.Config.DiscoveryMinServingVttablets = "1"
+		err = clusterInstance.VtgateProcess.RewriteConfiguration()
+		require.NoError(t, err)
+		// Test final config value.
+		err = clusterInstance.VtgateProcess.WaitForConfig(`"discovery_min_number_serving_vttablets":"1"`)
+		require.NoError(t, err)
+	})
+
+	t.Run("DiscoveryLegacyReplicationLagAlgo", func(t *testing.T) {
+		// Test initial config value
+		err := clusterInstance.VtgateProcess.WaitForConfig(`"discovery_legacy_replication_lag_algorithm":""`)
+		require.NoError(t, err)
+		defer func() {
+			// Restore default back.
+			clusterInstance.VtgateProcess.Config.DiscoveryLegacyReplicationLagAlgo = "true"
+			err = clusterInstance.VtgateProcess.RewriteConfiguration()
+			require.NoError(t, err)
+		}()
+		clusterInstance.VtgateProcess.Config.DiscoveryLegacyReplicationLagAlgo = "false"
+		err = clusterInstance.VtgateProcess.RewriteConfiguration()
+		require.NoError(t, err)
+		// Test final config value.
+		err = clusterInstance.VtgateProcess.WaitForConfig(`"discovery_legacy_replication_lag_algorithm":"false"`)
+		require.NoError(t, err)
+	})
+}
+
 func TestLookupErrorMetric(t *testing.T) {
 	conn, closer := start(t)
 	defer closer()
@@ -844,12 +917,125 @@ func getVtgateApiErrorCounts(t *testing.T) float64 {
 }
 
 func getVar(t *testing.T, key string) interface{} {
-	vars, err := clusterInstance.VtgateProcess.GetVars()
-	require.NoError(t, err)
+	vars := clusterInstance.VtgateProcess.GetVars()
+	require.NotNil(t, vars)
 
 	val, exists := vars[key]
 	if !exists {
 		return nil
 	}
 	return val
+}
+
+// TestQueryProcessedMetric verifies that query metrics are correctly published.
+func TestQueryProcessedMetric(t *testing.T) {
+	conn, closer := start(t)
+	defer closer()
+
+	tcases := []struct {
+		sql          string
+		queryMetric  string
+		tableMetrics []string
+		shards       int
+	}{{
+		sql:          "select id1, id2 from t1",
+		queryMetric:  "SELECT.Scatter.PRIMARY",
+		shards:       2,
+		tableMetrics: []string{"SELECT.ks_t1"},
+	}, {
+		sql:          "update t1 set id2 = 2 where id1 = 1",
+		queryMetric:  "UPDATE.MultiShard.PRIMARY",
+		shards:       2,
+		tableMetrics: []string{"UPDATE.ks_t1"},
+	}, {
+		sql:          "delete from t1 where id1 in (1)",
+		queryMetric:  "DELETE.MultiShard.PRIMARY",
+		shards:       2,
+		tableMetrics: []string{"DELETE.ks_t1"},
+	}, {
+		sql:         "show tables",
+		queryMetric: "SHOW.Passthrough.PRIMARY",
+		shards:      1,
+	}, {
+		sql:         "savepoint a",
+		queryMetric: "SAVEPOINT.Transaction.PRIMARY",
+	}, {
+		sql:         "rollback",
+		queryMetric: "ROLLBACK.Transaction.PRIMARY",
+	}, {
+		sql:         "set @x=3",
+		queryMetric: "SET.Local.PRIMARY",
+	}, {
+		sql:         "set sql_mode=''",
+		queryMetric: "SET.MultiShard.PRIMARY",
+		shards:      1,
+	}, {
+		sql:         "set @@vitess_metadata.k1='v1'",
+		queryMetric: "SET.Topology.PRIMARY",
+	}, {
+		sql:          "select 1 from t1 a, t1 b",
+		queryMetric:  "SELECT.Join.PRIMARY",
+		shards:       3,
+		tableMetrics: []string{"SELECT.ks_t1"},
+	}, {
+		sql:          "select count(*) from t1 a, t1 b",
+		queryMetric:  "SELECT.Complex.PRIMARY",
+		shards:       6,
+		tableMetrics: []string{"SELECT.ks_t1"},
+	}, {
+		sql:          "select 1 from t1, t2, t3, t4 where t1.id1 = t2.id3 and t2.id3 = t3.id6 and t3.id6 = t4.id1 and t3.id7 = 5",
+		queryMetric:  "SELECT.Lookup.PRIMARY",
+		shards:       2,
+		tableMetrics: []string{"SELECT.ks_t1", "SELECT.ks_t2", "SELECT.ks_t3", "SELECT.ks_t4"},
+	}}
+
+	initialQP := getQPMetric(t, "QueryExecutions")
+	initialQR := getQPMetric(t, "QueryRoutes")
+	initialQT := getQPMetric(t, "QueryExecutionsByTable")
+	for _, tc := range tcases {
+		t.Run(tc.sql, func(t *testing.T) {
+			utils.Exec(t, conn, tc.sql)
+			updatedQP := getQPMetric(t, "QueryExecutions")
+			updatedQR := getQPMetric(t, "QueryRoutes")
+			updatedQT := getQPMetric(t, "QueryExecutionsByTable")
+			assert.EqualValuesf(t, 1, getValue(updatedQP, tc.queryMetric)-getValue(initialQP, tc.queryMetric), "queryExecutions metric: %s", tc.queryMetric)
+			assert.EqualValuesf(t, tc.shards, getValue(updatedQR, tc.queryMetric)-getValue(initialQR, tc.queryMetric), "queryRoutes metric: %s", tc.queryMetric)
+			for _, metric := range tc.tableMetrics {
+				assert.EqualValuesf(t, 1, getValue(updatedQT, metric)-getValue(initialQT, metric), "queryExecutionsByTable metric: %s", metric)
+			}
+			initialQP, initialQR, initialQT = updatedQP, updatedQR, updatedQT
+		})
+	}
+}
+
+func getQPMetric(t *testing.T, metric string) map[string]any {
+	t.Helper()
+
+	vars := clusterInstance.VtgateProcess.GetVars()
+	require.NotNil(t, vars)
+
+	qpVars, exists := vars[metric]
+	if !exists {
+		return nil
+	}
+
+	qpMap, ok := qpVars.(map[string]any)
+	require.True(t, ok, "query queryMetric vars is not a map")
+
+	return qpMap
+}
+
+func getValue(m map[string]any, key string) float64 {
+	if m == nil {
+		return 0
+	}
+	val, exists := m[key]
+	if !exists {
+		return 0
+	}
+	f, ok := val.(float64)
+	if !ok {
+		return 0
+	}
+	return f
 }

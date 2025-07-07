@@ -30,6 +30,7 @@ import (
 	"testing"
 
 	"vitess.io/vitess/go/test/endtoend/cluster"
+	"vitess.io/vitess/go/vt/utils"
 )
 
 var (
@@ -48,13 +49,13 @@ var (
 					) Engine=InnoDB
 `
 	commonTabletArg = []string{
-		"--vreplication_retry_delay", "1s",
-		"--degraded_threshold", "5s",
-		"--lock_tables_timeout", "5s",
-		"--watch_replication_stream",
-		"--enable_replication_reporter",
+		utils.GetFlagVariantForTests("--vreplication-retry-delay"), "1s",
+		utils.GetFlagVariantForTests("--degraded-threshold"), "5s",
+		utils.GetFlagVariantForTests("--lock-tables-timeout"), "5s",
+		utils.GetFlagVariantForTests("--watch-replication-stream"),
+		utils.GetFlagVariantForTests("--enable-replication-reporter"),
 		"--serving_state_grace_period", "1s",
-		"--binlog_player_protocol", "grpc",
+		utils.GetFlagVariantForTests("--binlog-player-protocol"), "grpc",
 	}
 	vSchema = `
 		{
@@ -97,7 +98,6 @@ Topology: We create a keyspace with two shards , having 3 tablets each. Primarie
 to 'zone1' and replicas/rdonly belongs to cell2.
 */
 func TestMain(m *testing.M) {
-	defer cluster.PanicHandler(nil)
 	flag.Parse()
 
 	exitcode, err := func() (int, error) {
@@ -117,12 +117,12 @@ func TestMain(m *testing.M) {
 		if err != nil {
 			return 1, err
 		}
-		err = clusterInstance.VtctlProcess.AddCellInfo(cell2)
+		err = clusterInstance.VtctldClientProcess.AddCellInfo(cell2)
 		if err != nil {
 			return 1, err
 		}
 
-		vtctldClientProcess := cluster.VtctldClientProcessInstance("localhost", clusterInstance.VtctldProcess.GrpcPort, clusterInstance.TmpDirectory)
+		vtctldClientProcess := cluster.VtctldClientProcessInstance(clusterInstance.VtctldProcess.GrpcPort, clusterInstance.TopoPort, "localhost", clusterInstance.TmpDirectory)
 		_, err = vtctldClientProcess.ExecuteCommandWithOutput("CreateKeyspace", keyspaceName, "--durability-policy=semi_sync")
 		if err != nil {
 			return 1, err

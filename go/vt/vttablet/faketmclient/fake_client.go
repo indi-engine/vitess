@@ -66,6 +66,10 @@ func (client *FakeTabletManagerClient) CreateVReplicationWorkflow(ctx context.Co
 	return nil, nil
 }
 
+func (client *FakeTabletManagerClient) DeleteTableData(ctx context.Context, tablet *topodatapb.Tablet, req *tabletmanagerdatapb.DeleteTableDataRequest) (*tabletmanagerdatapb.DeleteTableDataResponse, error) {
+	return nil, nil
+}
+
 func (client *FakeTabletManagerClient) DeleteVReplicationWorkflow(ctx context.Context, tablet *topodatapb.Tablet, req *tabletmanagerdatapb.DeleteVReplicationWorkflowRequest) (*tabletmanagerdatapb.DeleteVReplicationWorkflowResponse, error) {
 	return nil, nil
 }
@@ -91,6 +95,10 @@ func (client *FakeTabletManagerClient) UpdateVReplicationWorkflow(ctx context.Co
 }
 
 func (client *FakeTabletManagerClient) UpdateVReplicationWorkflows(ctx context.Context, tablet *topodatapb.Tablet, req *tabletmanagerdatapb.UpdateVReplicationWorkflowsRequest) (*tabletmanagerdatapb.UpdateVReplicationWorkflowsResponse, error) {
+	return nil, nil
+}
+
+func (client *FakeTabletManagerClient) ValidateVReplicationPermissions(ctx context.Context, tablet *topodatapb.Tablet, request *tabletmanagerdatapb.ValidateVReplicationPermissionsRequest) (*tabletmanagerdatapb.ValidateVReplicationPermissionsResponse, error) {
 	return nil, nil
 }
 
@@ -157,6 +165,11 @@ func (client *FakeTabletManagerClient) SetReadWrite(ctx context.Context, tablet 
 	return nil
 }
 
+// ChangeTags is part of the tmclient.TabletManagerClient interface.
+func (client *FakeTabletManagerClient) ChangeTags(ctx context.Context, tablet *topodatapb.Tablet, tabletTags map[string]string, replace bool) (*tabletmanagerdatapb.ChangeTagsResponse, error) {
+	return &tabletmanagerdatapb.ChangeTagsResponse{}, nil
+}
+
 // ChangeType is part of the tmclient.TabletManagerClient interface.
 func (client *FakeTabletManagerClient) ChangeType(ctx context.Context, tablet *topodatapb.Tablet, dbType topodatapb.TabletType, semiSync bool) error {
 	return nil
@@ -213,13 +226,27 @@ func (client *FakeTabletManagerClient) ExecuteFetchAsApp(ctx context.Context, ta
 }
 
 // GetUnresolvedTransactions is part of the tmclient.TabletManagerClient interface.
-func (client *FakeTabletManagerClient) GetUnresolvedTransactions(ctx context.Context, tablet *topodatapb.Tablet) ([]*querypb.TransactionMetadata, error) {
+func (client *FakeTabletManagerClient) GetUnresolvedTransactions(ctx context.Context, tablet *topodatapb.Tablet, abandonAge int64) ([]*querypb.TransactionMetadata, error) {
 	return nil, nil
 }
 
 // ConcludeTransaction is part of the tmclient.TabletManagerClient interface.
 func (client *FakeTabletManagerClient) ConcludeTransaction(ctx context.Context, tablet *topodatapb.Tablet, dtid string, mm bool) error {
 	return nil
+}
+
+// ConcludeTransaction is part of the tmclient.TabletManagerClient interface.
+func (client *FakeTabletManagerClient) MysqlHostMetrics(ctx context.Context, tablet *topodatapb.Tablet, req *tabletmanagerdatapb.MysqlHostMetricsRequest) (*tabletmanagerdatapb.MysqlHostMetricsResponse, error) {
+	return nil, nil
+}
+
+// ReadTransaction is part of the tmclient.TabletManagerClient interface.
+func (client *FakeTabletManagerClient) ReadTransaction(ctx context.Context, tablet *topodatapb.Tablet, dtid string) (*querypb.TransactionMetadata, error) {
+	return nil, nil
+}
+
+func (client *FakeTabletManagerClient) GetTransactionInfo(ctx context.Context, tablet *topodatapb.Tablet, dtid string) (*tabletmanagerdatapb.GetTransactionInfoResponse, error) {
+	return nil, nil
 }
 
 //
@@ -311,6 +338,16 @@ func (client *FakeTabletManagerClient) VReplicationWaitForPos(ctx context.Contex
 	return nil
 }
 
+// UpdateSequenceTables is part of the tmclient.TabletManagerClient interface.
+func (itmc *FakeTabletManagerClient) UpdateSequenceTables(ctx context.Context, tablet *topodatapb.Tablet, request *tabletmanagerdatapb.UpdateSequenceTablesRequest) (*tabletmanagerdatapb.UpdateSequenceTablesResponse, error) {
+	return nil, nil
+}
+
+// GetMaxValueForSequences is part of the tmclient.TabletManagerClient interface.
+func (itmc *FakeTabletManagerClient) GetMaxValueForSequences(ctx context.Context, tablet *topodatapb.Tablet, request *tabletmanagerdatapb.GetMaxValueForSequencesRequest) (*tabletmanagerdatapb.GetMaxValueForSequencesResponse, error) {
+	return nil, nil
+}
+
 //
 // Reparenting related functions
 //
@@ -328,6 +365,11 @@ func (client *FakeTabletManagerClient) InitPrimary(ctx context.Context, tablet *
 // PopulateReparentJournal is part of the tmclient.TabletManagerClient interface.
 func (client *FakeTabletManagerClient) PopulateReparentJournal(ctx context.Context, tablet *topodatapb.Tablet, timeCreatedNS int64, actionName string, masterAlias *topodatapb.TabletAlias, position string) error {
 	return nil
+}
+
+// ReadReparentJournalInfo is part of the tmclient.TabletManagerClient interface.
+func (client *FakeTabletManagerClient) ReadReparentJournalInfo(ctx context.Context, tablet *topodatapb.Tablet) (int32, error) {
+	return 10, nil
 }
 
 // DemotePrimary is part of the tmclient.TabletManagerClient interface.

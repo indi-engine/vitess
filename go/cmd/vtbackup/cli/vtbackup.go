@@ -19,6 +19,7 @@ package cli
 import (
 	"context"
 	"crypto/rand"
+	"errors"
 	"fmt"
 	"math"
 	"math/big"
@@ -45,6 +46,7 @@ import (
 	"vitess.io/vitess/go/vt/servenv"
 	"vitess.io/vitess/go/vt/topo"
 	"vitess.io/vitess/go/vt/topo/topoproto"
+	"vitess.io/vitess/go/vt/utils"
 	"vitess.io/vitess/go/vt/vterrors"
 	_ "vitess.io/vitess/go/vt/vttablet/grpctmclient"
 	"vitess.io/vitess/go/vt/vttablet/tmclient"
@@ -65,6 +67,8 @@ const (
 	phaseNameTakeNewBackup               = "TakeNewBackup"
 	phaseStatusCatchupReplicationStalled = "Stalled"
 	phaseStatusCatchupReplicationStopped = "Stopped"
+
+	timeoutWaitingForReplicationStatus = 60 * time.Second
 )
 
 var (
@@ -141,19 +145,25 @@ var (
 		Long: `vtbackup is a batch command to perform a single pass of backup maintenance for a shard.
 
 When run periodically for each shard, vtbackup can ensure these configurable policies:
-	* There is always a recent backup for the shard.
-	* Old backups for the shard are removed.
+ * There is always a recent backup for the shard.
+
+ * Old backups for the shard are removed.
 
 Whatever system launches vtbackup is responsible for the following:
-	- Running vtbackup with similar flags that would be used for a vttablet and
-    mysqlctld in the target shard to be backed up.
-	- Provisioning as much disk space for vtbackup as would be given to vttablet.
-    The data directory MUST be empty at startup. Do NOT reuse a persistent disk.
-	- Running vtbackup periodically for each shard, for each backup storage location.
-	- Ensuring that at most one instance runs at a time for a given pair of shard
-    and backup storage location.
-	- Retrying vtbackup if it fails.
-	- Alerting human operators if the failure is persistent.
+ - Running vtbackup with similar flags that would be used for a vttablet and 
+   mysqlctld in the target shard to be backed up.
+
+ - Provisioning as much disk space for vtbackup as would be given to vttablet.
+   The data directory MUST be empty at startup. Do NOT reuse a persistent disk.
+
+ - Running vtbackup periodically for each shard, for each backup storage location.
+
+ - Ensuring that at most one instance runs at a time for a given pair of shard
+   and backup storage location.
+
+ - Retrying vtbackup if it fails.
+
+ - Alerting human operators if the failure is persistent.
 
 The process vtbackup follows to take a new backup has the following steps:
  1. Restore from the most recent backup.
@@ -200,15 +210,15 @@ func init() {
 	Main.Flags().BoolVar(&upgradeSafe, "upgrade-safe", upgradeSafe, "Whether to use innodb_fast_shutdown=0 for the backup so it is safe to use for MySQL upgrades.")
 
 	// vttablet-like flags
-	Main.Flags().StringVar(&initDbNameOverride, "init_db_name_override", initDbNameOverride, "(init parameter) override the name of the db used by vttablet")
-	Main.Flags().StringVar(&initKeyspace, "init_keyspace", initKeyspace, "(init parameter) keyspace to use for this tablet")
-	Main.Flags().StringVar(&initShard, "init_shard", initShard, "(init parameter) shard to use for this tablet")
+	utils.SetFlagStringVar(Main.Flags(), &initDbNameOverride, "init-db-name-override", initDbNameOverride, "(init parameter) override the name of the db used by vttablet")
+	utils.SetFlagStringVar(Main.Flags(), &initKeyspace, "init-keyspace", initKeyspace, "(init parameter) keyspace to use for this tablet")
+	utils.SetFlagStringVar(Main.Flags(), &initShard, "init-shard", initShard, "(init parameter) shard to use for this tablet")
 	Main.Flags().IntVar(&concurrency, "concurrency", concurrency, "(init restore parameter) how many concurrent files to restore at once")
 	Main.Flags().StringVar(&incrementalFromPos, "incremental_from_pos", incrementalFromPos, "Position, or name of backup from which to create an incremental backup. Default: empty. If given, then this backup becomes an incremental backup from given position or given backup. If value is 'auto', this backup will be taken from the last successful backup position.")
 
 	// mysqlctld-like flags
-	Main.Flags().IntVar(&mysqlPort, "mysql_port", mysqlPort, "mysql port")
-	Main.Flags().StringVar(&mysqlSocket, "mysql_socket", mysqlSocket, "path to the mysql socket")
+	utils.SetFlagIntVar(Main.Flags(), &mysqlPort, "mysql-port", mysqlPort, "MySQL port")
+	utils.SetFlagStringVar(Main.Flags(), &mysqlSocket, "mysql-socket", mysqlSocket, "Path to the mysqld socket file")
 	Main.Flags().DurationVar(&mysqlTimeout, "mysql_timeout", mysqlTimeout, "how long to wait for mysqld startup")
 	Main.Flags().DurationVar(&mysqlShutdownTimeout, "mysql-shutdown-timeout", mysqlShutdownTimeout, "how long to wait for mysqld shutdown")
 	Main.Flags().StringVar(&initDBSQLFile, "init_db_sql_file", initDBSQLFile, "path to .sql file to run after mysql_install_db")
@@ -335,6 +345,18 @@ func takeBackup(ctx, backgroundCtx context.Context, topoServer *topo.Server, bac
 	if err != nil {
 		return fmt.Errorf("failed to initialize mysql config: %v", err)
 	}
+	ctx, cancelCtx := context.WithCancel(ctx)
+	backgroundCtx, cancelBackgroundCtx := context.WithCancel(backgroundCtx)
+	defer func() {
+		cancelCtx()
+		cancelBackgroundCtx()
+	}()
+	mysqld.OnTerm(func() {
+		log.Warning("Cancelling vtbackup as MySQL has terminated")
+		cancelCtx()
+		cancelBackgroundCtx()
+	})
+
 	initCtx, initCancel := context.WithTimeout(ctx, mysqlTimeout)
 	defer initCancel()
 	initMysqldAt := time.Now()
@@ -520,7 +542,13 @@ func takeBackup(ctx, backgroundCtx context.Context, topoServer *topo.Server, bac
 
 		waitStartTime = time.Now()
 	)
+
+	lastErr := vterrors.NewLastError("replication catch up", timeoutWaitingForReplicationStatus)
 	for {
+		if !lastErr.ShouldRetry() {
+			return fmt.Errorf("timeout waiting for replication status after %.0f seconds", timeoutWaitingForReplicationStatus.Seconds())
+		}
+
 		select {
 		case <-ctx.Done():
 			return fmt.Errorf("error in replication catch up: %v", ctx.Err())
@@ -530,6 +558,7 @@ func takeBackup(ctx, backgroundCtx context.Context, topoServer *topo.Server, bac
 		lastStatus = status
 		status, statusErr = mysqld.ReplicationStatus(ctx)
 		if statusErr != nil {
+			lastErr.Record(statusErr)
 			log.Warningf("Error getting replication status: %v", statusErr)
 			continue
 		}
@@ -548,7 +577,10 @@ func takeBackup(ctx, backgroundCtx context.Context, topoServer *topo.Server, bac
 			}
 		}
 		if !status.Healthy() {
-			log.Warning("Replication has stopped before backup could be taken. Trying to restart replication.")
+			errStr := "Replication has stopped before backup could be taken. Trying to restart replication."
+			log.Warning(errStr)
+			lastErr.Record(errors.New(strings.ToLower(errStr)))
+
 			phaseStatus.Set([]string{phaseNameCatchupReplication, phaseStatusCatchupReplicationStopped}, 1)
 			if err := startReplication(ctx, mysqld, topoServer); err != nil {
 				log.Warningf("Failed to restart replication: %v", err)

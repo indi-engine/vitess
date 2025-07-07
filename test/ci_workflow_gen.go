@@ -47,6 +47,19 @@ var (
 )
 
 const (
+	oracleCloudRunner = "oracle-16cpu-64gb-x86-64"
+	githubRunner      = "gh-hosted-runners-16cores-1-24.04"
+	cores16RunnerName = githubRunner
+	defaultRunnerName = "ubuntu-24.04"
+)
+
+// To support a private git repository, set goPrivate to a repo in
+// github.com/org/repo format. This assumes a GitHub PAT token is
+// set as a repo secret named GH_ACCESS_TOKEN. The GitHub PAT must
+// have read access to your vitess fork/repo.
+const goPrivate = ""
+
+const (
 	workflowConfigDir = "../.github/workflows"
 
 	unitTestTemplate = "templates/unit_test.tpl"
@@ -75,6 +88,7 @@ var (
 		"xb_backup",
 		"backup_pitr",
 		"backup_pitr_xtrabackup",
+		"backup_pitr_mysqlshell",
 		"21",
 		"mysql_server_vault",
 		"vstream",
@@ -102,6 +116,7 @@ var (
 		"vtgate_vindex_heavy",
 		"vtgate_vschema",
 		"vtgate_queries",
+		"vtgate_plantests",
 		"vtgate_schema_tracker",
 		"vtgate_foreignkey_stress",
 		"vtorc",
@@ -115,7 +130,9 @@ var (
 		"vreplication_v2",
 		"vreplication_partial_movetables_and_materialize",
 		"vreplication_foreign_key_stress",
-		"vreplication_migrate_vdiff2_convert_tz",
+		"vreplication_migrate",
+		"vreplication_vtctldclient_movetables_tz",
+		"vreplication_vdiff2",
 		"vreplication_multi_tenant",
 		"schemadiff_vrepl",
 		"topo_connection_cache",
@@ -152,31 +169,40 @@ var (
 		"onlineddl_vrepl_stress_suite",
 		"onlineddl_vrepl_suite",
 		"vreplication_basic",
-		"vreplication_migrate_vdiff2_convert_tz",
+		"vreplication_migrate",
+		"vreplication_vtctldclient_vdiff2_movetables_tz",
+	}
+	clusterRequiringMinio = []string{
+		"21",
 	}
 )
 
 type unitTest struct {
-	Name, Platform, FileName, Evalengine string
+	Name, RunsOn, Platform, FileName, GoPrivate, Evalengine string
 }
 
 type clusterTest struct {
 	Name, Shard, Platform              string
 	FileName                           string
 	BuildTag                           string
+	RunsOn                             string
+	GoPrivate                          string
 	MemoryCheck                        bool
 	MakeTools, InstallXtraBackup       bool
 	Docker                             bool
 	LimitResourceUsage                 bool
 	EnableBinlogTransactionCompression bool
+	EnablePartialJSON                  bool
 	PartialKeyspace                    bool
-	Cores16                            bool
+	NeedsMinio                         bool
 }
 
 type vitessTesterTest struct {
-	FileName string
-	Name     string
-	Path     string
+	FileName  string
+	Name      string
+	RunsOn    string
+	GoPrivate string
+	Path      string
 }
 
 // clusterMySQLVersions return list of mysql versions (one or more) that this cluster needs to test against
@@ -232,8 +258,10 @@ func canonnizeList(list []string) []string {
 func generateVitessTesterWorkflows(mp map[string]string, tpl string) {
 	for test, testPath := range mp {
 		tt := &vitessTesterTest{
-			Name: fmt.Sprintf("Vitess Tester (%v)", test),
-			Path: testPath,
+			Name:      fmt.Sprintf("Vitess Tester (%v)", test),
+			RunsOn:    defaultRunnerName,
+			GoPrivate: goPrivate,
+			Path:      testPath,
 		}
 
 		templateFileName := tpl
@@ -251,14 +279,16 @@ func generateClusterWorkflows(list []string, tpl string) {
 	for _, cluster := range clusters {
 		for _, mysqlVersion := range clusterMySQLVersions() {
 			test := &clusterTest{
-				Name:     fmt.Sprintf("Cluster (%s)", cluster),
-				Shard:    cluster,
-				BuildTag: buildTag[cluster],
+				Name:      fmt.Sprintf("Cluster (%s)", cluster),
+				Shard:     cluster,
+				BuildTag:  buildTag[cluster],
+				RunsOn:    defaultRunnerName,
+				GoPrivate: goPrivate,
 			}
 			cores16Clusters := canonnizeList(clusterRequiring16CoresMachines)
 			for _, cores16Cluster := range cores16Clusters {
 				if cores16Cluster == cluster {
-					test.Cores16 = true
+					test.RunsOn = cores16RunnerName
 					break
 				}
 			}
@@ -283,6 +313,13 @@ func generateClusterWorkflows(list []string, tpl string) {
 					break
 				}
 			}
+			minioClusters := canonnizeList(clusterRequiringMinio)
+			for _, minioCluster := range minioClusters {
+				if minioCluster == cluster {
+					test.NeedsMinio = true
+					break
+				}
+			}
 			if mysqlVersion == mysql57 {
 				test.Platform = string(mysql57)
 			}
@@ -291,6 +328,7 @@ func generateClusterWorkflows(list []string, tpl string) {
 			}
 			if strings.Contains(cluster, "vrepl") {
 				test.EnableBinlogTransactionCompression = true
+				test.EnablePartialJSON = true
 			}
 			mysqlVersionIndicator := ""
 			if mysqlVersion != defaultMySQLVersion && len(clusterMySQLVersions()) > 1 {
@@ -322,7 +360,9 @@ func generateUnitTestWorkflows() {
 		for _, evalengine := range []string{"1", "0"} {
 			test := &unitTest{
 				Name:       fmt.Sprintf("Unit Test (%s%s)", evalengineToString(evalengine), platform),
+				RunsOn:     defaultRunnerName,
 				Platform:   string(platform),
+				GoPrivate:  goPrivate,
 				Evalengine: evalengine,
 			}
 			test.FileName = fmt.Sprintf("unit_test_%s%s.yml", evalengineToString(evalengine), platform)

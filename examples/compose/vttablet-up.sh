@@ -95,6 +95,7 @@ rm -rf $VTDATAROOT/$tablet_dir/{mysql.sock,mysql.sock.lock}
 
 # Create mysql instances
 # Do not create mysql instance for primary if connecting to external mysql database
+#TODO: Remove underscore(_) flags in v25, replace them with dashed(-) notation
 if [[ $tablet_role != "externalprimary" ]]; then
   echo "Initing mysql for tablet: $uid role: $role external: $external.. "
   $VTROOT/bin/mysqlctld \
@@ -142,7 +143,7 @@ else
                       --restore_from_backup"
 fi
 
-
+#TODO: Remove underscore(_) flags in v25, replace them with dashed(-) notation
 echo "Starting vttablet..."
 exec $VTROOT/bin/vttablet \
   $TOPOLOGY_FLAGS \
@@ -150,7 +151,6 @@ exec $VTROOT/bin/vttablet \
   --tablet-path $alias \
   --tablet_hostname "$vthost" \
   --health_check_interval 5s \
-  --disable_active_reparents=true \
   --port $web_port \
   --grpc_port $grpc_port \
   --service_map 'grpc-queryservice,grpc-tabletmanager,grpc-updatestream' \

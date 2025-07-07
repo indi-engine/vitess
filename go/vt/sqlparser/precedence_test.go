@@ -21,6 +21,8 @@ import (
 	"testing"
 	"time"
 
+	"github.com/stretchr/testify/assert"
+
 	"github.com/stretchr/testify/require"
 )
 
@@ -84,7 +86,7 @@ func TestPlusStarPrecedence(t *testing.T) {
 			t.Error(err)
 			continue
 		}
-		expr := readable(tree.(*Select).SelectExprs[0].(*AliasedExpr).Expr)
+		expr := readable(tree.(*Select).SelectExprs.Exprs[0].(*AliasedExpr).Expr)
 		if expr != tcase.output {
 			t.Errorf("Parse: \n%s, want: \n%s", expr, tcase.output)
 		}
@@ -159,6 +161,13 @@ func TestParens(t *testing.T) {
 		{in: "10 - (2 - 1)", expected: "10 - (2 - 1)"},
 		{in: "0 <=> (1 and 0)", expected: "0 <=> (1 and 0)"},
 		{in: "(~ (1||0)) IS NULL", expected: "~(1 or 0) is null"},
+		{in: "1 not like ('a' is null)", expected: "1 not like ('a' is null)"},
+		{in: ":vtg1 not like (:vtg2 is null)", expected: ":vtg1 not like (:vtg2 is null)"},
+		{in: "a and b member of (c)", expected: "a and b member of (c)"},
+		{
+			in:       "foo is null and (bar = true or cast('1448364' as unsigned) member of (baz))",
+			expected: "foo is null and (bar = true or cast('1448364' as unsigned) member of (baz))",
+		},
 	}
 
 	parser := NewTestParser()
@@ -179,10 +188,8 @@ func TestRandom(t *testing.T) {
 	endBy := time.Now().Add(1 * time.Second)
 
 	parser := NewTestParser()
-	for {
-		if time.Now().After(endBy) {
-			break
-		}
+	for !time.Now().After(endBy) {
+
 		// Given a random expression
 		randomExpr := g.Expression(ExprGeneratorConfig{})
 		inputQ := "select " + String(randomExpr) + " from t"
@@ -195,4 +202,26 @@ func TestRandom(t *testing.T) {
 		outputOfParseResult := String(parsedInput)
 		require.Equal(t, outputOfParseResult, inputQ)
 	}
+}
+
+func TestPrecedenceOfMemberOfWithAndWithoutParser(t *testing.T) {
+	// This test was used to expose the difference in precedence between the parser and the ast formatter
+	expression := "a and b member of (c)"
+
+	// hand coded ast with the expected precedence
+	ast1 := &AndExpr{
+		Left: NewColName("a"),
+		Right: &MemberOfExpr{
+			Value:   NewColName("b"),
+			JSONArr: NewColName("c"),
+		},
+	}
+
+	assert.Equal(t, expression, String(ast1))
+
+	// Now let's try it through the parser
+	ast2, err := NewTestParser().ParseExpr(expression)
+	require.NoError(t, err)
+
+	assert.Equal(t, expression, String(ast2))
 }

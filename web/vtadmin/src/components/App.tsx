@@ -30,6 +30,7 @@ import { Stream } from './routes/stream/Stream';
 import { Workflows } from './routes/Workflows';
 import { Workflow } from './routes/workflow/Workflow';
 import { VTExplain } from './routes/VTExplain';
+import { VExplain } from './routes/VExplain';
 import { Keyspace } from './routes/keyspace/Keyspace';
 import { Tablet } from './routes/tablet/Tablet';
 import { Backups } from './routes/Backups';
@@ -40,7 +41,14 @@ import { isReadOnlyMode } from '../util/env';
 import { CreateKeyspace } from './routes/createKeyspace/CreateKeyspace';
 import { Topology } from './routes/topology/Topology';
 import { ClusterTopology } from './routes/topology/ClusterTopology';
+import { CreateMoveTables } from './routes/createWorkflow/CreateMoveTables';
 import { Transactions } from './routes/Transactions';
+import { Transaction } from './routes/transaction/Transaction';
+import { CreateReshard } from './routes/createWorkflow/CreateReshard';
+import { CreateMaterialize } from './routes/createWorkflow/CreateMaterialize';
+import { TopologyTree } from './routes/topologyTree/TopologyTree';
+import { SchemaMigrations } from './routes/SchemaMigrations';
+import { CreateSchemaMigration } from './routes/createSchemaMigration/CreateSchemaMigration';
 
 export const App = () => {
     return (
@@ -106,9 +114,31 @@ export const App = () => {
                             <VTExplain />
                         </Route>
 
-                        <Route path="/workflows">
+                        <Route path="/vexplain">
+                            <VExplain />
+                        </Route>
+
+                        <Route exact path="/workflows">
                             <Workflows />
                         </Route>
+
+                        {!isReadOnlyMode() && (
+                            <Route exact path="/workflows/movetables/create">
+                                <CreateMoveTables />
+                            </Route>
+                        )}
+
+                        {!isReadOnlyMode() && (
+                            <Route exact path="/workflows/reshard/create">
+                                <CreateReshard />
+                            </Route>
+                        )}
+
+                        {!isReadOnlyMode() && (
+                            <Route exact path="/workflows/materialize/create">
+                                <CreateMaterialize />
+                            </Route>
+                        )}
 
                         <Route path="/workflow/:clusterID/:keyspace/:workflowName/stream/:tabletCell/:tabletUID/:streamID">
                             <Stream />
@@ -118,12 +148,30 @@ export const App = () => {
                             <Workflow />
                         </Route>
 
+                        <Route exact path="/migrations">
+                            <SchemaMigrations />
+                        </Route>
+
+                        {!isReadOnlyMode() && (
+                            <Route exact path="/migrations/create">
+                                <CreateSchemaMigration />
+                            </Route>
+                        )}
+
                         <Route path="/transactions">
                             <Transactions />
                         </Route>
 
+                        <Route path="/transaction/:clusterID/:dtid">
+                            <Transaction />
+                        </Route>
+
                         <Route path="/topology/:clusterID">
                             <ClusterTopology />
+                        </Route>
+
+                        <Route path="/topologytree/:clusterID">
+                            <TopologyTree />
                         </Route>
 
                         <Route path="/topology">

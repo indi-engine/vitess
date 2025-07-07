@@ -18,13 +18,13 @@ package misc
 
 import (
 	"context"
+	"strings"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
 	"vitess.io/vitess/go/mysql"
-	"vitess.io/vitess/go/test/endtoend/cluster"
 	"vitess.io/vitess/go/test/endtoend/utils"
 )
 
@@ -44,7 +44,6 @@ func start(t *testing.T) (utils.MySQLCompare, func()) {
 	return mcmp, func() {
 		deleteAll()
 		mcmp.Close()
-		cluster.PanicHandler(t)
 	}
 }
 
@@ -69,6 +68,7 @@ func TestQueryTimeoutWithDual(t *testing.T) {
 	_, err = utils.ExecAllowError(t, mcmp.VtConn, "select /*vt+ QUERY_TIMEOUT_MS=15 */ sleep(0.001) from dual")
 	assert.NoError(t, err)
 	// infinite query timeout overriding all defaults
+	utils.SkipIfBinaryIsBelowVersion(t, 21, "vttablet")
 	_, err = utils.ExecAllowError(t, mcmp.VtConn, "select /*vt+ QUERY_TIMEOUT_MS=0 */ sleep(5) from dual")
 	assert.NoError(t, err)
 }
@@ -99,7 +99,7 @@ func TestQueryTimeoutWithTables(t *testing.T) {
 	utils.Exec(t, mcmp.VtConn, "select /*vt+ QUERY_TIMEOUT_MS=500 */ sleep(0.1) from t1 where id1 = 1")
 	_, err = utils.ExecAllowError(t, mcmp.VtConn, "select /*vt+ QUERY_TIMEOUT_MS=20 */ sleep(0.1) from t1 where id1 = 1")
 	require.Error(t, err)
-	assert.ErrorContains(t, err, "context deadline exceeded")
+	assert.ErrorContains(t, err, "DeadlineExceeded")
 	assert.ErrorContains(t, err, "(errno 1317) (sqlstate 70100)")
 }
 
@@ -112,7 +112,8 @@ func TestQueryTimeoutWithShardTargeting(t *testing.T) {
 	utils.Exec(t, mcmp.VtConn, "use `ks_misc/-80`")
 
 	// insert some data
-	utils.Exec(t, mcmp.VtConn, "insert into t1(id1, id2) values (1,2),(3,4),(4,5),(5,6)")
+	// Fix: Increased query timeout from 100ms to 1000ms to prevent timeout errors on slow runners.
+	utils.Exec(t, mcmp.VtConn, "insert /*vt+ QUERY_TIMEOUT_MS=1000 */ into t1(id1, id2) values (1,2),(3,4),(4,5),(5,6)")
 
 	queries := []string{
 		"insert /*vt+ QUERY_TIMEOUT_MS=1 */ into t1(id1, id2) values (6,sleep(5))",
@@ -124,13 +125,14 @@ func TestQueryTimeoutWithShardTargeting(t *testing.T) {
 	for _, query := range queries {
 		t.Run(query, func(t *testing.T) {
 			_, err := utils.ExecAllowError(t, mcmp.VtConn, query)
-			assert.ErrorContains(t, err, "context deadline exceeded")
+			// the error message can be different based on VTGate or VTTABLET or grpc error.
 			assert.ErrorContains(t, err, "(errno 1317) (sqlstate 70100)")
 		})
 	}
 }
 
 func TestQueryTimeoutWithoutVTGateDefault(t *testing.T) {
+	utils.SkipIfBinaryIsBelowVersion(t, 21, "vttablet")
 	// disable query timeout
 	clusterInstance.VtGateExtraArgs = append(clusterInstance.VtGateExtraArgs,
 		"--query-timeout", "0")
@@ -184,6 +186,7 @@ func TestQueryTimeoutWithoutVTGateDefault(t *testing.T) {
 // and not just individual routes.
 func TestOverallQueryTimeout(t *testing.T) {
 	utils.SkipIfBinaryIsBelowVersion(t, 21, "vtgate")
+	utils.SkipIfBinaryIsBelowVersion(t, 21, "vttablet")
 	mcmp, closer := start(t)
 	defer closer()
 
@@ -194,13 +197,19 @@ func TestOverallQueryTimeout(t *testing.T) {
 	// take 2 and 3 seconds each to run. If we have an overall timeout for 4 seconds, then it should fail.
 	_, err := utils.ExecAllowError(t, mcmp.VtConn, "select /*vt+ QUERY_TIMEOUT_MS=4000 */ sleep(u2.id2), u1.id2 from t1 u1 join t1 u2 where u1.id2 = u2.id1")
 	assert.Error(t, err)
-	assert.ErrorContains(t, err, "DeadlineExceeded desc = context deadline exceeded (errno 1317) (sqlstate 70100)")
+	// We can get two different error messages based on whether it is coming from vttablet or vtgate
+	deadLineExceeded := "DeadlineExceeded desc"
+	if !strings.Contains(err.Error(), "Query execution was interrupted, maximum statement execution time exceeded") {
+		assert.ErrorContains(t, err, deadLineExceeded)
+	}
 
 	// Let's also check that setting the session variable also works.
 	utils.Exec(t, mcmp.VtConn, "set query_timeout=4000")
 	_, err = utils.ExecAllowError(t, mcmp.VtConn, "select sleep(u2.id2), u1.id2 from t1 u1 join t1 u2 where u1.id2 = u2.id1")
 	assert.Error(t, err)
-	assert.ErrorContains(t, err, "DeadlineExceeded desc = context deadline exceeded (errno 1317) (sqlstate 70100)")
+	if !strings.Contains(err.Error(), "Query execution was interrupted, maximum statement execution time exceeded") {
+		assert.ErrorContains(t, err, deadLineExceeded)
+	}
 
 	// Increasing the timeout should pass the query.
 	utils.Exec(t, mcmp.VtConn, "set query_timeout=10000")

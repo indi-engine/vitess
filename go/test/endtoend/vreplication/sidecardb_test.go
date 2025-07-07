@@ -14,7 +14,7 @@ import (
 const GetCurrentTablesQuery = "show tables from _vt"
 
 func getSidecarDBTables(t *testing.T, tabletID string) (numTablets int, tables []string) {
-	output, err := vc.VtctlClient.ExecuteCommandWithOutput("ExecuteFetchAsDba", "--", "--json", tabletID, GetCurrentTablesQuery)
+	output, err := vc.VtctldClient.ExecuteCommandWithOutput("ExecuteFetchAsDBA", "--json", tabletID, GetCurrentTablesQuery)
 	require.NoError(t, err)
 	result := gjson.Get(output, "rows")
 	require.NotNil(t, result)
@@ -38,7 +38,7 @@ var ddls1, ddls2 []string
 
 func init() {
 	sidecarDBTables = []string{"copy_state", "dt_participant", "dt_state", "heartbeat", "post_copy_action",
-		"redo_state", "redo_statement", "reparent_journal", "resharding_journal", "schema_migrations", "schema_version",
+		"redo_state", "redo_statement", "reparent_journal", "resharding_journal", "schema_migrations", "schema_version", "semisync_heartbeat",
 		"tables", "udfs", "vdiff", "vdiff_log", "vdiff_table", "views", "vreplication", "vreplication_log"}
 	numSidecarDBTables = len(sidecarDBTables)
 	ddls1 = []string{
@@ -51,7 +51,7 @@ func init() {
 }
 
 func prs(t *testing.T, keyspace, shard string) {
-	_, err := vc.VtctldClient.ExecuteCommandWithOutput("PlannedReparentShard", "--", fmt.Sprintf("%s/%s", keyspace, shard))
+	_, err := vc.VtctldClient.ExecuteCommandWithOutput("PlannedReparentShard", fmt.Sprintf("%s/%s", keyspace, shard))
 	require.NoError(t, err)
 }
 
@@ -91,7 +91,7 @@ func TestSidecarDB(t *testing.T) {
 
 		prs(t, keyspace, shard)
 		currentPrimary = tablet101
-		expectedChanges100 += numChanges
+		expectedChanges101 += numChanges
 		validateSidecarDBTables(t, tablet100, sidecarDBTables)
 		validateSidecarDBTables(t, tablet101, sidecarDBTables)
 		require.Equal(t, expectedChanges100, getNumExecutedDDLQueries(t, tablet100Port))
@@ -100,7 +100,7 @@ func TestSidecarDB(t *testing.T) {
 
 	t.Run("modify schema, prs, and self heal on new primary", func(t *testing.T) {
 		numChanges := modifySidecarDBSchema(t, vc, currentPrimary, ddls1)
-		expectedChanges101 += numChanges
+		expectedChanges100 += numChanges
 		prs(t, keyspace, shard)
 		// nolint
 		currentPrimary = tablet100
@@ -118,7 +118,7 @@ func validateSidecarDBTables(t *testing.T, tabletID string, tables []string) {
 
 func modifySidecarDBSchema(t *testing.T, vc *VitessCluster, tabletID string, ddls []string) (numChanges int) {
 	for _, ddl := range ddls {
-		output, err := vc.VtctlClient.ExecuteCommandWithOutput("ExecuteFetchAsDba", "--", tabletID, ddl)
+		output, err := vc.VtctldClient.ExecuteCommandWithOutput("ExecuteFetchAsDBA", tabletID, ddl)
 		require.NoErrorf(t, err, output)
 	}
 	return len(ddls)

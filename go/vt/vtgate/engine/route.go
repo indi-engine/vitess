@@ -37,7 +37,6 @@ import (
 	"vitess.io/vitess/go/vt/vtgate/vindexes"
 
 	querypb "vitess.io/vitess/go/vt/proto/query"
-	topodatapb "vitess.io/vitess/go/vt/proto/topodata"
 )
 
 var _ Primitive = (*Route)(nil)
@@ -58,15 +57,8 @@ type Route struct {
 	// Route does not need transaction handling
 	noTxNeeded
 
-	// TargetTabletType specifies an explicit target destination tablet type
-	// this is only used in conjunction with TargetDestination
-	TargetTabletType topodatapb.TabletType
-
 	// Query specifies the query to be executed.
 	Query string
-
-	// TableName specifies the tables to send the query to.
-	TableName string
 
 	// FieldQuery specifies the query to be executed for a GetFieldInfo request.
 	FieldQuery string
@@ -95,6 +87,8 @@ type Route struct {
 	// select count(*) from tbl where lookupColumn = 'not there'
 	// select exists(<subq>)
 	NoRoutesSpecialHandling bool
+
+	FetchLastInsertID bool
 }
 
 // NewRoute creates a Route.
@@ -113,42 +107,8 @@ var (
 	partialSuccessScatterQueries = stats.NewCounter("PartialSuccessScatterQueries", "Count of partially successful scatter queries")
 )
 
-// RouteType returns a description of the query routing type used by the primitive
-func (route *Route) RouteType() string {
-	return route.Opcode.String()
-}
-
-// GetKeyspaceName specifies the Keyspace that this primitive routes to.
-func (route *Route) GetKeyspaceName() string {
-	return route.Keyspace.Name
-}
-
-// GetTableName specifies the table that this primitive routes to.
-func (route *Route) GetTableName() string {
-	return route.TableName
-}
-
 // TryExecute performs a non-streaming exec.
 func (route *Route) TryExecute(ctx context.Context, vcursor VCursor, bindVars map[string]*querypb.BindVariable, wantfields bool) (*sqltypes.Result, error) {
-	qr, err := route.executeInternal(ctx, vcursor, bindVars, wantfields)
-	if err != nil {
-		return nil, err
-	}
-	return qr.Truncate(route.TruncateColumnCount), nil
-}
-
-type cxtKey int
-
-const (
-	IgnoreReserveTxn cxtKey = iota
-)
-
-func (route *Route) executeInternal(
-	ctx context.Context,
-	vcursor VCursor,
-	bindVars map[string]*querypb.BindVariable,
-	wantfields bool,
-) (*sqltypes.Result, error) {
 	rss, bvs, err := route.findRoute(ctx, vcursor, bindVars)
 	if err != nil {
 		return nil, err
@@ -156,6 +116,12 @@ func (route *Route) executeInternal(
 
 	return route.executeShards(ctx, vcursor, bindVars, wantfields, rss, bvs)
 }
+
+type cxtKey int
+
+const (
+	IgnoreReserveTxn cxtKey = iota
+)
 
 func (route *Route) executeShards(
 	ctx context.Context,
@@ -194,7 +160,7 @@ func (route *Route) executeShards(
 	}
 
 	queries := getQueries(route.Query, bvs)
-	result, errs := vcursor.ExecuteMultiShard(ctx, route, rss, queries, false /* rollbackOnError */, false /* canAutocommit */)
+	result, errs := vcursor.ExecuteMultiShard(ctx, route, rss, queries, false /*rollbackOnError*/, false /*canAutocommit*/, route.FetchLastInsertID)
 
 	route.executeWarmingReplicaRead(ctx, vcursor, bindVars, queries)
 
@@ -212,11 +178,15 @@ func (route *Route) executeShards(
 		}
 	}
 
-	if len(route.OrderBy) == 0 {
-		return result, nil
+	if len(route.OrderBy) > 0 && len(rss) > 1 {
+		var err error
+		result, err = route.sort(result)
+		if err != nil {
+			return nil, err
+		}
 	}
 
-	return route.sort(result)
+	return result.Truncate(route.TruncateColumnCount), nil
 }
 
 func filterOutNilErrors(errs []error) []error {
@@ -286,8 +256,8 @@ func (route *Route) streamExecuteShards(
 		}
 	}
 
-	if len(route.OrderBy) == 0 {
-		errs := vcursor.StreamExecuteMulti(ctx, route, route.Query, rss, bvs, false /* rollbackOnError */, false /* autocommit */, func(qr *sqltypes.Result) error {
+	if len(route.OrderBy) == 0 || len(rss) == 1 {
+		errs := vcursor.StreamExecuteMulti(ctx, route, route.Query, rss, bvs, false /* rollbackOnError */, false /* autocommit */, route.FetchLastInsertID, func(qr *sqltypes.Result) error {
 			return callback(qr.Truncate(route.TruncateColumnCount))
 		})
 		if len(errs) > 0 {
@@ -305,6 +275,21 @@ func (route *Route) streamExecuteShards(
 
 	// There is an order by. We have to merge-sort.
 	return route.mergeSort(ctx, vcursor, bindVars, wantfields, callback, rss, bvs)
+}
+
+// this is used to make mergeSort easy to test
+var createMergeSort = func(
+	prims []StreamExecutor,
+	orderBy evalengine.Comparison,
+	scatterErrorsAsWarnings bool,
+	fetchLastInsertID bool,
+) *MergeSort {
+	return &MergeSort{
+		Primitives:              prims,
+		OrderBy:                 orderBy,
+		ScatterErrorsAsWarnings: scatterErrorsAsWarnings,
+		FetchLastInsertID:       fetchLastInsertID,
+	}
 }
 
 func (route *Route) mergeSort(
@@ -325,12 +310,9 @@ func (route *Route) mergeSort(
 			primitive: route,
 		})
 	}
-	ms := MergeSort{
-		Primitives:              prims,
-		OrderBy:                 route.OrderBy,
-		ScatterErrorsAsWarnings: route.ScatterErrorsAsWarnings,
-	}
-	return vcursor.StreamExecutePrimitive(ctx, &ms, bindVars, wantfields, func(qr *sqltypes.Result) error {
+
+	ms := createMergeSort(prims, route.OrderBy, route.ScatterErrorsAsWarnings, route.FetchLastInsertID)
+	return vcursor.StreamExecutePrimitive(ctx, ms, bindVars, wantfields, func(qr *sqltypes.Result) error {
 		return callback(qr.Truncate(route.TruncateColumnCount))
 	})
 }
@@ -350,7 +332,7 @@ func (route *Route) GetFields(ctx context.Context, vcursor VCursor, bindVars map
 
 	// If not find, then pick any shard.
 	if rs == nil {
-		rss, _, err := vcursor.ResolveDestinations(ctx, route.Keyspace.Name, nil, []key.Destination{key.DestinationAnyShard{}})
+		rss, _, err := vcursor.ResolveDestinations(ctx, route.Keyspace.Name, nil, []key.ShardDestination{key.DestinationAnyShard{}})
 		if err != nil {
 			return nil, err
 		}
@@ -360,7 +342,7 @@ func (route *Route) GetFields(ctx context.Context, vcursor VCursor, bindVars map
 		}
 		rs = rss[0]
 	}
-	qr, err := execShard(ctx, route, vcursor, route.FieldQuery, bindVars, rs, false /* rollbackOnError */, false /* canAutocommit */)
+	qr, err := execShard(ctx, route, vcursor, route.FieldQuery, bindVars, rs, false /* rollbackOnError */, false /* canAutocommit */, route.FetchLastInsertID)
 	if err != nil {
 		return nil, err
 	}
@@ -373,17 +355,17 @@ func (route *Route) sort(in *sqltypes.Result) (*sqltypes.Result, error) {
 	// the contents of any row.
 	out := in.ShallowCopy()
 
-	if err := route.OrderBy.SortResult(out); err != nil {
-		return nil, err
-	}
-	return out.Truncate(route.TruncateColumnCount), nil
+	err := route.OrderBy.SortResult(out)
+	return out, err
 }
 
 func (route *Route) description() PrimitiveDescription {
 	other := map[string]any{
 		"Query":      route.Query,
-		"Table":      route.GetTableName(),
 		"FieldQuery": route.FieldQuery,
+	}
+	if route.FetchLastInsertID {
+		other["FetchLastInsertID"] = true
 	}
 	if route.Vindex != nil {
 		other["Vindex"] = route.Vindex.String()
@@ -442,7 +424,7 @@ func (route *Route) executeAfterLookup(
 	bindVars map[string]*querypb.BindVariable,
 	wantfields bool,
 	ids []sqltypes.Value,
-	dest []key.Destination,
+	dest []key.ShardDestination,
 ) (*sqltypes.Result, error) {
 	protoIds := make([]*querypb.Value, 0, len(ids))
 	for _, id := range ids {
@@ -466,7 +448,7 @@ func (route *Route) streamExecuteAfterLookup(
 	wantfields bool,
 	callback func(*sqltypes.Result) error,
 	ids []sqltypes.Value,
-	dest []key.Destination,
+	dest []key.ShardDestination,
 ) error {
 	protoIds := make([]*querypb.Value, 0, len(ids))
 	for _, id := range ids {
@@ -490,7 +472,7 @@ func execShard(
 	query string,
 	bindVars map[string]*querypb.BindVariable,
 	rs *srvtopo.ResolvedShard,
-	rollbackOnError, canAutocommit bool,
+	rollbackOnError, canAutocommit, fetchLastInsertID bool,
 ) (*sqltypes.Result, error) {
 	autocommit := canAutocommit && vcursor.AutocommitApproval()
 	result, errs := vcursor.ExecuteMultiShard(ctx, primitive, []*srvtopo.ResolvedShard{rs}, []*querypb.BoundQuery{
@@ -498,7 +480,7 @@ func execShard(
 			Sql:           query,
 			BindVariables: bindVars,
 		},
-	}, rollbackOnError, autocommit)
+	}, rollbackOnError, autocommit, fetchLastInsertID)
 	return result, vterrors.Aggregate(errs)
 }
 
@@ -545,7 +527,7 @@ func (route *Route) executeWarmingReplicaRead(ctx context.Context, vcursor VCurs
 				return
 			}
 
-			_, errs := replicaVCursor.ExecuteMultiShard(ctx, route, rss, queries, false /* rollbackOnError */, false /* autocommit */)
+			_, errs := replicaVCursor.ExecuteMultiShard(ctx, route, rss, queries, false /*rollbackOnError*/, false /*canAutocommit*/, route.FetchLastInsertID)
 			if len(errs) > 0 {
 				log.Warningf("Failed to execute warming replica read: %v", errs)
 			} else {

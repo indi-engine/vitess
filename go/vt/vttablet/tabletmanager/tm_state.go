@@ -32,11 +32,14 @@ import (
 	"vitess.io/vitess/go/vt/key"
 	"vitess.io/vitess/go/vt/log"
 	"vitess.io/vitess/go/vt/mysqlctl"
+	"vitess.io/vitess/go/vt/proto/vttime"
 	"vitess.io/vitess/go/vt/servenv"
 	"vitess.io/vitess/go/vt/topo"
 	"vitess.io/vitess/go/vt/topo/topoproto"
 	"vitess.io/vitess/go/vt/topotools"
+	"vitess.io/vitess/go/vt/utils"
 	"vitess.io/vitess/go/vt/vterrors"
+	"vitess.io/vitess/go/vt/vttablet/tabletserver"
 	"vitess.io/vitess/go/vt/vttablet/tabletserver/rules"
 
 	topodatapb "vitess.io/vitess/go/vt/proto/topodata"
@@ -45,7 +48,7 @@ import (
 var publishRetryInterval = 30 * time.Second
 
 func registerStateFlags(fs *pflag.FlagSet) {
-	fs.DurationVar(&publishRetryInterval, "publish_retry_interval", publishRetryInterval, "how long vttablet waits to retry publishing the tablet record")
+	utils.SetFlagDurationVar(fs, &publishRetryInterval, "publish-retry-interval", publishRetryInterval, "how long vttablet waits to retry publishing the tablet record")
 }
 
 func init() {
@@ -135,11 +138,10 @@ func (ts *tmState) RefreshFromTopo(ctx context.Context) error {
 	if err != nil {
 		return err
 	}
-	ts.RefreshFromTopoInfo(ctx, shardInfo, srvKeyspace)
-	return nil
+	return ts.RefreshFromTopoInfo(ctx, shardInfo, srvKeyspace)
 }
 
-func (ts *tmState) RefreshFromTopoInfo(ctx context.Context, shardInfo *topo.ShardInfo, srvKeyspace *topodatapb.SrvKeyspace) {
+func (ts *tmState) RefreshFromTopoInfo(ctx context.Context, shardInfo *topo.ShardInfo, srvKeyspace *topodatapb.SrvKeyspace) error {
 	ts.mu.Lock()
 	defer ts.mu.Unlock()
 
@@ -157,6 +159,7 @@ func (ts *tmState) RefreshFromTopoInfo(ctx context.Context, shardInfo *topo.Shar
 	if srvKeyspace != nil {
 		ts.isShardServing = make(map[topodatapb.TabletType]bool)
 		ts.tabletControls = make(map[topodatapb.TabletType]bool)
+		ts.tm.QueryServiceControl.SetTwoPCAllowed(tabletserver.TwoPCAllowed_TabletControls, true)
 
 		for _, partition := range srvKeyspace.GetPartitions() {
 
@@ -169,7 +172,10 @@ func (ts *tmState) RefreshFromTopoInfo(ctx context.Context, shardInfo *topo.Shar
 			for _, tabletControl := range partition.GetShardTabletControls() {
 				if key.KeyRangeEqual(tabletControl.GetKeyRange(), ts.KeyRange()) {
 					if tabletControl.QueryServiceDisabled {
-						ts.tabletControls[partition.GetServedType()] = true
+						err := ts.prepareForDisableQueryService(ctx, partition.GetServedType())
+						if err != nil {
+							return err
+						}
 					}
 					break
 				}
@@ -177,7 +183,20 @@ func (ts *tmState) RefreshFromTopoInfo(ctx context.Context, shardInfo *topo.Shar
 		}
 	}
 
-	_ = ts.updateLocked(ctx)
+	return ts.updateLocked(ctx)
+}
+
+// prepareForDisableQueryService prepares the tablet for disabling query service.
+func (ts *tmState) prepareForDisableQueryService(ctx context.Context, servType topodatapb.TabletType) error {
+	if servType == topodatapb.TabletType_PRIMARY {
+		ts.tm.QueryServiceControl.SetTwoPCAllowed(tabletserver.TwoPCAllowed_TabletControls, false)
+		err := ts.tm.QueryServiceControl.WaitForPreparedTwoPCTransactions(ctx)
+		if err != nil {
+			return err
+		}
+	}
+	ts.tabletControls[servType] = true
+	return nil
 }
 
 func (ts *tmState) ChangeTabletType(ctx context.Context, tabletType topodatapb.TabletType, action DBAction) error {
@@ -185,11 +204,12 @@ func (ts *tmState) ChangeTabletType(ctx context.Context, tabletType topodatapb.T
 	defer ts.mu.Unlock()
 	log.Infof("Changing Tablet Type: %v for %s", tabletType, ts.tablet.Alias.String())
 
+	var primaryTermStartTime *vttime.Time
 	if tabletType == topodatapb.TabletType_PRIMARY {
-		PrimaryTermStartTime := protoutil.TimeToProto(time.Now())
+		primaryTermStartTime = protoutil.TimeToProto(time.Now())
 
 		// Update the tablet record first.
-		_, err := topotools.ChangeType(ctx, ts.tm.TopoServer, ts.tm.tabletAlias, tabletType, PrimaryTermStartTime)
+		_, err := topotools.ChangeType(ctx, ts.tm.TopoServer, ts.tm.tabletAlias, tabletType, primaryTermStartTime)
 		if err != nil {
 			log.Errorf("Error changing type in topo record for tablet %s :- %v\nWill keep trying to read from the toposerver", topoproto.TabletAliasString(ts.tm.tabletAlias), err)
 			// In case of a topo error, we aren't sure if the data has been written or not.
@@ -204,7 +224,7 @@ func (ts *tmState) ChangeTabletType(ctx context.Context, tabletType topodatapb.T
 					<-time.After(100 * time.Millisecond)
 					continue
 				}
-				if ti.Type == tabletType && proto.Equal(ti.PrimaryTermStartTime, PrimaryTermStartTime) {
+				if ti.Type == tabletType && proto.Equal(ti.PrimaryTermStartTime, primaryTermStartTime) {
 					log.Infof("Tablet record in toposerver matches, continuing operation")
 					break
 				}
@@ -212,18 +232,26 @@ func (ts *tmState) ChangeTabletType(ctx context.Context, tabletType topodatapb.T
 				return err
 			}
 		}
+	}
 
+	err := ts.updateTypeAndPublish(ctx, tabletType, primaryTermStartTime, action)
+	return err
+}
+
+// updateTypeAndPublish updates the tablet type in the internal state, and publishes the changes.
+func (ts *tmState) updateTypeAndPublish(ctx context.Context, tabletType topodatapb.TabletType, primaryTermStartTime *vttime.Time, action DBAction) error {
+	if tabletType == topodatapb.TabletType_PRIMARY {
 		if action == DBActionSetReadWrite {
 			// We need to redo the prepared transactions in read only mode using the dba user to ensure we don't lose them.
 			// We call SetReadOnly only after the topo has been updated to avoid
 			// situations where two tablets are primary at the DB level but not at the vitess level
-			if err = ts.tm.redoPreparedTransactionsAndSetReadWrite(ctx); err != nil {
+			if err := ts.tm.redoPreparedTransactionsAndSetReadWrite(ctx); err != nil {
 				return err
 			}
 		}
 
 		ts.tablet.Type = tabletType
-		ts.tablet.PrimaryTermStartTime = PrimaryTermStartTime
+		ts.tablet.PrimaryTermStartTime = primaryTermStartTime
 	} else {
 		ts.tablet.Type = tabletType
 		ts.tablet.PrimaryTermStartTime = nil
@@ -238,6 +266,17 @@ func (ts *tmState) ChangeTabletType(ctx context.Context, tabletType topodatapb.T
 	ts.publishStateLocked(ctx)
 	ts.tm.notifyShardSync()
 	return err
+}
+
+func (ts *tmState) ChangeTabletTags(ctx context.Context, tabletTags map[string]string) {
+	ts.mu.Lock()
+	defer ts.mu.Unlock()
+	log.Infof("Changing Tablet Tags: %v for %s", tabletTags, ts.tablet.Alias.String())
+
+	ts.tablet.Tags = tabletTags
+	ts.publishStateLocked(ctx)
+	ts.publishForDisplay()
+	setTabletTagsStats(ts.tablet)
 }
 
 func (ts *tmState) SetMysqlPort(mport int32) {

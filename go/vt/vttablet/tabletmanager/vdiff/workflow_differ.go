@@ -21,6 +21,7 @@ import (
 	"errors"
 	"fmt"
 	"reflect"
+	"slices"
 	"strings"
 	"time"
 
@@ -33,6 +34,7 @@ import (
 	"vitess.io/vitess/go/vt/log"
 	"vitess.io/vitess/go/vt/schema"
 	"vitess.io/vitess/go/vt/sqlparser"
+	"vitess.io/vitess/go/vt/topo"
 	"vitess.io/vitess/go/vt/vtctl/schematools"
 	"vitess.io/vitess/go/vt/vterrors"
 	"vitess.io/vitess/go/vt/vtgate/vindexes"
@@ -40,7 +42,6 @@ import (
 	"vitess.io/vitess/go/vt/vttablet/tabletmanager/vreplication"
 
 	binlogdatapb "vitess.io/vitess/go/vt/proto/binlogdata"
-	querypb "vitess.io/vitess/go/vt/proto/query"
 	tabletmanagerdatapb "vitess.io/vitess/go/vt/proto/tabletmanagerdata"
 	vtrpcpb "vitess.io/vitess/go/vt/proto/vtrpc"
 )
@@ -69,11 +70,18 @@ func newWorkflowDiffer(ct *controller, opts *tabletmanagerdatapb.VDiffOptions, c
 	return wd, nil
 }
 
-// If the only difference is the order in which the rows were returned
-// by MySQL on each side then we'll have the same number of extras on
-// both sides. If that's the case, then let's see if the extra rows on
-// both sides are actually different.
+// reconcileExtraRows compares the extra rows in the source and target tables. If there are any matching rows, they are
+// removed from the extra rows. The number of extra rows to compare is limited by vdiff option maxExtraRowsToCompare.
 func (wd *workflowDiffer) reconcileExtraRows(dr *DiffReport, maxExtraRowsToCompare int64, maxReportSampleRows int64) error {
+	err := wd.reconcileReferenceTables(dr)
+	if err != nil {
+		return err
+	}
+
+	return wd.doReconcileExtraRows(dr, maxExtraRowsToCompare, maxReportSampleRows)
+}
+
+func (wd *workflowDiffer) reconcileReferenceTables(dr *DiffReport) error {
 	if dr.MismatchedRows == 0 {
 		// Get the VSchema on the target and source keyspaces. We can then use this
 		// for handling additional edge cases, such as adjusting results for reference
@@ -104,41 +112,84 @@ func (wd *workflowDiffer) reconcileExtraRows(dr *DiffReport, maxExtraRowsToCompa
 			dr.ExtraRowsTargetDiffs = nil
 		}
 	}
+	return nil
+}
 
-	if (dr.ExtraRowsSource == dr.ExtraRowsTarget) && (dr.ExtraRowsSource <= maxExtraRowsToCompare) {
-		for i := 0; i < len(dr.ExtraRowsSourceDiffs); i++ {
-			foundMatch := false
-			for j := 0; j < len(dr.ExtraRowsTargetDiffs); j++ {
-				if reflect.DeepEqual(dr.ExtraRowsSourceDiffs[i], dr.ExtraRowsTargetDiffs[j]) {
-					dr.ExtraRowsSourceDiffs = append(dr.ExtraRowsSourceDiffs[:i], dr.ExtraRowsSourceDiffs[i+1:]...)
-					dr.ExtraRowsTargetDiffs = append(dr.ExtraRowsTargetDiffs[:j], dr.ExtraRowsTargetDiffs[j+1:]...)
-					dr.ExtraRowsSource--
-					dr.ExtraRowsTarget--
-					dr.ProcessedRows--
-					dr.MatchingRows++
-					// We've removed an element from both slices at the current index
-					// so we need to shift the counters back as well to process the
-					// new elements at the index and avoid using an index out of range.
-					i--
-					j--
-					foundMatch = true
-					break
-				}
+func (wd *workflowDiffer) doReconcileExtraRows(dr *DiffReport, maxExtraRowsToCompare int64, maxReportSampleRows int64) error {
+	if dr.ExtraRowsSource == 0 || dr.ExtraRowsTarget == 0 {
+		return nil
+	}
+	matchedSourceDiffs := make([]bool, int(dr.ExtraRowsSource))
+	matchedTargetDiffs := make([]bool, int(dr.ExtraRowsTarget))
+	matchedDiffs := int64(0)
+
+	maxRows := int(dr.ExtraRowsSource)
+	if maxRows > int(maxExtraRowsToCompare) {
+		maxRows = int(maxExtraRowsToCompare)
+	}
+	log.Infof("Reconciling extra rows for table %s in vdiff %s, extra source rows %d, extra target rows %d, max rows %d",
+		dr.TableName, wd.ct.uuid, dr.ExtraRowsSource, dr.ExtraRowsTarget, maxRows)
+
+	// Find the matching extra rows
+	for i := 0; i < maxRows; i++ {
+		for j := 0; j < int(dr.ExtraRowsTarget); j++ {
+			if matchedTargetDiffs[j] {
+				// previously matched
+				continue
 			}
-			// If we didn't find a match then the tables are in fact different and we can short circuit the second pass
-			if !foundMatch {
+			if reflect.DeepEqual(dr.ExtraRowsSourceDiffs[i], dr.ExtraRowsTargetDiffs[j]) {
+				matchedSourceDiffs[i] = true
+				matchedTargetDiffs[j] = true
+				matchedDiffs++
 				break
 			}
 		}
 	}
-	// We can now trim the extra rows diffs on both sides to the maxReportSampleRows value
+
+	if matchedDiffs == 0 {
+		log.Infof("No matching extra rows found for table %s in vdiff %s, checked %d rows",
+			dr.TableName, maxRows, wd.ct.uuid)
+	} else {
+		// Now remove the matching extra rows
+		newExtraRowsSourceDiffs := make([]*RowDiff, 0, dr.ExtraRowsSource-matchedDiffs)
+		newExtraRowsTargetDiffs := make([]*RowDiff, 0, dr.ExtraRowsTarget-matchedDiffs)
+		for i := 0; i < int(dr.ExtraRowsSource); i++ {
+			if !matchedSourceDiffs[i] {
+				newExtraRowsSourceDiffs = append(newExtraRowsSourceDiffs, dr.ExtraRowsSourceDiffs[i])
+			}
+			if len(newExtraRowsSourceDiffs) >= maxRows {
+				break
+			}
+		}
+		for i := 0; i < int(dr.ExtraRowsTarget); i++ {
+			if !matchedTargetDiffs[i] {
+				newExtraRowsTargetDiffs = append(newExtraRowsTargetDiffs, dr.ExtraRowsTargetDiffs[i])
+			}
+			if len(newExtraRowsTargetDiffs) >= maxRows {
+				break
+			}
+		}
+		dr.ExtraRowsSourceDiffs = newExtraRowsSourceDiffs
+		dr.ExtraRowsTargetDiffs = newExtraRowsTargetDiffs
+
+		// Update the counts
+		dr.ExtraRowsSource = int64(len(dr.ExtraRowsSourceDiffs))
+		dr.ExtraRowsTarget = int64(len(dr.ExtraRowsTargetDiffs))
+		dr.MatchingRows += matchedDiffs
+		dr.MismatchedRows -= matchedDiffs
+		dr.ProcessedRows += matchedDiffs
+		log.Infof("Reconciled extra rows for table %s in vdiff %s, matching rows %d, extra source rows %d, extra target rows %d. Max compared rows %d",
+			dr.TableName, wd.ct.uuid, matchedDiffs, dr.ExtraRowsSource, dr.ExtraRowsTarget, maxRows)
+	}
+
+	// Trim the extra rows diffs to the maxReportSampleRows value. Note we need to do this after updating
+	// the slices and counts above, since maxExtraRowsToCompare can be greater than maxVDiffReportSampleRows.
 	if int64(len(dr.ExtraRowsSourceDiffs)) > maxReportSampleRows && maxReportSampleRows > 0 {
 		dr.ExtraRowsSourceDiffs = dr.ExtraRowsSourceDiffs[:maxReportSampleRows-1]
 	}
 	if int64(len(dr.ExtraRowsTargetDiffs)) > maxReportSampleRows && maxReportSampleRows > 0 {
 		dr.ExtraRowsTargetDiffs = dr.ExtraRowsTargetDiffs[:maxReportSampleRows-1]
 	}
-
 	return nil
 }
 
@@ -344,7 +395,7 @@ func (wd *workflowDiffer) buildPlan(dbClient binlogplayer.DBClient, filter *binl
 
 	for _, table := range schm.TableDefinitions {
 		// if user specified tables explicitly only use those, otherwise diff all tables in workflow
-		if len(specifiedTables) != 0 && !stringListContains(specifiedTables, table.Name) {
+		if len(specifiedTables) != 0 && !slices.Contains(specifiedTables, table.Name) {
 			continue
 		}
 		if schema.IsInternalOperationTableName(table.Name) && !schema.IsOnlineDDLTableName(table.Name) {
@@ -370,14 +421,23 @@ func (wd *workflowDiffer) buildPlan(dbClient binlogplayer.DBClient, filter *binl
 		}
 
 		td := newTableDiffer(wd, table, sourceQuery)
-		lastpkpb, err := wd.getTableLastPK(dbClient, table.Name)
+		lastPK, err := wd.getTableLastPK(dbClient, table.Name)
 		if err != nil {
 			return err
 		}
-		td.lastPK = lastpkpb
+		if lastPK != nil {
+			td.lastSourcePK = lastPK.Source
+			td.lastTargetPK = lastPK.Target
+		}
 		wd.tableDiffers[table.Name] = td
 		if _, err := td.buildTablePlan(dbClient, wd.ct.vde.dbName, wd.collationEnv); err != nil {
 			return err
+		}
+		// We get the PK columns from the source schema as well as they can differ
+		// and they determine the proper position to use when saving our progress.
+		if err := td.getSourcePKCols(); err != nil {
+			return vterrors.Wrapf(err, "could not get the primary key columns from the %s source keyspace",
+				wd.ct.sourceKeyspace)
 		}
 	}
 	if len(wd.tableDiffers) == 0 {
@@ -388,7 +448,7 @@ func (wd *workflowDiffer) buildPlan(dbClient binlogplayer.DBClient, filter *binl
 }
 
 // getTableLastPK gets the lastPK protobuf message for a given vdiff table.
-func (wd *workflowDiffer) getTableLastPK(dbClient binlogplayer.DBClient, tableName string) (*querypb.QueryResult, error) {
+func (wd *workflowDiffer) getTableLastPK(dbClient binlogplayer.DBClient, tableName string) (*tabletmanagerdatapb.VDiffTableLastPK, error) {
 	query, err := sqlparser.ParseAndBind(sqlGetVDiffTable,
 		sqltypes.Int64BindVariable(wd.ct.id),
 		sqltypes.StringBindVariable(tableName),
@@ -406,11 +466,15 @@ func (wd *workflowDiffer) getTableLastPK(dbClient binlogplayer.DBClient, tableNa
 			return nil, err
 		}
 		if len(lastpk) != 0 {
-			var lastpkpb querypb.QueryResult
-			if err := prototext.Unmarshal(lastpk, &lastpkpb); err != nil {
-				return nil, err
+			lastPK := &tabletmanagerdatapb.VDiffTableLastPK{}
+			if err := prototext.Unmarshal(lastpk, lastPK); err != nil {
+				return nil, vterrors.Wrapf(err, "failed to unmarshal lastpk value of %s for the %s table",
+					string(lastpk), tableName)
 			}
-			return &lastpkpb, nil
+			if lastPK.Source == nil { // Then it's the same as the target
+				lastPK.Source = lastPK.Target
+			}
+			return lastPK, nil
 		}
 	}
 	return nil, nil
@@ -487,4 +551,15 @@ func (wd *workflowDiffer) initVDiffTables(dbClient binlogplayer.DBClient) error 
 		}
 	}
 	return nil
+}
+
+// getSourceTopoServer returns the source topo server as for Mount+Migrate the
+// source tablets will be in a different Vitess cluster with its own TopoServer.
+func (wd *workflowDiffer) getSourceTopoServer() (*topo.Server, error) {
+	if wd.ct.externalCluster == "" {
+		return wd.ct.ts, nil
+	}
+	ctx, cancel := context.WithTimeout(wd.ct.vde.ctx, topo.RemoteOperationTimeout)
+	defer cancel()
+	return wd.ct.ts.OpenExternalVitessClusterServer(ctx, wd.ct.externalCluster)
 }

@@ -27,6 +27,7 @@ import (
 	"vitess.io/vitess/go/vt/callerid"
 	"vitess.io/vitess/go/vt/grpcclient"
 	"vitess.io/vitess/go/vt/servenv"
+	"vitess.io/vitess/go/vt/utils"
 	"vitess.io/vitess/go/vt/vterrors"
 	"vitess.io/vitess/go/vt/vtgate/vtgateconn"
 
@@ -60,11 +61,11 @@ func init() {
 }
 
 func registerFlags(fs *pflag.FlagSet) {
-	fs.StringVar(&cert, "vtgate_grpc_cert", "", "the cert to use to connect")
-	fs.StringVar(&key, "vtgate_grpc_key", "", "the key to use to connect")
-	fs.StringVar(&ca, "vtgate_grpc_ca", "", "the server ca to use to validate servers when connecting")
-	fs.StringVar(&crl, "vtgate_grpc_crl", "", "the server crl to use to validate server certificates when connecting")
-	fs.StringVar(&name, "vtgate_grpc_server_name", "", "the server name to use to validate server certificate")
+	utils.SetFlagStringVar(fs, &cert, "vtgate-grpc-cert", "", "the cert to use to connect")
+	utils.SetFlagStringVar(fs, &key, "vtgate-grpc-key", "", "the key to use to connect")
+	utils.SetFlagStringVar(fs, &ca, "vtgate-grpc-ca", "", "the server ca to use to validate servers when connecting")
+	utils.SetFlagStringVar(fs, &crl, "vtgate-grpc-crl", "", "the server crl to use to validate server certificates when connecting")
+	utils.SetFlagStringVar(fs, &name, "vtgate-grpc-server-name", "", "the server name to use to validate server certificate")
 }
 
 type vtgateConn struct {
@@ -107,7 +108,13 @@ func DialWithOpts(_ context.Context, opts ...grpc.DialOption) vtgateconn.DialerF
 	return Dial(opts...)
 }
 
-func (conn *vtgateConn) Execute(ctx context.Context, session *vtgatepb.Session, query string, bindVars map[string]*querypb.BindVariable) (*vtgatepb.Session, *sqltypes.Result, error) {
+func (conn *vtgateConn) Execute(
+	ctx context.Context,
+	session *vtgatepb.Session,
+	query string,
+	bindVars map[string]*querypb.BindVariable,
+	prepared bool,
+) (*vtgatepb.Session, *sqltypes.Result, error) {
 	request := &vtgatepb.ExecuteRequest{
 		CallerId: callerid.EffectiveCallerIDFromContext(ctx),
 		Session:  session,
@@ -115,6 +122,7 @@ func (conn *vtgateConn) Execute(ctx context.Context, session *vtgatepb.Session, 
 			Sql:           query,
 			BindVariables: bindVars,
 		},
+		Prepared: prepared,
 	}
 	response, err := conn.c.Execute(ctx, request)
 	if err != nil {
@@ -200,23 +208,85 @@ func (conn *vtgateConn) StreamExecute(ctx context.Context, session *vtgatepb.Ses
 	}, nil
 }
 
-func (conn *vtgateConn) Prepare(ctx context.Context, session *vtgatepb.Session, query string, bindVars map[string]*querypb.BindVariable) (*vtgatepb.Session, []*querypb.Field, error) {
+// ExecuteMulti executes multiple non-streaming queries.
+func (conn *vtgateConn) ExecuteMulti(ctx context.Context, session *vtgatepb.Session, sqlString string) (newSession *vtgatepb.Session, qrs []*sqltypes.Result, err error) {
+	request := &vtgatepb.ExecuteMultiRequest{
+		CallerId: callerid.EffectiveCallerIDFromContext(ctx),
+		Session:  session,
+		Sql:      sqlString,
+	}
+	response, err := conn.c.ExecuteMulti(ctx, request)
+	if err != nil {
+		return session, nil, vterrors.FromGRPC(err)
+	}
+	return response.Session, sqltypes.Proto3ToResults(response.Results), vterrors.FromVTRPC(response.Error)
+}
+
+type streamExecuteMultiAdapter struct {
+	recv   func() (*querypb.QueryResult, bool, error)
+	fields []*querypb.Field
+}
+
+func (a *streamExecuteMultiAdapter) Recv() (*sqltypes.Result, bool, error) {
+	var qr *querypb.QueryResult
+	var err error
+	var newResult bool
+	for {
+		qr, newResult, err = a.recv()
+		if qr != nil || err != nil {
+			break
+		}
+		// we reach here, only when it is the last packet.
+		// as in the last packet we receive the session and there is no result
+	}
+	if err != nil {
+		return nil, newResult, err
+	}
+	if qr != nil && qr.Fields != nil {
+		a.fields = qr.Fields
+	}
+	return sqltypes.CustomProto3ToResult(a.fields, qr), newResult, nil
+}
+
+// StreamExecuteMulti executes multiple streaming queries.
+func (conn *vtgateConn) StreamExecuteMulti(ctx context.Context, session *vtgatepb.Session, sqlString string, processResponse func(response *vtgatepb.StreamExecuteMultiResponse)) (sqltypes.MultiResultStream, error) {
+	req := &vtgatepb.StreamExecuteMultiRequest{
+		CallerId: callerid.EffectiveCallerIDFromContext(ctx),
+		Sql:      sqlString,
+		Session:  session,
+	}
+	stream, err := conn.c.StreamExecuteMulti(ctx, req)
+	if err != nil {
+		return nil, vterrors.FromGRPC(err)
+	}
+	return &streamExecuteMultiAdapter{
+		recv: func() (*querypb.QueryResult, bool, error) {
+			ser, err := stream.Recv()
+			if err != nil {
+				return nil, false, vterrors.FromGRPC(err)
+			}
+			processResponse(ser)
+			return ser.Result.GetResult(), ser.NewResult, vterrors.FromVTRPC(ser.Result.GetError())
+		},
+	}, nil
+}
+
+func (conn *vtgateConn) Prepare(ctx context.Context, session *vtgatepb.Session, query string) (*vtgatepb.Session, []*querypb.Field, uint16, error) {
 	request := &vtgatepb.PrepareRequest{
 		CallerId: callerid.EffectiveCallerIDFromContext(ctx),
 		Session:  session,
 		Query: &querypb.BoundQuery{
-			Sql:           query,
-			BindVariables: bindVars,
+			Sql: query,
 		},
 	}
 	response, err := conn.c.Prepare(ctx, request)
 	if err != nil {
-		return session, nil, vterrors.FromGRPC(err)
+		return session, nil, 0, vterrors.FromGRPC(err)
 	}
 	if response.Error != nil {
-		return response.Session, nil, vterrors.FromVTRPC(response.Error)
+		return response.Session, nil, 0, vterrors.FromVTRPC(response.Error)
 	}
-	return response.Session, response.Fields, nil
+	return response.Session, response.Fields, uint16(response.ParamsCount), nil
 }
 
 func (conn *vtgateConn) CloseSession(ctx context.Context, session *vtgatepb.Session) error {

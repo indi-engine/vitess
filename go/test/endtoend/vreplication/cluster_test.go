@@ -26,9 +26,11 @@ import (
 	"path"
 	"runtime"
 	"strings"
-	"sync"
 	"testing"
 	"time"
+
+	"github.com/stretchr/testify/require"
+	"golang.org/x/sync/errgroup"
 
 	"vitess.io/vitess/go/mysql"
 	"vitess.io/vitess/go/test/endtoend/cluster"
@@ -36,12 +38,10 @@ import (
 	"vitess.io/vitess/go/vt/log"
 	"vitess.io/vitess/go/vt/mysqlctl"
 	"vitess.io/vitess/go/vt/sqlparser"
+	"vitess.io/vitess/go/vt/utils"
 	"vitess.io/vitess/go/vt/vtgate/planbuilder/plancontext"
-	vttablet "vitess.io/vitess/go/vt/vttablet/common"
 
 	vtctldatapb "vitess.io/vitess/go/vt/proto/vtctldata"
-
-	"github.com/stretchr/testify/require"
 )
 
 var (
@@ -55,10 +55,10 @@ var (
 	sidecarDBIdentifier   = sqlparser.String(sqlparser.NewIdentifierCS(sidecarDBName))
 	mainClusterConfig     *ClusterConfig
 	externalClusterConfig *ClusterConfig
-	extraVTGateArgs       = []string{"--tablet_refresh_interval", "10ms", "--enable_buffer", "--buffer_window", loadTestBufferingWindowDuration.String(),
-		"--buffer_size", "250000", "--buffer_min_time_between_failovers", "1s", "--buffer_max_failover_duration", loadTestBufferingWindowDuration.String(),
-		"--buffer_drain_concurrency", "10"}
-	extraVtctldArgs = []string{"--remote_operation_timeout", "600s", "--topo_etcd_lease_ttl", "120"}
+	extraVTGateArgs       = []string{utils.GetFlagVariantForTests("--tablet-refresh-interval"), "10ms", "--enable_buffer", utils.GetFlagVariantForTests("--buffer-window"), loadTestBufferingWindowDuration.String(),
+		utils.GetFlagVariantForTests("--buffer-size"), "250000", utils.GetFlagVariantForTests("--buffer-min-time-between-failovers"), "1s", utils.GetFlagVariantForTests("--buffer-max-failover-duration"), loadTestBufferingWindowDuration.String(),
+		utils.GetFlagVariantForTests("--buffer-drain-concurrency"), "10"}
+	extraVtctldArgs = []string{utils.GetFlagVariantForTests("--remote-operation-timeout"), "600s", "--topo-etcd-lease-ttl", "120"}
 	// This variable can be used within specific tests to alter vttablet behavior.
 	extraVTTabletArgs = []string{}
 
@@ -101,18 +101,6 @@ func (cc *ClusterConfig) enableGTIDCompression() func() {
 	}
 }
 
-// setAllVTTabletExperimentalFlags sets all the experimental flags for vttablet and returns a function
-// that can be used to reset them in a defer.
-func setAllVTTabletExperimentalFlags() func() {
-	experimentalArgs := fmt.Sprintf("--vreplication_experimental_flags=%d",
-		vttablet.VReplicationExperimentalFlagAllowNoBlobBinlogRowImage|vttablet.VReplicationExperimentalFlagOptimizeInserts|vttablet.VReplicationExperimentalFlagVPlayerBatching)
-	oldArgs := extraVTTabletArgs
-	extraVTTabletArgs = append(extraVTTabletArgs, experimentalArgs)
-	return func() {
-		extraVTTabletArgs = oldArgs
-	}
-}
-
 // VitessCluster represents all components within the test cluster
 type VitessCluster struct {
 	t             *testing.T
@@ -122,8 +110,6 @@ type VitessCluster struct {
 	Cells         map[string]*Cell
 	Topo          *cluster.TopoProcess
 	Vtctld        *cluster.VtctldProcess
-	Vtctl         *cluster.VtctlProcess
-	VtctlClient   *cluster.VtctlClientProcess
 	VtctldClient  *cluster.VtctldClientProcess
 	VTOrcProcess  *cluster.VTOrcProcess
 }
@@ -179,13 +165,12 @@ func (vc *VitessCluster) StartVTOrc() error {
 	if vc.VTOrcProcess != nil {
 		return nil
 	}
-	base := cluster.VtctlProcessInstance(vc.ClusterConfig.topoPort, vc.ClusterConfig.hostname)
-	base.Binary = "vtorc"
+	base := cluster.VtProcessInstance("vtorc", "vtorc", vc.ClusterConfig.topoPort, vc.ClusterConfig.hostname)
 	vtorcProcess := &cluster.VTOrcProcess{
-		VtctlProcess: *base,
-		LogDir:       vc.ClusterConfig.tmpDir,
-		Config:       cluster.VTOrcConfiguration{},
-		Port:         vc.ClusterConfig.vtorcPort,
+		VtProcess: base,
+		LogDir:    vc.ClusterConfig.tmpDir,
+		Config:    cluster.VTOrcConfiguration{},
+		Port:      vc.ClusterConfig.vtorcPort,
 	}
 	err := vtorcProcess.Setup()
 	if err != nil {
@@ -313,11 +298,17 @@ func downloadDBTypeVersion(dbType string, majorVersion string, path string) erro
 }
 
 func getClusterConfig(idx int, dataRootDir string) *ClusterConfig {
+	offset := 0
+	if !debugMode {
+		// Add some randomness to the ports so that multiple tests can run in
+		// parallel on the same host.
+		offset = (idx + 1) * rand.IntN(1000)
+	}
 	basePort := 15000
 	etcdPort := 2379
 
-	basePort += idx * 10000
-	etcdPort += idx * 10000
+	basePort += (idx * 10000) + offset
+	etcdPort += (idx * 10000) + offset
 	if _, err := os.Stat(dataRootDir); os.IsNotExist(err) {
 		os.Mkdir(dataRootDir, 0700)
 	}
@@ -398,8 +389,6 @@ func NewVitessCluster(t *testing.T, opts *clusterOptions) *VitessCluster {
 	}
 
 	vc.setupVtctld()
-	vc.setupVtctl()
-	vc.setupVtctlClient()
 	vc.setupVtctldClient()
 
 	return vc
@@ -413,34 +402,21 @@ func (vc *VitessCluster) setupVtctld() {
 	vc.Vtctld.Setup(vc.CellNames[0], extraVtctldArgs...)
 }
 
-func (vc *VitessCluster) setupVtctl() {
-	vc.Vtctl = cluster.VtctlProcessInstance(vc.ClusterConfig.topoPort, vc.ClusterConfig.hostname)
-	require.NotNil(vc.t, vc.Vtctl)
+func (vc *VitessCluster) setupVtctldClient() {
+	vc.VtctldClient = cluster.VtctldClientProcessInstance(vc.ClusterConfig.vtctldGrpcPort, vc.ClusterConfig.topoPort, vc.ClusterConfig.hostname, vc.ClusterConfig.tmpDir)
+	require.NotNil(vc.t, vc.VtctldClient)
 	for _, cellName := range vc.CellNames {
-		vc.Vtctl.AddCellInfo(cellName)
+		vc.VtctldClient.AddCellInfo(cellName)
 		cell, err := vc.AddCell(vc.t, cellName)
 		require.NoError(vc.t, err)
 		require.NotNil(vc.t, cell)
 	}
 }
 
-func (vc *VitessCluster) setupVtctlClient() {
-	vc.VtctlClient = cluster.VtctlClientProcessInstance(vc.ClusterConfig.hostname, vc.Vtctld.GrpcPort, vc.ClusterConfig.tmpDir)
-	require.NotNil(vc.t, vc.VtctlClient)
-}
-
-func (vc *VitessCluster) setupVtctldClient() {
-	vc.VtctldClient = cluster.VtctldClientProcessInstance(vc.ClusterConfig.hostname, vc.Vtctld.GrpcPort, vc.ClusterConfig.tmpDir)
-	require.NotNil(vc.t, vc.VtctldClient)
-}
-
 // CleanupDataroot deletes the vtdataroot directory. Since we run multiple tests sequentially in a single CI test shard,
 // we can run out of disk space due to all the leftover artifacts from previous tests.
 func (vc *VitessCluster) CleanupDataroot(t *testing.T, recreate bool) {
-	// This is always set to "true" on GitHub Actions runners:
-	// https://docs.github.com/en/actions/learn-github-actions/variables#default-environment-variables
-	ci, ok := os.LookupEnv("CI")
-	if !ok || strings.ToLower(ci) != "true" {
+	if debugMode {
 		// Leave the directory in place to support local debugging.
 		return
 	}
@@ -474,7 +450,7 @@ func (vc *VitessCluster) AddKeyspace(t *testing.T, cells []*Cell, ksName string,
 		SidecarDBName: sidecarDBName,
 	}
 
-	err := vc.VtctldClient.CreateKeyspace(keyspace.Name, keyspace.SidecarDBName)
+	err := vc.VtctldClient.CreateKeyspace(keyspace.Name, keyspace.SidecarDBName, "")
 	require.NoError(t, err)
 
 	log.Infof("Applying throttler config for keyspace %s", keyspace.Name)
@@ -499,17 +475,17 @@ func (vc *VitessCluster) AddKeyspace(t *testing.T, cells []*Cell, ksName string,
 
 	require.NoError(t, vc.AddShards(t, cells, keyspace, shards, numReplicas, numRdonly, tabletIDBase, opts))
 	if schema != "" {
-		err := vc.VtctlClient.ApplySchema(ksName, schema)
+		err := vc.VtctldClient.ApplySchema(ksName, schema)
 		require.NoError(t, err)
 	}
 	keyspace.Schema = schema
 	if vschema != "" {
-		err := vc.VtctlClient.ApplyVSchema(ksName, vschema)
+		err := vc.VtctldClient.ApplyVSchema(ksName, vschema)
 		require.NoError(t, err)
 	}
 	keyspace.VSchema = vschema
 
-	err = vc.VtctlClient.ExecuteCommand("RebuildKeyspaceGraph", ksName)
+	err = vc.VtctldClient.ExecuteCommand("RebuildKeyspaceGraph", ksName)
 	require.NoError(t, err)
 	return keyspace, nil
 }
@@ -519,8 +495,8 @@ func (vc *VitessCluster) AddTablet(t testing.TB, cell *Cell, keyspace *Keyspace,
 	tablet := &Tablet{}
 	var options []string
 	defaultHeartbeatOptions := []string{
-		"--heartbeat_on_demand_duration", "5s",
-		"--heartbeat_interval", "250ms",
+		utils.GetFlagVariantForTests("--heartbeat-on-demand-duration"), "5s",
+		utils.GetFlagVariantForTests("--heartbeat-interval"), "250ms",
 	}
 	if !mainClusterConfig.overrideHeartbeatOptions {
 		options = append(options, defaultHeartbeatOptions...)
@@ -529,7 +505,7 @@ func (vc *VitessCluster) AddTablet(t testing.TB, cell *Cell, keyspace *Keyspace,
 	options = append(options, extraVTTabletArgs...)
 
 	if mainClusterConfig.vreplicationCompressGTID {
-		options = append(options, "--vreplication_store_compressed_gtid=true")
+		options = append(options, "--vreplication-store-compressed-gtid=true")
 	}
 
 	vttablet := cluster.VttabletProcessInstance(
@@ -598,7 +574,7 @@ func (vc *VitessCluster) AddShards(t *testing.T, cells []*Cell, keyspace *Keyspa
 			log.Infof("Shard %s already exists, not adding", shardName)
 		} else {
 			log.Infof("Adding Shard %s", shardName)
-			if err := vc.VtctlClient.ExecuteCommand("CreateShard", keyspace.Name+"/"+shardName); err != nil {
+			if err := vc.VtctldClient.ExecuteCommand("CreateShard", keyspace.Name+"/"+shardName); err != nil {
 				t.Fatalf("CreateShard command failed with %+v\n", err)
 			}
 			keyspace.Shards[shardName] = shard
@@ -697,7 +673,7 @@ func (vc *VitessCluster) AddShards(t *testing.T, cells []*Cell, keyspace *Keyspa
 		}
 		require.NotEqual(t, 0, primaryTabletUID, "Should have created a primary tablet")
 		log.Infof("InitializeShard and make %d primary", primaryTabletUID)
-		require.NoError(t, vc.VtctlClient.InitializeShard(keyspace.Name, shardName, cells[0].Name, primaryTabletUID))
+		require.NoError(t, vc.VtctldClient.InitializeShard(keyspace.Name, shardName, cells[0].Name, primaryTabletUID))
 
 		log.Infof("Finished creating shard %s", shard.Name)
 	}
@@ -734,7 +710,7 @@ func (vc *VitessCluster) AddShards(t *testing.T, cells []*Cell, keyspace *Keyspa
 		}
 	}
 
-	err := vc.VtctlClient.ExecuteCommand("RebuildKeyspaceGraph", keyspace.Name)
+	err := vc.VtctldClient.ExecuteCommand("RebuildKeyspaceGraph", keyspace.Name)
 	require.NoError(t, err)
 
 	log.Infof("Waiting for throttler config to be applied on all shards")
@@ -763,7 +739,7 @@ func (vc *VitessCluster) DeleteShard(t testing.TB, cellName string, ksName strin
 	}
 	log.Infof("Deleting Shard %s", shardName)
 	// TODO how can we avoid the use of even_if_serving?
-	if output, err := vc.VtctlClient.ExecuteCommandWithOutput("DeleteShard", "--", "--recursive", "--even_if_serving", ksName+"/"+shardName); err != nil {
+	if output, err := vc.VtctldClient.ExecuteCommandWithOutput("DeleteShard", "--recursive", "--even-if-serving", ksName+"/"+shardName); err != nil {
 		t.Fatalf("DeleteShard command failed with error %+v and output %s\n", err, output)
 	}
 
@@ -814,29 +790,9 @@ func (vc *VitessCluster) teardown() {
 		}
 	}
 
-	var wg sync.WaitGroup
-
 	for _, keyspace := range keyspaces {
-		for _, shard := range keyspace.Shards {
-			for _, tablet := range shard.Tablets {
-				wg.Add(1)
-				go func(tablet2 *Tablet) {
-					defer wg.Done()
-					if tablet2.DbServer != nil && tablet2.DbServer.TabletUID > 0 {
-						if err := tablet2.DbServer.Stop(); err != nil {
-							log.Infof("Error stopping mysql process: %s", err.Error())
-						}
-					}
-					if err := tablet2.Vttablet.TearDown(); err != nil {
-						log.Infof("Error stopping vttablet %s %s", tablet2.Name, err.Error())
-					} else {
-						log.Infof("Successfully stopped vttablet %s", tablet2.Name)
-					}
-				}(tablet)
-			}
-		}
+		_ = vc.TearDownKeyspace(keyspace)
 	}
-	wg.Wait()
 	if err := vc.Vtctld.TearDown(); err != nil {
 		log.Infof("Error stopping Vtctld:  %s", err.Error())
 	} else {
@@ -856,6 +812,38 @@ func (vc *VitessCluster) teardown() {
 			log.Infof("Error stopping VTOrc: %s", err.Error())
 		}
 	}
+}
+
+func (vc *VitessCluster) TearDownKeyspace(ks *Keyspace) error {
+	eg := errgroup.Group{}
+	for _, shard := range ks.Shards {
+		for _, tablet := range shard.Tablets {
+			eg.Go(func() error {
+				if tablet.DbServer != nil && tablet.DbServer.TabletUID > 0 {
+					if err := tablet.DbServer.Stop(); err != nil {
+						log.Infof("Error stopping mysql process associated with vttablet %s: %v", tablet.Name, err)
+						return err
+					}
+				}
+				if err := tablet.Vttablet.TearDown(); err != nil {
+					log.Infof("Error stopping vttablet %s: %v", tablet.Name, err)
+					return err
+				} else {
+					log.Infof("Successfully stopped vttablet %s", tablet.Name)
+				}
+				return nil
+			})
+		}
+	}
+	return eg.Wait()
+}
+
+func (vc *VitessCluster) DeleteKeyspace(t testing.TB, ksName string) {
+	out, err := vc.VtctldClient.ExecuteCommandWithOutput("DeleteKeyspace", ksName, "--recursive")
+	if err != nil {
+		log.Error("DeleteKeyspace failed with error: , output: %s", err, out)
+	}
+	require.NoError(t, err)
 }
 
 // TearDown brings down a cluster, deleting processes, removing topo keys
@@ -884,7 +872,7 @@ func (vc *VitessCluster) getVttabletsInKeyspace(t *testing.T, cell *Cell, ksName
 	tablets := make(map[string]*cluster.VttabletProcess)
 	for _, shard := range keyspace.Shards {
 		for _, tablet := range shard.Tablets {
-			if tablet.Vttablet.GetTabletStatus() == "SERVING" {
+			if tablet.Vttablet.GetTabletStatus() == "SERVING" && (tabletType == "" || strings.EqualFold(tablet.Vttablet.GetTabletType(), tabletType)) {
 				log.Infof("Serving status of tablet %s is %s, %s", tablet.Name, tablet.Vttablet.ServingStatus, tablet.Vttablet.GetTabletStatus())
 				tablets[tablet.Name] = tablet.Vttablet
 			}

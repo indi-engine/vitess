@@ -67,7 +67,6 @@ const (
 
 // Use $VREPL_SUITE_TEST_FILTER environment variable to filter tests by name.
 func TestMain(m *testing.M) {
-	defer cluster.PanicHandler(nil)
 	flag.Parse()
 
 	testsFilter = os.Getenv(testFilterEnvVar)
@@ -83,12 +82,14 @@ func TestMain(m *testing.M) {
 		}
 
 		clusterInstance.VtctldExtraArgs = []string{
+			// TODO: Replace flag with dashed version in v25
 			"--schema_change_dir", schemaChangeDirectory,
 			"--schema_change_controller", "local",
 			"--schema_change_check_interval", "1s",
 		}
 
 		clusterInstance.VtTabletExtraArgs = []string{
+			// TODO: Replace flag with dashed version in v25
 			"--heartbeat_interval", "250ms",
 			"--heartbeat_on_demand_duration", "5s",
 			"--migration_check_interval", "5s",
@@ -133,7 +134,6 @@ func TestMain(m *testing.M) {
 }
 
 func TestVreplSuiteSchemaChanges(t *testing.T) {
-	defer cluster.PanicHandler(t)
 
 	shards := clusterInstance.Keyspaces[0].Shards
 	require.Equal(t, 1, len(shards))

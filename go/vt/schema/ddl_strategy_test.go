@@ -28,13 +28,9 @@ func TestIsDirect(t *testing.T) {
 	assert.True(t, DDLStrategyDirect.IsDirect())
 	assert.False(t, DDLStrategyVitess.IsDirect())
 	assert.False(t, DDLStrategyOnline.IsDirect())
-	assert.False(t, DDLStrategyGhost.IsDirect())
-	assert.False(t, DDLStrategyPTOSC.IsDirect())
 	assert.True(t, DDLStrategy("").IsDirect())
 	assert.False(t, DDLStrategy("vitess").IsDirect())
 	assert.False(t, DDLStrategy("online").IsDirect())
-	assert.False(t, DDLStrategy("gh-ost").IsDirect())
-	assert.False(t, DDLStrategy("pt-osc").IsDirect())
 	assert.False(t, DDLStrategy("mysql").IsDirect())
 	assert.True(t, DDLStrategy("something").IsDirect())
 }
@@ -189,6 +185,8 @@ func TestParseDDLStrategy(t *testing.T) {
 		options              string
 		isDeclarative        bool
 		isSingleton          bool
+		isSingletonContext   bool
+		isSingletonTable     bool
 		isPostponeLaunch     bool
 		isPostponeCompletion bool
 		isInOrderCompletion  bool
@@ -216,14 +214,6 @@ func TestParseDDLStrategy(t *testing.T) {
 			strategy:         DDLStrategyOnline,
 		},
 		{
-			strategyVariable: "gh-ost",
-			strategy:         DDLStrategyGhost,
-		},
-		{
-			strategyVariable: "pt-osc",
-			strategy:         DDLStrategyPTOSC,
-		},
-		{
 			strategyVariable: "mysql",
 			strategy:         DDLStrategyMySQL,
 		},
@@ -231,32 +221,33 @@ func TestParseDDLStrategy(t *testing.T) {
 			strategy: DDLStrategyDirect,
 		},
 		{
-			strategyVariable: "gh-ost --max-load=Threads_running=100 --allow-master",
-			strategy:         DDLStrategyGhost,
-			// These are gh-ost options. Nothing we can do until that changes upstream
-			options:        "--max-load=Threads_running=100 --allow-master",
-			runtimeOptions: "--max-load=Threads_running=100 --allow-master",
-		},
-		{
-			strategyVariable: "gh-ost --max-load=Threads_running=100 -declarative",
-			strategy:         DDLStrategyGhost,
-			options:          "--max-load=Threads_running=100 -declarative",
-			runtimeOptions:   "--max-load=Threads_running=100",
-			isDeclarative:    true,
-		},
-		{
-			strategyVariable: "gh-ost --declarative --max-load=Threads_running=100",
-			strategy:         DDLStrategyGhost,
-			options:          "--declarative --max-load=Threads_running=100",
-			runtimeOptions:   "--max-load=Threads_running=100",
-			isDeclarative:    true,
-		},
-		{
-			strategyVariable: "pt-osc -singleton",
-			strategy:         DDLStrategyPTOSC,
+			strategyVariable: "vitess -singleton",
+			strategy:         DDLStrategyVitess,
 			options:          "-singleton",
 			runtimeOptions:   "",
 			isSingleton:      true,
+		},
+		{
+			strategyVariable: "vitess --singleton --declarative",
+			strategy:         DDLStrategyVitess,
+			options:          "--singleton --declarative",
+			runtimeOptions:   "",
+			isSingleton:      true,
+			isDeclarative:    true,
+		},
+		{
+			strategyVariable:   "vitess --singleton-context",
+			strategy:           DDLStrategyVitess,
+			options:            "--singleton-context",
+			runtimeOptions:     "",
+			isSingletonContext: true,
+		},
+		{
+			strategyVariable: "vitess --singleton-table",
+			strategy:         DDLStrategyVitess,
+			options:          "--singleton-table",
+			runtimeOptions:   "",
+			isSingletonTable: true,
 		},
 		{
 			strategyVariable: "online -postpone-launch",
@@ -342,7 +333,7 @@ func TestParseDDLStrategy(t *testing.T) {
 			expectError:      "time: invalid duration",
 		},
 		{
-			strategyVariable: "gh-ost --force-cut-over-after=3m",
+			strategyVariable: "mysql --force-cut-over-after=3m",
 			strategy:         DDLStrategyVitess,
 			runtimeOptions:   "",
 			expectError:      "--force-cut-over-after is only valid in 'vitess' strategy",
@@ -387,6 +378,8 @@ func TestParseDDLStrategy(t *testing.T) {
 			assert.Equal(t, ts.options, setting.Options)
 			assert.Equal(t, ts.isDeclarative, setting.IsDeclarative())
 			assert.Equal(t, ts.isSingleton, setting.IsSingleton())
+			assert.Equal(t, ts.isSingletonContext, setting.IsSingletonContext())
+			assert.Equal(t, ts.isSingletonTable, setting.IsSingletonTable())
 			assert.Equal(t, ts.isPostponeCompletion, setting.IsPostponeCompletion())
 			assert.Equal(t, ts.isPostponeLaunch, setting.IsPostponeLaunch())
 			assert.Equal(t, ts.isAllowConcurrent, setting.IsAllowConcurrent())

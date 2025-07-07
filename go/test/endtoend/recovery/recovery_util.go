@@ -26,6 +26,7 @@ import (
 	"github.com/stretchr/testify/require"
 
 	"vitess.io/vitess/go/test/endtoend/cluster"
+	"vitess.io/vitess/go/vt/utils"
 	"vitess.io/vitess/go/vt/vtgate/vtgateconn"
 )
 
@@ -36,16 +37,16 @@ var (
 	UseXb = false
 	// XbArgs are the arguments for specifying xtrabackup.
 	XbArgs = []string{
-		"--backup_engine_implementation", "xtrabackup",
-		"--xtrabackup_stream_mode=xbstream",
-		"--xtrabackup_user=vt_dba",
-		"--xtrabackup_backup_flags", fmt.Sprintf("--password=%s", dbPassword),
+		utils.GetFlagVariantForTests("--backup-engine-implementation"), "xtrabackup",
+		fmt.Sprintf("%s=xbstream", utils.GetFlagVariantForTests("--xtrabackup-stream-mode")),
+		fmt.Sprintf("%s=vt_dba", utils.GetFlagVariantForTests("--xtrabackup-user")),
+		utils.GetFlagVariantForTests("--xtrabackup-backup-flags"), fmt.Sprintf("--password=%s", dbPassword),
 	}
 )
 
 // VerifyQueriesUsingVtgate verifies queries using vtgate.
 func VerifyQueriesUsingVtgate(t *testing.T, session *vtgateconn.VTGateSession, query string, value string) {
-	qr, err := session.Execute(context.Background(), query, nil)
+	qr, err := session.Execute(context.Background(), query, nil, false)
 	require.Nil(t, err)
 	assert.Equal(t, value, fmt.Sprintf("%v", qr.Rows[0][0]))
 }
@@ -55,28 +56,28 @@ func RestoreTablet(t *testing.T, localCluster *cluster.LocalProcessCluster, tabl
 	tablet.ValidateTabletRestart(t)
 	replicaTabletArgs := commonTabletArg
 
-	_, err := localCluster.VtctlProcess.ExecuteCommandWithOutput("GetKeyspace", restoreKSName)
+	_, err := localCluster.VtctldClientProcess.ExecuteCommandWithOutput("GetKeyspace", restoreKSName)
 
 	if restoreTime.IsZero() {
 		restoreTime = time.Now().UTC()
 	}
 
 	if err != nil {
-		_, err := localCluster.VtctlProcess.ExecuteCommandWithOutput("CreateKeyspace", "--",
-			"--keyspace_type=SNAPSHOT", "--base_keyspace="+keyspaceName,
-			"--snapshot_time", restoreTime.Format(time.RFC3339), restoreKSName)
+		_, err := localCluster.VtctldClientProcess.ExecuteCommandWithOutput("CreateKeyspace", restoreKSName,
+			"--type=SNAPSHOT", "--base-keyspace="+keyspaceName,
+			"--snapshot-timestamp", restoreTime.Format(time.RFC3339))
 		require.Nil(t, err)
 	}
 
 	if UseXb {
 		replicaTabletArgs = append(replicaTabletArgs, XbArgs...)
 	}
-	replicaTabletArgs = append(replicaTabletArgs, "--disable_active_reparents",
-		"--enable_replication_reporter=false",
-		"--init_tablet_type", "replica",
-		"--init_keyspace", restoreKSName,
-		"--init_shard", shardName,
-		"--init_db_name_override", "vt_"+keyspaceName,
+	replicaTabletArgs = append(replicaTabletArgs,
+		utils.GetFlagVariantForTests("--enable-replication-reporter")+"=false",
+		utils.GetFlagVariantForTests("--init-tablet-type"), "replica",
+		utils.GetFlagVariantForTests("--init-keyspace"), restoreKSName,
+		utils.GetFlagVariantForTests("--init-shard"), shardName,
+		utils.GetFlagVariantForTests("--init-db-name-override"), "vt_"+keyspaceName,
 	)
 	tablet.VttabletProcess.SupportsBackup = true
 	tablet.VttabletProcess.ExtraArgs = replicaTabletArgs

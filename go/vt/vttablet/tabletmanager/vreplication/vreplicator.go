@@ -89,6 +89,7 @@ const (
 	json_unquote(json_extract(action, '$.type'))=%a and vrepl_id=%a and table_name=%a`
 	sqlDeletePostCopyAction = `delete from _vt.post_copy_action where vrepl_id=%a and
 	table_name=%a and id=%a`
+	SqlMaxAllowedPacket = "select @@session.max_allowed_packet as max_allowed_packet"
 )
 
 // vreplicator provides the core logic to start vreplication streams
@@ -145,7 +146,7 @@ func newVReplicator(id int32, source *binlogdatapb.BinlogSource, sourceVStreamer
 		workflowConfig = vttablet.DefaultVReplicationConfig
 	}
 	if workflowConfig.HeartbeatUpdateInterval > vreplicationMinimumHeartbeatUpdateInterval {
-		log.Warningf("The supplied value for vreplication_heartbeat_update_interval:%d seconds is larger than the maximum allowed:%d seconds, vreplication will fallback to %d",
+		log.Warningf("The supplied value for vreplication-heartbeat-update-interval:%d seconds is larger than the maximum allowed:%d seconds, vreplication will fallback to %d",
 			workflowConfig.HeartbeatUpdateInterval, vreplicationMinimumHeartbeatUpdateInterval, vreplicationMinimumHeartbeatUpdateInterval)
 	}
 	vttablet.InitVReplicationConfigDefaults()
@@ -186,10 +187,17 @@ func newVReplicator(id int32, source *binlogdatapb.BinlogSource, sourceVStreamer
 // code.
 func (vr *vreplicator) Replicate(ctx context.Context) error {
 	err := vr.replicate(ctx)
-	if err != nil {
-		if err := vr.setMessage(err.Error()); err != nil {
-			binlogplayer.LogError("Failed to set error state", err)
+	if err == nil {
+		return nil
+	}
+	if vr.dbClient.IsClosed() {
+		// Connection was possible terminated by the server. We should renew it.
+		if cerr := vr.dbClient.Connect(); cerr != nil {
+			return vterrors.Wrapf(err, "failed to reconnect to the database: %v", cerr)
 		}
+	}
+	if err := vr.setMessage(err.Error()); err != nil {
+		binlogplayer.LogError("Failed to set error state", err)
 	}
 	return err
 }
@@ -297,6 +305,13 @@ func (vr *vreplicator) replicate(ctx context.Context) error {
 					return err
 				}
 			} else {
+				if vr.state != binlogdatapb.VReplicationWorkflowState_Copying {
+					if err := vr.setState(binlogdatapb.VReplicationWorkflowState_Copying, ""); err != nil {
+						vr.stats.ErrorCounts.Add([]string{"Copy"}, 1)
+						return err
+					}
+					vr.insertLog(LogCopyRestart, fmt.Sprintf("Copy phase restarted for %d table(s)", numTablesToCopy))
+				}
 				if err := newVCopier(vr).copyNext(ctx, settings); err != nil {
 					vr.stats.ErrorCounts.Add([]string{"Copy"}, 1)
 					return err
@@ -500,9 +515,15 @@ func (vr *vreplicator) setState(state binlogdatapb.VReplicationWorkflowState, me
 		})
 	}
 	vr.stats.State.Store(state.String())
-	query := fmt.Sprintf("update _vt.vreplication set state='%v', message=%v where id=%v", state, encodeString(binlogplayer.MessageTruncate(message)), vr.id)
-	if _, err := vr.dbClient.ExecuteFetch(query, 1); err != nil {
-		return fmt.Errorf("could not set state: %v: %v", query, err)
+	query := fmt.Sprintf("update _vt.vreplication set state=%v, message=%v where id=%v", encodeString(state.String()), encodeString(binlogplayer.MessageTruncate(message)), vr.id)
+	// If we're batching a transaction, then include the state update
+	// in the current transaction batch.
+	if vr.dbClient.InTransaction && vr.dbClient.maxBatchSize > 0 {
+		vr.dbClient.AddQueryToTrxBatch(query)
+	} else { // Otherwise, send it down the wire
+		if _, err := vr.dbClient.ExecuteFetch(query, 1); err != nil {
+			return fmt.Errorf("could not set state: %v: %v", query, err)
+		}
 	}
 	if state == vr.state {
 		return nil
@@ -514,9 +535,7 @@ func (vr *vreplicator) setState(state binlogdatapb.VReplicationWorkflowState, me
 }
 
 func encodeString(in string) string {
-	var buf strings.Builder
-	sqltypes.NewVarChar(in).EncodeSQL(&buf)
-	return buf.String()
+	return sqltypes.EncodeStringSQL(in)
 }
 
 func (vr *vreplicator) getSettingFKCheck() error {
@@ -619,9 +638,8 @@ func (vr *vreplicator) setSQLMode(ctx context.Context, dbClient *vdbClient) (fun
 //   - "vreplication" for most flows
 //   - "vreplication:online-ddl" for online ddl flows.
 //     Note that with such name, it's possible to throttle
-//     the workflow by either /throttler/throttle-app?app=vreplication and/or /throttler/throttle-app?app=online-ddl
-//     This is useful when we want to throttle all migrations. We throttle "online-ddl" and that applies to both vreplication
-//     migrations as well as gh-ost migrations.
+//     the workflow by either "vreplication" and/or "online-ddl"
+//     This is useful when we want to throttle all migrations. We throttle "online-ddl".
 func (vr *vreplicator) throttlerAppName() string {
 	names := []string{vr.WorkflowName, throttlerapp.VReplicationName.String()}
 	if vr.WorkflowType == int32(binlogdatapb.VReplicationWorkflowType_OnlineDDL) {
@@ -954,7 +972,7 @@ func (vr *vreplicator) execPostCopyActions(ctx context.Context, tableName string
 		select {
 		// Stop any further actions if the vreplicator's context is
 		// cancelled -- most likely due to hitting the
-		// vreplication_copy_phase_duration
+		// vreplication-copy-phase-duration
 		case <-ctx.Done():
 			return vterrors.Errorf(vtrpcpb.Code_CANCELED, "context has expired")
 		default:

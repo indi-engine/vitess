@@ -53,11 +53,11 @@ func TestPlayerGeneratedInvisiblePrimaryKey(t *testing.T) {
 
 	execStatements(t, []string{
 		"SET @@session.sql_generate_invisible_primary_key=ON;",
-		"create table t1(val varbinary(128))",
-		fmt.Sprintf("create table %s.t1(val varbinary(128))", vrepldb),
-		"create table t2(val varbinary(128))",
+		"create table t1(val varchar(128))",
+		fmt.Sprintf("create table %s.t1(val varchar(128))", vrepldb),
+		"create table t2(val varchar(128))",
 		"SET @@session.sql_generate_invisible_primary_key=OFF;",
-		fmt.Sprintf("create table %s.t2(my_row_id int, val varbinary(128), primary key(my_row_id))", vrepldb),
+		fmt.Sprintf("create table %s.t2(my_row_id int, val varchar(128), primary key(my_row_id))", vrepldb),
 	})
 	defer execStatements(t, []string{
 		"drop table t1",
@@ -235,8 +235,8 @@ func TestVReplicationTimeUpdated(t *testing.T) {
 	ctx := context.Background()
 	defer deleteTablet(addTablet(100))
 	execStatements(t, []string{
-		"create table t1(id int, val varbinary(128), primary key(id))",
-		fmt.Sprintf("create table %s.t1(id int, val varbinary(128), primary key(id))", vrepldb),
+		"create table t1(id int, val varchar(128), primary key(id))",
+		fmt.Sprintf("create table %s.t1(id int, val varchar(128), primary key(id))", vrepldb),
 	})
 	defer execStatements(t, []string{
 		"drop table t1",
@@ -340,14 +340,14 @@ func TestCharPK(t *testing.T) {
 		data   [][]string
 	}{{ // binary(2)
 		input:  "insert into t1 values(1, 'a')",
-		output: "insert into t1(id,val) values (1,'a\\0')",
+		output: "insert into t1(id,val) values (1,_binary'a\\0')",
 		table:  "t1",
 		data: [][]string{
 			{"1", "a\000"},
 		},
 	}, {
 		input:  "update t1 set id = 2 where val = 'a\000'",
-		output: "update t1 set id=2 where val='a\\0'",
+		output: "update t1 set id=2 where val=_binary'a\\0'",
 		table:  "t1",
 		data: [][]string{
 			{"2", "a\000"},
@@ -368,14 +368,14 @@ func TestCharPK(t *testing.T) {
 		},
 	}, { // varbinary(2)
 		input:  "insert into t3 values(1, 'a')",
-		output: "insert into t3(id,val) values (1,'a')",
+		output: "insert into t3(id,val) values (1,_binary'a')",
 		table:  "t3",
 		data: [][]string{
 			{"1", "a"},
 		},
 	}, {
 		input:  "update t3 set id = 2 where val = 'a'",
-		output: "update t3 set id=2 where val='a'",
+		output: "update t3 set id=2 where val=_binary'a'",
 		table:  "t3",
 		data: [][]string{
 			{"2", "a"},
@@ -628,7 +628,6 @@ func TestPlayerStatementModeWithFilterAndErrorHandling(t *testing.T) {
 
 	// It does not work when filter is enabled
 	output := qh.Expect(
-		"begin",
 		"rollback",
 		fmt.Sprintf("/update _vt.vreplication set message='%s", expectedMsg),
 	)
@@ -686,6 +685,8 @@ func TestPlayerStatementMode(t *testing.T) {
 
 func TestPlayerFilters(t *testing.T) {
 	defer deleteTablet(addTablet(100))
+
+	vttablet.DefaultVReplicationConfig.EnableHttpLog = true
 
 	execStatements(t, []string{
 		"create table src1(id int, val varbinary(128), primary key(id))",
@@ -748,7 +749,7 @@ func TestPlayerFilters(t *testing.T) {
 			Filter: "select id1, val from src5 where val = 'abc'",
 		}, {
 			Match:  "dst_charset",
-			Filter: "select id1, concat(substr(_utf8mb4 val collate utf8mb4_bin,1,1),'abcxyz') val, concat(substr(_utf8mb4 val collate utf8mb4_bin,1,1),'abcxyz') val2 from src_charset",
+			Filter: "select id1, concat(substr(CONVERT(val USING utf8mb4) COLLATE utf8mb4_bin,1,1),'abcxyz') val, concat(substr(CONVERT(val USING utf8mb4) COLLATE utf8mb4_bin,1,1),'abcxyz') val2 from src_charset",
 		}},
 	}
 	bls := &binlogdatapb.BinlogSource{
@@ -772,7 +773,7 @@ func TestPlayerFilters(t *testing.T) {
 		input: "insert into src1 values(1, 'aaa')",
 		output: qh.Expect(
 			"begin",
-			"insert into dst1(id,val) values (1,'aaa')",
+			"insert into dst1(id,val) values (1,_binary'aaa')",
 			"/update _vt.vreplication set pos=",
 			"commit",
 		),
@@ -782,7 +783,7 @@ func TestPlayerFilters(t *testing.T) {
 		},
 		logs: []LogExpectation{
 			{"FIELD", "/src1.*id.*INT32.*val.*VARBINARY.*"},
-			{"ROWCHANGE", "insert into dst1(id,val) values (1,'aaa')"},
+			{"ROWCHANGE", "insert into dst1(id,val) values (1,_binary'aaa')"},
 			{"ROW", "/src1.*3.*1aaa.*"},
 		},
 	}, {
@@ -790,7 +791,7 @@ func TestPlayerFilters(t *testing.T) {
 		input: "update src1 set val='bbb'",
 		output: qh.Expect(
 			"begin",
-			"update dst1 set val='bbb' where id=1",
+			"update dst1 set val=_binary'bbb' where id=1",
 			"/update _vt.vreplication set pos=",
 			"commit",
 		),
@@ -799,7 +800,7 @@ func TestPlayerFilters(t *testing.T) {
 			{"1", "bbb"},
 		},
 		logs: []LogExpectation{
-			{"ROWCHANGE", "update dst1 set val='bbb' where id=1"},
+			{"ROWCHANGE", "update dst1 set val=_binary'bbb' where id=1"},
 			{"ROW", "/src1.*3.*1aaa.*"},
 		},
 	}, {
@@ -869,7 +870,7 @@ func TestPlayerFilters(t *testing.T) {
 		input: "insert into src3 values(1, 'aaa')",
 		output: qh.Expect(
 			"begin",
-			"insert ignore into dst3(id,val) values (1,'aaa')",
+			"insert ignore into dst3(id,val) values (1,_binary'aaa')",
 			"/update _vt.vreplication set pos=",
 			"commit",
 		),
@@ -882,7 +883,7 @@ func TestPlayerFilters(t *testing.T) {
 		input: "update src3 set val='bbb'",
 		output: qh.Expect(
 			"begin",
-			"insert ignore into dst3(id,val) values (1,'bbb')",
+			"insert ignore into dst3(id,val) values (1,_binary'bbb')",
 			"/update _vt.vreplication set pos=",
 			"commit",
 		),
@@ -907,7 +908,7 @@ func TestPlayerFilters(t *testing.T) {
 		input: "insert into yes values(1, 'aaa')",
 		output: qh.Expect(
 			"begin",
-			"insert into yes(id,val) values (1,'aaa')",
+			"insert into yes(id,val) values (1,_binary'aaa')",
 			"/update _vt.vreplication set pos=",
 			"commit",
 		),
@@ -920,7 +921,7 @@ func TestPlayerFilters(t *testing.T) {
 		input: "update yes set val='bbb'",
 		output: qh.Expect(
 			"begin",
-			"update yes set val='bbb' where id=1",
+			"update yes set val=_binary'bbb' where id=1",
 			"/update _vt.vreplication set pos=",
 			"commit",
 		),
@@ -937,7 +938,7 @@ func TestPlayerFilters(t *testing.T) {
 		input: "insert into nopk values(1, 'aaa')",
 		output: qh.Expect(
 			"begin",
-			"insert into nopk(id,val) values (1,'aaa')",
+			"insert into nopk(id,val) values (1,_binary'aaa')",
 			"/update _vt.vreplication set pos=",
 			"commit",
 		),
@@ -950,8 +951,8 @@ func TestPlayerFilters(t *testing.T) {
 		input: "update nopk set val='bbb' where id=1",
 		output: qh.Expect(
 			"begin",
-			"delete from nopk where id=1 and val='aaa'",
-			"insert into nopk(id,val) values (1,'bbb')",
+			"delete from nopk where id=1 and val=_binary'aaa'",
+			"insert into nopk(id,val) values (1,_binary'bbb')",
 			"/update _vt.vreplication set pos=",
 			"commit",
 		),
@@ -964,7 +965,7 @@ func TestPlayerFilters(t *testing.T) {
 		input: "delete from nopk where id=1",
 		output: qh.Expect(
 			"begin",
-			"delete from nopk where id=1 and val='bbb'",
+			"delete from nopk where id=1 and val=_binary'bbb'",
 			"/update _vt.vreplication set pos=",
 			"commit",
 		),
@@ -975,8 +976,7 @@ func TestPlayerFilters(t *testing.T) {
 		input: "insert into src4 values (1,100,'aaa'),(2,200,'bbb'),(3,100,'ccc')",
 		output: qh.Expect(
 			"begin",
-			"insert into dst4(id1,val) values (1,'aaa')",
-			"insert into dst4(id1,val) values (3,'ccc')",
+			"insert into dst4(id1,val) values (1,_binary'aaa'), (3,_binary'ccc')",
 			"/update _vt.vreplication set pos=",
 			"commit",
 		),
@@ -987,8 +987,7 @@ func TestPlayerFilters(t *testing.T) {
 		input: "insert into src5 values (1,100,'abc'),(2,200,'xyz'),(3,100,'xyz'),(4,300,'abc'),(5,200,'xyz')",
 		output: qh.Expect(
 			"begin",
-			"insert into dst5(id1,val) values (1,'abc')",
-			"insert into dst5(id1,val) values (4,'abc')",
+			"insert into dst5(id1,val) values (1,_binary'abc'), (4,_binary'abc')",
 			"/update _vt.vreplication set pos=",
 			"commit",
 		),
@@ -999,7 +998,7 @@ func TestPlayerFilters(t *testing.T) {
 		input: "insert into src_charset values (1,'木元')",
 		output: qh.Expect(
 			"begin",
-			"insert into dst_charset(id1,val,val2) values (1,concat(substr(_utf8mb4 '木元' collate utf8mb4_bin, 1, 1), 'abcxyz'),concat(substr(_utf8mb4 '木元' collate utf8mb4_bin, 1, 1), 'abcxyz'))",
+			"insert into dst_charset(id1,val,val2) values (1,concat(substr(convert(_binary'木元' using utf8mb4) collate utf8mb4_bin, 1, 1), 'abcxyz'),concat(substr(convert(_binary'木元' using utf8mb4) collate utf8mb4_bin, 1, 1), 'abcxyz'))",
 			"/update _vt.vreplication set pos=",
 			"commit",
 		),
@@ -1026,12 +1025,12 @@ func TestPlayerKeywordNames(t *testing.T) {
 	defer deleteTablet(addTablet(100))
 
 	execStatements(t, []string{
-		"create table `begin`(`primary` int, `column` varbinary(128), primary key(`primary`))",
-		fmt.Sprintf("create table %s.`begin`(`primary` int, `column` varbinary(128), primary key(`primary`))", vrepldb),
-		"create table `rollback`(`primary` int, `column` varbinary(128), primary key(`primary`))",
-		fmt.Sprintf("create table %s.`rollback`(`primary` int, `column` varbinary(128), primary key(`primary`))", vrepldb),
-		"create table `commit`(`primary` int, `column` varbinary(128), primary key(`primary`))",
-		fmt.Sprintf("create table %s.`commit`(`primary` int, `column` varbinary(128), primary key(`primary`))", vrepldb),
+		"create table `begin`(`primary` int, `column` varchar(128), primary key(`primary`))",
+		fmt.Sprintf("create table %s.`begin`(`primary` int, `column` varchar(128), primary key(`primary`))", vrepldb),
+		"create table `rollback`(`primary` int, `column` varchar(128), primary key(`primary`))",
+		fmt.Sprintf("create table %s.`rollback`(`primary` int, `column` varchar(128), primary key(`primary`))", vrepldb),
+		"create table `commit`(`primary` int, `column` varchar(128), primary key(`primary`))",
+		fmt.Sprintf("create table %s.`commit`(`primary` int, `column` varchar(128), primary key(`primary`))", vrepldb),
 	})
 	defer execStatements(t, []string{
 		"drop table `begin`",
@@ -1257,7 +1256,7 @@ func TestPlayerKeyspaceID(t *testing.T) {
 		input: "insert into src1 values(1, 'aaa')",
 		output: qh.Expect(
 			"begin",
-			"insert into dst1(id,val) values (1,'\x16k@\xb4J\xbaK\xd6')",
+			"insert into dst1(id,val) values (1,_binary'\x16k@\xb4J\xbaK\xd6')",
 			"/update _vt.vreplication set pos=",
 			"commit",
 		),
@@ -1495,9 +1494,7 @@ func TestPlayerRowMove(t *testing.T) {
 	})
 	expectDBClientQueries(t, qh.Expect(
 		"begin",
-		"insert into dst(val1,sval2,rcount) values (1,ifnull(1, 0),1) on duplicate key update sval2=sval2+ifnull(values(sval2), 0), rcount=rcount+1",
-		"insert into dst(val1,sval2,rcount) values (2,ifnull(2, 0),1) on duplicate key update sval2=sval2+ifnull(values(sval2), 0), rcount=rcount+1",
-		"insert into dst(val1,sval2,rcount) values (2,ifnull(3, 0),1) on duplicate key update sval2=sval2+ifnull(values(sval2), 0), rcount=rcount+1",
+		"insert into dst(val1,sval2,rcount) values (1,ifnull(1, 0),1), (2,ifnull(2, 0),1), (2,ifnull(3, 0),1) on duplicate key update sval2=sval2+ifnull(values(sval2), 0), rcount=rcount+1",
 		"/update _vt.vreplication set pos=",
 		"commit",
 	))
@@ -1505,7 +1502,7 @@ func TestPlayerRowMove(t *testing.T) {
 		{"1", "1", "1"},
 		{"2", "5", "2"},
 	})
-	validateQueryCountStat(t, "replicate", 3)
+	validateQueryCountStat(t, "replicate", 1)
 
 	execStatements(t, []string{
 		"update src set val1=1, val2=4 where id=3",
@@ -1521,7 +1518,297 @@ func TestPlayerRowMove(t *testing.T) {
 		{"1", "5", "2"},
 		{"2", "2", "1"},
 	})
-	validateQueryCountStat(t, "replicate", 5)
+	validateQueryCountStat(t, "replicate", 3)
+}
+
+// TestPlayerPartialImages tests the behavior of the vplayer when modifying
+// a table with BLOB and JSON columns, including when modifying the Primary
+// Key for a row, when we have partial binlog images, meaning that
+// binlog-row-image=NOBLOB and/or binlog-row-value-options=PARTIAL_JSON.
+func TestPlayerPartialImages(t *testing.T) {
+	if !runPartialJSONTest {
+		t.Skip("Skipping test as binlog_row_value_options=PARTIAL_JSON is not enabled")
+	}
+
+	defer deleteTablet(addTablet(100))
+	execStatements(t, []string{
+		"create table src (id int, jd json, bd blob, primary key(id))",
+		fmt.Sprintf("create table %s.dst (id int, jd json, bd blob, primary key(id))", vrepldb),
+	})
+	defer execStatements(t, []string{
+		"drop table src",
+		fmt.Sprintf("drop table %s.dst", vrepldb),
+	})
+
+	filter := &binlogdatapb.Filter{
+		Rules: []*binlogdatapb.Rule{{
+			Match:  "dst",
+			Filter: "select * from src",
+		}},
+	}
+	bls := &binlogdatapb.BinlogSource{
+		Keyspace: env.KeyspaceName,
+		Shard:    env.ShardName,
+		Filter:   filter,
+		OnDdl:    binlogdatapb.OnDDLAction_IGNORE,
+	}
+	cancel, _ := startVReplication(t, bls, "")
+	defer cancel()
+
+	type testCase struct {
+		input  string
+		output []string
+		data   [][]string
+		error  string
+	}
+
+	var testCases []testCase
+
+	if vttablet.DefaultVReplicationConfig.ExperimentalFlags&vttablet.VReplicationExperimentalFlagVPlayerBatching == 0 {
+		testCases = append(testCases, testCase{
+			input: "insert into src (id, jd, bd) values (1,'{\"key1\": \"val1\"}','blob data'), (2,'{\"key2\": \"val2\"}','blob data2'), (3,'{\"key3\": \"val3\"}','blob data3')",
+			output: []string{
+				"insert into dst(id,jd,bd) values (1,JSON_OBJECT(_utf8mb4'key1', _utf8mb4'val1'),_binary'blob data')",
+				"insert into dst(id,jd,bd) values (2,JSON_OBJECT(_utf8mb4'key2', _utf8mb4'val2'),_binary'blob data2')",
+				"insert into dst(id,jd,bd) values (3,JSON_OBJECT(_utf8mb4'key3', _utf8mb4'val3'),_binary'blob data3')",
+			},
+			data: [][]string{
+				{"1", "{\"key1\": \"val1\"}", "blob data"},
+				{"2", "{\"key2\": \"val2\"}", "blob data2"},
+				{"3", "{\"key3\": \"val3\"}", "blob data3"},
+			},
+		})
+	} else {
+		testCases = append(testCases, testCase{
+			input: "insert into src (id, jd, bd) values (1,'{\"key1\": \"val1\"}','blob data'), (2,'{\"key2\": \"val2\"}','blob data2'), (3,'{\"key3\": \"val3\"}','blob data3')",
+			output: []string{
+				"insert into dst(id,jd,bd) values (1,JSON_OBJECT(_utf8mb4'key1', _utf8mb4'val1'),_binary'blob data'), (2,JSON_OBJECT(_utf8mb4'key2', _utf8mb4'val2'),_binary'blob data2'), (3,JSON_OBJECT(_utf8mb4'key3', _utf8mb4'val3'),_binary'blob data3')",
+			},
+			data: [][]string{
+				{"1", "{\"key1\": \"val1\"}", "blob data"},
+				{"2", "{\"key2\": \"val2\"}", "blob data2"},
+				{"3", "{\"key3\": \"val3\"}", "blob data3"},
+			},
+		})
+	}
+	if runNoBlobTest {
+		testCases = append(testCases, testCase{
+			input: `update src set jd=JSON_SET(jd, '$.color', 'red') where id = 1`,
+			output: []string{
+				"update dst set jd=JSON_INSERT(`jd`, _utf8mb4'$.color', CAST(JSON_QUOTE(_utf8mb4'red') as JSON)) where id=1",
+			},
+			data: [][]string{
+				{"1", "{\"key1\": \"val1\", \"color\": \"red\"}", "blob data"},
+				{"2", "{\"key2\": \"val2\"}", "blob data2"},
+				{"3", "{\"key3\": \"val3\"}", "blob data3"},
+			},
+		})
+	} else {
+		testCases = append(testCases, testCase{
+			input: `update src set jd=JSON_SET(jd, '$.color', 'red') where id = 1`,
+			output: []string{
+				"update dst set jd=JSON_INSERT(`jd`, _utf8mb4'$.color', CAST(JSON_QUOTE(_utf8mb4'red') as JSON)), bd=_binary'blob data' where id=1",
+			},
+			data: [][]string{
+				{"1", "{\"key1\": \"val1\", \"color\": \"red\"}", "blob data"},
+				{"2", "{\"key2\": \"val2\"}", "blob data2"},
+				{"3", "{\"key3\": \"val3\"}", "blob data3"},
+			},
+		})
+	}
+	testCases = append(testCases, []testCase{
+		{
+			input: `update src set bd = 'new blob data' where id = 2`,
+			output: []string{
+				"update dst set bd=_binary'new blob data' where id=2",
+			},
+			data: [][]string{
+				{"1", "{\"key1\": \"val1\", \"color\": \"red\"}", "blob data"},
+				{"2", "{\"key2\": \"val2\"}", "new blob data"},
+				{"3", "{\"key3\": \"val3\"}", "blob data3"},
+			},
+		},
+		{
+			input: `update src set id = id+10, bd = 'newest blob data' where id = 2`,
+			output: []string{
+				"delete from dst where id=2",
+				"insert into dst(id,jd,bd) values (12,JSON_OBJECT(_utf8mb4'key2', _utf8mb4'val2'),_binary'newest blob data')",
+			},
+			data: [][]string{
+				{"1", "{\"key1\": \"val1\", \"color\": \"red\"}", "blob data"},
+				{"3", "{\"key3\": \"val3\"}", "blob data3"},
+				{"12", "{\"key2\": \"val2\"}", "newest blob data"},
+			},
+		},
+	}...)
+	if runNoBlobTest {
+		testCases = append(testCases, []testCase{
+			{
+				input: `update src set jd=JSON_SET(jd, '$.years', 5) where id = 1`,
+				output: []string{
+					"update dst set jd=JSON_INSERT(`jd`, _utf8mb4'$.years', CAST(5 as JSON)) where id=1",
+				},
+				data: [][]string{
+					{"1", "{\"key1\": \"val1\", \"color\": \"red\", \"years\": 5}", "blob data"},
+					{"3", "{\"key3\": \"val3\"}", "blob data3"},
+					{"12", "{\"key2\": \"val2\"}", "newest blob data"},
+				},
+			},
+			{
+				input: `update src set jd=JSON_SET(jd, '$.hobbies', JSON_ARRAY('skiing', 'video games', 'hiking')) where id = 1`,
+				output: []string{
+					"update dst set jd=JSON_INSERT(`jd`, _utf8mb4'$.hobbies', JSON_ARRAY(_utf8mb4'skiing', _utf8mb4'video games', _utf8mb4'hiking')) where id=1",
+				},
+				data: [][]string{
+					{"1", "{\"key1\": \"val1\", \"color\": \"red\", \"years\": 5, \"hobbies\": [\"skiing\", \"video games\", \"hiking\"]}", "blob data"},
+					{"3", "{\"key3\": \"val3\"}", "blob data3"},
+					{"12", "{\"key2\": \"val2\"}", "newest blob data"},
+				},
+			},
+			{
+				input: `update src set jd=JSON_SET(jd, '$.misc', '{"address":"1012 S Park", "town":"Hastings", "state":"MI"}') where id = 12`,
+				output: []string{
+					"update dst set jd=JSON_INSERT(`jd`, _utf8mb4'$.misc', CAST(JSON_QUOTE(_utf8mb4'{\"address\":\"1012 S Park\", \"town\":\"Hastings\", \"state\":\"MI\"}') as JSON)) where id=12",
+				},
+				data: [][]string{
+					{"1", "{\"key1\": \"val1\", \"color\": \"red\", \"years\": 5, \"hobbies\": [\"skiing\", \"video games\", \"hiking\"]}", "blob data"},
+					{"3", "{\"key3\": \"val3\"}", "blob data3"},
+					{"12", "{\"key2\": \"val2\", \"misc\": \"{\\\"address\\\":\\\"1012 S Park\\\", \\\"town\\\":\\\"Hastings\\\", \\\"state\\\":\\\"MI\\\"}\"}", "newest blob data"},
+				},
+			},
+			{
+				input: `update src set jd=JSON_SET(jd, '$.current', true) where id = 12`,
+				output: []string{
+					"update dst set jd=JSON_INSERT(`jd`, _utf8mb4'$.current', CAST(_utf8mb4'true' as JSON)) where id=12",
+				},
+				data: [][]string{
+					{"1", "{\"key1\": \"val1\", \"color\": \"red\", \"years\": 5, \"hobbies\": [\"skiing\", \"video games\", \"hiking\"]}", "blob data"},
+					{"3", "{\"key3\": \"val3\"}", "blob data3"},
+					{"12", "{\"key2\": \"val2\", \"misc\": \"{\\\"address\\\":\\\"1012 S Park\\\", \\\"town\\\":\\\"Hastings\\\", \\\"state\\\":\\\"MI\\\"}\", \"current\": true}", "newest blob data"},
+				},
+			},
+			{
+				input: `update src set jd=JSON_SET(jd, '$.idontknow', null, '$.idontknoweither', 'null') where id = 3`,
+				output: []string{
+					"update dst set jd=JSON_INSERT(JSON_INSERT(`jd`, _utf8mb4'$.idontknow', CAST(_utf8mb4'null' as JSON)), _utf8mb4'$.idontknoweither', CAST(JSON_QUOTE(_utf8mb4'null') as JSON)) where id=3",
+				},
+				data: [][]string{
+					{"1", "{\"key1\": \"val1\", \"color\": \"red\", \"years\": 5, \"hobbies\": [\"skiing\", \"video games\", \"hiking\"]}", "blob data"},
+					{"3", "{\"key3\": \"val3\", \"idontknow\": null, \"idontknoweither\": \"null\"}", "blob data3"},
+					{"12", "{\"key2\": \"val2\", \"misc\": \"{\\\"address\\\":\\\"1012 S Park\\\", \\\"town\\\":\\\"Hastings\\\", \\\"state\\\":\\\"MI\\\"}\", \"current\": true}", "newest blob data"},
+				},
+			},
+			{
+				input: `update src set id = id+10 where id = 3`,
+				error: "binary log event missing a needed value for dst.bd due to not using binlog-row-image=FULL",
+			},
+		}...)
+	} else {
+		testCases = append(testCases, []testCase{
+			{
+				input: `update src set jd=JSON_SET(jd, '$.years', 5) where id = 1`,
+				output: []string{
+					"update dst set jd=JSON_INSERT(`jd`, _utf8mb4'$.years', CAST(5 as JSON)), bd=_binary'blob data' where id=1",
+				},
+				data: [][]string{
+					{"1", "{\"key1\": \"val1\", \"color\": \"red\", \"years\": 5}", "blob data"},
+					{"3", "{\"key3\": \"val3\"}", "blob data3"},
+					{"12", "{\"key2\": \"val2\"}", "newest blob data"},
+				},
+			},
+			{
+				input: `update src set jd=JSON_SET(jd, '$.hobbies', JSON_ARRAY('skiing', 'video games', 'hiking')) where id = 1`,
+				output: []string{
+					"update dst set jd=JSON_INSERT(`jd`, _utf8mb4'$.hobbies', JSON_ARRAY(_utf8mb4'skiing', _utf8mb4'video games', _utf8mb4'hiking')), bd=_binary'blob data' where id=1",
+				},
+				data: [][]string{
+					{"1", "{\"key1\": \"val1\", \"color\": \"red\", \"years\": 5, \"hobbies\": [\"skiing\", \"video games\", \"hiking\"]}", "blob data"},
+					{"3", "{\"key3\": \"val3\"}", "blob data3"},
+					{"12", "{\"key2\": \"val2\"}", "newest blob data"},
+				},
+			},
+			{
+				input: `update src set jd=JSON_SET(jd, '$.misc', '{"address":"1012 S Park", "town":"Hastings", "state":"MI"}') where id = 12`,
+				output: []string{
+					"update dst set jd=JSON_INSERT(`jd`, _utf8mb4'$.misc', CAST(JSON_QUOTE(_utf8mb4'{\"address\":\"1012 S Park\", \"town\":\"Hastings\", \"state\":\"MI\"}') as JSON)), bd=_binary'newest blob data' where id=12",
+				},
+				data: [][]string{
+					{"1", "{\"key1\": \"val1\", \"color\": \"red\", \"years\": 5, \"hobbies\": [\"skiing\", \"video games\", \"hiking\"]}", "blob data"},
+					{"3", "{\"key3\": \"val3\"}", "blob data3"},
+					{"12", "{\"key2\": \"val2\", \"misc\": \"{\\\"address\\\":\\\"1012 S Park\\\", \\\"town\\\":\\\"Hastings\\\", \\\"state\\\":\\\"MI\\\"}\"}", "newest blob data"},
+				},
+			},
+			{
+				input: `update src set jd=JSON_SET(jd, '$.current', true) where id = 12`,
+				output: []string{
+					"update dst set jd=JSON_INSERT(`jd`, _utf8mb4'$.current', CAST(_utf8mb4'true' as JSON)), bd=_binary'newest blob data' where id=12",
+				},
+				data: [][]string{
+					{"1", "{\"key1\": \"val1\", \"color\": \"red\", \"years\": 5, \"hobbies\": [\"skiing\", \"video games\", \"hiking\"]}", "blob data"},
+					{"3", "{\"key3\": \"val3\"}", "blob data3"},
+					{"12", "{\"key2\": \"val2\", \"misc\": \"{\\\"address\\\":\\\"1012 S Park\\\", \\\"town\\\":\\\"Hastings\\\", \\\"state\\\":\\\"MI\\\"}\", \"current\": true}", "newest blob data"},
+				},
+			},
+			{
+				input: `update src set jd=JSON_SET(jd, '$.idontknow', null, '$.idontknoweither', 'null') where id = 3`,
+				output: []string{
+					"update dst set jd=JSON_INSERT(JSON_INSERT(`jd`, _utf8mb4'$.idontknow', CAST(_utf8mb4'null' as JSON)), _utf8mb4'$.idontknoweither', CAST(JSON_QUOTE(_utf8mb4'null') as JSON)), bd=_binary'blob data3' where id=3",
+				},
+				data: [][]string{
+					{"1", "{\"key1\": \"val1\", \"color\": \"red\", \"years\": 5, \"hobbies\": [\"skiing\", \"video games\", \"hiking\"]}", "blob data"},
+					{"3", "{\"key3\": \"val3\", \"idontknow\": null, \"idontknoweither\": \"null\"}", "blob data3"},
+					{"12", "{\"key2\": \"val2\", \"misc\": \"{\\\"address\\\":\\\"1012 S Park\\\", \\\"town\\\":\\\"Hastings\\\", \\\"state\\\":\\\"MI\\\"}\", \"current\": true}", "newest blob data"},
+				},
+			},
+			{
+				input: `update src set id = id+10 where id = 3`,
+				output: []string{
+					"delete from dst where id=3",
+					"insert into dst(id,jd,bd) values (13,JSON_OBJECT(_utf8mb4'idontknow', null, _utf8mb4'idontknoweither', _utf8mb4'null', _utf8mb4'key3', _utf8mb4'val3'),_binary'blob data3')",
+				},
+				data: [][]string{
+					{"1", "{\"key1\": \"val1\", \"color\": \"red\", \"years\": 5, \"hobbies\": [\"skiing\", \"video games\", \"hiking\"]}", "blob data"},
+					{"12", "{\"key2\": \"val2\", \"misc\": \"{\\\"address\\\":\\\"1012 S Park\\\", \\\"town\\\":\\\"Hastings\\\", \\\"state\\\":\\\"MI\\\"}\", \"current\": true}", "newest blob data"},
+					{"13", "{\"key3\": \"val3\", \"idontknow\": null, \"idontknoweither\": \"null\"}", "blob data3"},
+				},
+			},
+		}...)
+	}
+
+	for _, tc := range testCases {
+		t.Run(tc.input, func(t *testing.T) {
+			execStatements(t, []string{tc.input})
+			var want qh.ExpectationSequencer
+			if tc.error != "" {
+				if vttablet.DefaultVReplicationConfig.ExperimentalFlags&vttablet.VReplicationExperimentalFlagVPlayerBatching == 0 {
+					want = qh.Expect(
+						"begin",
+						"delete from dst where id=3",
+						"rollback",
+					).Then(qh.Immediately(
+						fmt.Sprintf("/update _vt.vreplication set message=.*%s.*", tc.error),
+					))
+				} else {
+					want = qh.Expect(
+						"rollback",
+					).Then(qh.Immediately(
+						fmt.Sprintf("/update _vt.vreplication set message=.*%s.*", tc.error),
+					))
+				}
+				expectDBClientQueries(t, want)
+			} else {
+				want = qh.Expect(
+					"begin",
+					tc.output...,
+				).Then(qh.Immediately(
+					"/update _vt.vreplication set pos=",
+					"commit",
+				))
+				expectDBClientQueries(t, want)
+				expectData(t, "dst", tc.data)
+			}
+		})
+	}
 }
 
 func TestPlayerTypes(t *testing.T) {
@@ -1580,12 +1867,14 @@ func TestPlayerTypes(t *testing.T) {
 	}
 	cancel, _ := startVReplication(t, bls, "")
 	defer cancel()
+
 	type testcase struct {
 		input  string
 		output string
 		table  string
 		data   [][]string
 	}
+
 	testcases := []testcase{{
 		input:  "insert into vitess_ints values(-128, 255, -32768, 65535, -8388608, 16777215, -2147483648, 4294967295, -9223372036854775808, 18446744073709551615, 2012)",
 		output: "insert into vitess_ints(tiny,tinyu,small,smallu,medium,mediumu,normal,normalu,big,bigu,y) values (-128,255,-32768,65535,-8388608,16777215,-2147483648,4294967295,-9223372036854775808,18446744073709551615,2012)",
@@ -1602,7 +1891,7 @@ func TestPlayerTypes(t *testing.T) {
 		},
 	}, {
 		input:  "insert into vitess_strings values('a', 'b', 'c', 'd', 'e', 'f', 'g', 'h', 'a', 'a,b,f,l,q,s,v,z')",
-		output: "insert into vitess_strings(vb,c,vc,b,tb,bl,ttx,tx,en,s) values ('a','b','c','d\\0\\0\\0\\0','e','f','g','h','a','a,b,f,l,q,s,v,z')",
+		output: "insert into vitess_strings(vb,c,vc,b,tb,bl,ttx,tx,en,s) values (_binary'a','b','c',_binary'd\\0\\0\\0\\0',_binary'e',_binary'f','g','h','a','a,b,f,l,q,s,v,z')",
 		table:  "vitess_strings",
 		data: [][]string{
 			{"a", "b", "c", "d\000\000\000\000", "e", "f", "g", "h", "a", "a,b,f,l,q,s,v,z"},
@@ -1623,7 +1912,7 @@ func TestPlayerTypes(t *testing.T) {
 		},
 	}, {
 		input:  "insert into binary_pk values('a', 'aaa')",
-		output: "insert into binary_pk(b,val) values ('a\\0\\0\\0','aaa')",
+		output: "insert into binary_pk(b,val) values (_binary'a\\0\\0\\0',_binary'aaa')",
 		table:  "binary_pk",
 		data: [][]string{
 			{"a\000\000\000", "aaa"},
@@ -1638,7 +1927,7 @@ func TestPlayerTypes(t *testing.T) {
 	}, {
 		// Binary pk is a special case: https://github.com/vitessio/vitess/issues/3984
 		input:  "update binary_pk set val='bbb' where b='a\\0\\0\\0'",
-		output: "update binary_pk set val='bbb' where b='a\\0\\0\\0'",
+		output: "update binary_pk set val=_binary'bbb' where b=_binary'a\\0\\0\\0'",
 		table:  "binary_pk",
 		data: [][]string{
 			{"a\000\000\000", "bbb"},
@@ -1658,15 +1947,30 @@ func TestPlayerTypes(t *testing.T) {
 			{"1", "", "{}", "123", `{"a": [42, 100]}`, `{"foo": "bar"}`},
 			{"2", "null", `{"name": null}`, "123", `{"a": [42, 100]}`, `{"foo": "bar"}`},
 		},
-	}, {
-		input:  "update vitess_json set val1 = '{\"bar\": \"foo\"}', val4 = '{\"a\": [98, 123]}', val5 = convert(x'7b7d' using utf8mb4) where id=1",
-		output: "update vitess_json set val1=JSON_OBJECT(_utf8mb4'bar', _utf8mb4'foo'), val2=JSON_OBJECT(), val3=CAST(123 as JSON), val4=JSON_OBJECT(_utf8mb4'a', JSON_ARRAY(98, 123)), val5=JSON_OBJECT() where id=1",
-		table:  "vitess_json",
-		data: [][]string{
-			{"1", `{"bar": "foo"}`, "{}", "123", `{"a": [98, 123]}`, `{}`},
-			{"2", "null", `{"name": null}`, "123", `{"a": [42, 100]}`, `{"foo": "bar"}`},
-		},
 	}}
+	if runPartialJSONTest {
+		// With partial JSON values we don't replicate the JSON columns that aren't
+		// actually updated.
+		testcases = append(testcases, testcase{
+			input:  "update vitess_json set val1 = '{\"bar\": \"foo\"}', val4 = '{\"a\": [98, 123]}', val5 = convert(x'7b7d' using utf8mb4) where id=1",
+			output: "update vitess_json set val1=JSON_OBJECT(_utf8mb4'bar', _utf8mb4'foo'), val4=JSON_OBJECT(_utf8mb4'a', JSON_ARRAY(98, 123)), val5=JSON_OBJECT() where id=1",
+			table:  "vitess_json",
+			data: [][]string{
+				{"1", `{"bar": "foo"}`, "{}", "123", `{"a": [98, 123]}`, `{}`},
+				{"2", "null", `{"name": null}`, "123", `{"a": [42, 100]}`, `{"foo": "bar"}`},
+			},
+		})
+	} else {
+		testcases = append(testcases, testcase{
+			input:  "update vitess_json set val1 = '{\"bar\": \"foo\"}', val4 = '{\"a\": [98, 123]}', val5 = convert(x'7b7d' using utf8mb4) where id=1",
+			output: "update vitess_json set val1=JSON_OBJECT(_utf8mb4'bar', _utf8mb4'foo'), val2=JSON_OBJECT(), val3=CAST(123 as JSON), val4=JSON_OBJECT(_utf8mb4'a', JSON_ARRAY(98, 123)), val5=JSON_OBJECT() where id=1",
+			table:  "vitess_json",
+			data: [][]string{
+				{"1", `{"bar": "foo"}`, "{}", "123", `{"a": [98, 123]}`, `{}`},
+				{"2", "null", `{"name": null}`, "123", `{"a": [42, 100]}`, `{"foo": "bar"}`},
+			},
+		})
+	}
 
 	for _, tcases := range testcases {
 		execStatements(t, []string{tcases.input})
@@ -1782,7 +2086,7 @@ func TestPlayerDDL(t *testing.T) {
 	expectDBClientQueries(t, qh.Expect(
 		"alter table t1 add column val2 varchar(128)",
 		"/update _vt.vreplication set message='error applying event: Duplicate",
-		"/update _vt.vreplication set state='Error', message='error applying event: Duplicate",
+		"/update _vt.vreplication set state='Error', message='terminal error: error applying event: Duplicate",
 	))
 	cancel()
 
@@ -1874,9 +2178,9 @@ func TestPlayerStopPos(t *testing.T) {
 		vttablet.DefaultVReplicationConfig.StoreCompressedGTID = false
 	}()
 	execStatements(t, []string{
-		"create table yes(id int, val varbinary(128), primary key(id))",
-		fmt.Sprintf("create table %s.yes(id int, val varbinary(128), primary key(id))", vrepldb),
-		"create table no(id int, val varbinary(128), primary key(id))",
+		"create table yes(id int, val varchar(128), primary key(id))",
+		fmt.Sprintf("create table %s.yes(id int, val varchar(128), primary key(id))", vrepldb),
+		"create table no(id int, val varchar(128), primary key(id))",
 	})
 	defer execStatements(t, []string{
 		"drop table yes",
@@ -2084,8 +2388,8 @@ func TestPlayerIdleUpdate(t *testing.T) {
 	idleTimeout = 100 * time.Millisecond
 
 	execStatements(t, []string{
-		"create table t1(id int, val varbinary(128), primary key(id))",
-		fmt.Sprintf("create table %s.t1(id int, val varbinary(128), primary key(id))", vrepldb),
+		"create table t1(id int, val varchar(128), primary key(id))",
+		fmt.Sprintf("create table %s.t1(id int, val varchar(128), primary key(id))", vrepldb),
 	})
 	defer execStatements(t, []string{
 		"drop table t1",
@@ -2137,8 +2441,8 @@ func TestPlayerSplitTransaction(t *testing.T) {
 	defer setFlag("vstream_packet_size", "10000")
 
 	execStatements(t, []string{
-		"create table t1(id int, val varbinary(128), primary key(id))",
-		fmt.Sprintf("create table %s.t1(id int, val varbinary(128), primary key(id))", vrepldb),
+		"create table t1(id int, val varchar(128), primary key(id))",
+		fmt.Sprintf("create table %s.t1(id int, val varchar(128), primary key(id))", vrepldb),
 	})
 	defer execStatements(t, []string{
 		"drop table t1",
@@ -2179,9 +2483,17 @@ func TestPlayerSplitTransaction(t *testing.T) {
 func TestPlayerLockErrors(t *testing.T) {
 	defer deleteTablet(addTablet(100))
 
+	// The immediate retry behavior does not apply when doing
+	// VPlayer Batching.
+	origExperimentalFlags := vttablet.DefaultVReplicationConfig.ExperimentalFlags
+	vttablet.DefaultVReplicationConfig.ExperimentalFlags = 0
+	defer func() {
+		vttablet.DefaultVReplicationConfig.ExperimentalFlags = origExperimentalFlags
+	}()
+
 	execStatements(t, []string{
-		"create table t1(id int, val varbinary(128), primary key(id))",
-		fmt.Sprintf("create table %s.t1(id int, val varbinary(128), primary key(id))", vrepldb),
+		"create table t1(id int, val varchar(128), primary key(id))",
+		fmt.Sprintf("create table %s.t1(id int, val varchar(128), primary key(id))", vrepldb),
 	})
 	defer execStatements(t, []string{
 		"drop table t1",
@@ -2258,9 +2570,17 @@ func TestPlayerLockErrors(t *testing.T) {
 func TestPlayerCancelOnLock(t *testing.T) {
 	defer deleteTablet(addTablet(100))
 
+	// The immediate retry behavior does not apply when doing
+	// VPlayer Batching.
+	origExperimentalFlags := vttablet.DefaultVReplicationConfig.ExperimentalFlags
+	vttablet.DefaultVReplicationConfig.ExperimentalFlags = 0
+	defer func() {
+		vttablet.DefaultVReplicationConfig.ExperimentalFlags = origExperimentalFlags
+	}()
+
 	execStatements(t, []string{
-		"create table t1(id int, val varbinary(128), primary key(id))",
-		fmt.Sprintf("create table %s.t1(id int, val varbinary(128), primary key(id))", vrepldb),
+		"create table t1(id int, val varchar(128), primary key(id))",
+		fmt.Sprintf("create table %s.t1(id int, val varchar(128), primary key(id))", vrepldb),
 	})
 	defer execStatements(t, []string{
 		"drop table t1",
@@ -2336,8 +2656,8 @@ func TestPlayerTransactions(t *testing.T) {
 	defer deleteTablet(addTablet(100))
 
 	execStatements(t, []string{
-		"create table t1(id int, val varbinary(128), primary key(id))",
-		fmt.Sprintf("create table %s.t1(id int, val varbinary(128), primary key(id))", vrepldb),
+		"create table t1(id int, val varchar(128), primary key(id))",
+		fmt.Sprintf("create table %s.t1(id int, val varchar(128), primary key(id))", vrepldb),
 	})
 	defer execStatements(t, []string{
 		"drop table t1",
@@ -2441,8 +2761,8 @@ func TestPlayerRelayLogMaxSize(t *testing.T) {
 			}
 
 			execStatements(t, []string{
-				"create table t1(id int, val varbinary(128), primary key(id))",
-				fmt.Sprintf("create table %s.t1(id int, val varbinary(128), primary key(id))", vrepldb),
+				"create table t1(id int, val varchar(128), primary key(id))",
+				fmt.Sprintf("create table %s.t1(id int, val varchar(128), primary key(id))", vrepldb),
 			})
 			defer execStatements(t, []string{
 				"drop table t1",
@@ -2535,8 +2855,8 @@ func TestRestartOnVStreamEnd(t *testing.T) {
 	vttablet.DefaultVReplicationConfig.RetryDelay = 1 * time.Millisecond
 
 	execStatements(t, []string{
-		"create table t1(id int, val varbinary(128), primary key(id))",
-		fmt.Sprintf("create table %s.t1(id int, val varbinary(128), primary key(id))", vrepldb),
+		"create table t1(id int, val varchar(128), primary key(id))",
+		fmt.Sprintf("create table %s.t1(id int, val varchar(128), primary key(id))", vrepldb),
 	})
 	defer execStatements(t, []string{
 		"drop table t1",
@@ -2801,10 +3121,10 @@ func TestGeneratedColumns(t *testing.T) {
 	defer deleteTablet(addTablet(100))
 
 	execStatements(t, []string{
-		"create table t1(id int, val varbinary(6), val2 varbinary(6) as (concat(id, val)), val3 varbinary(6) as (concat(val, id)), id2 int, primary key(id))",
-		fmt.Sprintf("create table %s.t1(id int, val varbinary(6), val2 varbinary(6) as (concat(id, val)), val3 varbinary(6), id2 int, primary key(id))", vrepldb),
-		"create table t2(id int, val varbinary(128), val2 varbinary(128) as (concat(id, val)) stored, val3 varbinary(128) as (concat(val, id)), id2 int, primary key(id))",
-		fmt.Sprintf("create table %s.t2(id int, val3 varbinary(128), val varbinary(128), id2 int, primary key(id))", vrepldb),
+		"create table t1(id int, val varchar(6), val2 varchar(6) as (concat(id, val)), val3 varchar(6) as (concat(val, id)), id2 int, primary key(id))",
+		fmt.Sprintf("create table %s.t1(id int, val varchar(6), val2 varchar(6) as (concat(id, val)), val3 varchar(6), id2 int, primary key(id))", vrepldb),
+		"create table t2(id int, val varchar(128), val2 varchar(128) as (concat(id, val)) stored, val3 varchar(128) as (concat(val, id)), id2 int, primary key(id))",
+		fmt.Sprintf("create table %s.t2(id int, val3 varchar(128), val varchar(128), id2 int, primary key(id))", vrepldb),
 	})
 	defer execStatements(t, []string{
 		"drop table t1",
@@ -2962,10 +3282,10 @@ func TestPlayerNoBlob(t *testing.T) {
 
 	defer deleteTablet(addTablet(100))
 	execStatements(t, []string{
-		"create table t1(id int, val1 varchar(20), blb1 blob, id2 int, blb2 longblob, val2 varbinary(10), primary key(id))",
-		fmt.Sprintf("create table %s.t1(id int, val1 varchar(20), blb1 blob, id2 int, blb2 longblob, val2 varbinary(10), primary key(id))", vrepldb),
-		"create table t2(id int, val1 varchar(20), txt1 text, id2 int, val2 varbinary(10), unique key(id, val1))",
-		fmt.Sprintf("create table %s.t2(id int, val1 varchar(20), txt1 text, id2 int, val2 varbinary(10), primary key(id, val1))", vrepldb),
+		"create table t1(id int, val1 varchar(20), blb1 text, id2 int, blb2 longtext, val2 varchar(10), primary key(id))",
+		fmt.Sprintf("create table %s.t1(id int, val1 varchar(20), blb1 text, id2 int, blb2 longtext, val2 varchar(10), primary key(id))", vrepldb),
+		"create table t2(id int, val1 varchar(20), txt1 text, id2 int, val2 varchar(10), unique key(id, val1))",
+		fmt.Sprintf("create table %s.t2(id int, val1 varchar(20), txt1 text, id2 int, val2 varchar(10), primary key(id, val1))", vrepldb),
 	})
 	defer execStatements(t, []string{
 		"drop table t1",

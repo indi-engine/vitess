@@ -24,7 +24,10 @@ import (
 
 	"vitess.io/vitess/go/test/endtoend/cluster"
 	"vitess.io/vitess/go/test/endtoend/vtorc/utils"
+	topodatapb "vitess.io/vitess/go/vt/proto/topodata"
 	"vitess.io/vitess/go/vt/servenv"
+
+	vtutils "vitess.io/vitess/go/vt/utils"
 	"vitess.io/vitess/go/vt/vtorc/config"
 	"vitess.io/vitess/go/vt/vtorc/inst"
 	"vitess.io/vitess/go/vt/vtorc/logic"
@@ -49,14 +52,23 @@ func TestReadTopologyInstanceBufferable(t *testing.T) {
 	}()
 
 	// Change the args such that they match how we would invoke VTOrc
-	os.Args = []string{"vtorc",
-		"--topo_global_server_address", clusterInfo.ClusterInstance.VtctlProcess.TopoGlobalAddress,
-		"--topo_implementation", clusterInfo.ClusterInstance.VtctlProcess.TopoImplementation,
-		"--topo_global_root", clusterInfo.ClusterInstance.VtctlProcess.TopoGlobalRoot,
+	args := map[string]string{
+		"--topo-global-server-address": clusterInfo.ClusterInstance.VtctldClientProcess.TopoGlobalAddress,
+		"--topo-implementation":        clusterInfo.ClusterInstance.VtctldClientProcess.TopoImplementation,
+		"--topo-global-root":           clusterInfo.ClusterInstance.VtctldClientProcess.TopoGlobalRoot,
 	}
+
+	vtutils.SetFlagVariantsForTests(args, "--topo-global-server-address", clusterInfo.ClusterInstance.VtctldClientProcess.TopoGlobalAddress)
+	vtutils.SetFlagVariantsForTests(args, "--topo-implementation", clusterInfo.ClusterInstance.VtctldClientProcess.TopoImplementation)
+	vtutils.SetFlagVariantsForTests(args, "--topo-global-root", clusterInfo.ClusterInstance.VtctldClientProcess.TopoGlobalRoot)
+
+	os.Args = []string{"vtorc"}
+	for k, v := range args {
+		os.Args = append(os.Args, k, v)
+	}
+
 	servenv.ParseFlags("vtorc")
-	config.Config.RecoveryPeriodBlockSeconds = 1
-	config.Config.InstancePollSeconds = 1
+	config.SetInstancePollTime(1 * time.Second)
 	config.MarkConfigurationLoaded()
 	server.StartVTOrcDiscovery()
 
@@ -75,10 +87,11 @@ func TestReadTopologyInstanceBufferable(t *testing.T) {
 	require.NotNil(t, primaryInstance)
 	assert.Equal(t, utils.Hostname, primaryInstance.Hostname)
 	assert.Equal(t, primary.MySQLPort, primaryInstance.Port)
+	assert.Equal(t, topodatapb.TabletType_PRIMARY, primaryInstance.TabletType)
 	assert.Contains(t, primaryInstance.InstanceAlias, "zone1")
 	assert.NotEqual(t, 0, primaryInstance.ServerID)
 	assert.Greater(t, len(primaryInstance.ServerUUID), 10)
-	assert.Regexp(t, "[58].[70].*", primaryInstance.Version)
+	assert.Regexp(t, "[58].[704].*", primaryInstance.Version)
 	assert.NotEmpty(t, primaryInstance.VersionComment)
 	assert.False(t, primaryInstance.ReadOnly)
 	assert.True(t, primaryInstance.LogBinEnabled)
@@ -87,11 +100,12 @@ func TestReadTopologyInstanceBufferable(t *testing.T) {
 	assert.Equal(t, "ON", primaryInstance.GTIDMode)
 	assert.Equal(t, "FULL", primaryInstance.BinlogRowImage)
 	assert.Contains(t, primaryInstance.SelfBinlogCoordinates.LogFile, fmt.Sprintf("vt-0000000%d-bin", primary.TabletUID))
-	assert.Greater(t, primaryInstance.SelfBinlogCoordinates.LogPos, uint32(0))
+	assert.Greater(t, primaryInstance.SelfBinlogCoordinates.LogPos, uint64(0))
 	assert.True(t, primaryInstance.SemiSyncPrimaryEnabled)
 	assert.True(t, primaryInstance.SemiSyncReplicaEnabled)
 	assert.True(t, primaryInstance.SemiSyncPrimaryStatus)
 	assert.False(t, primaryInstance.SemiSyncReplicaStatus)
+	assert.False(t, primaryInstance.SemiSyncBlocked)
 	assert.EqualValues(t, 2, primaryInstance.SemiSyncPrimaryClients)
 	assert.EqualValues(t, 1, primaryInstance.SemiSyncPrimaryWaitForReplicaCount)
 	assert.EqualValues(t, 1000000000000000000, primaryInstance.SemiSyncPrimaryTimeout)
@@ -125,10 +139,11 @@ func TestReadTopologyInstanceBufferable(t *testing.T) {
 	require.NotNil(t, replicaInstance)
 	assert.Equal(t, utils.Hostname, replicaInstance.Hostname)
 	assert.Equal(t, replica.MySQLPort, replicaInstance.Port)
+	assert.Equal(t, topodatapb.TabletType_REPLICA, replicaInstance.TabletType)
 	assert.Contains(t, replicaInstance.InstanceAlias, "zone1")
 	assert.NotEqual(t, 0, replicaInstance.ServerID)
 	assert.Greater(t, len(replicaInstance.ServerUUID), 10)
-	assert.Regexp(t, "[58].[70].*", replicaInstance.Version)
+	assert.Regexp(t, "[58].[704].*", replicaInstance.Version)
 	assert.NotEmpty(t, replicaInstance.VersionComment)
 	assert.True(t, replicaInstance.ReadOnly)
 	assert.True(t, replicaInstance.LogBinEnabled)
@@ -139,10 +154,11 @@ func TestReadTopologyInstanceBufferable(t *testing.T) {
 	assert.Equal(t, utils.Hostname, replicaInstance.SourceHost)
 	assert.Equal(t, primary.MySQLPort, replicaInstance.SourcePort)
 	assert.Contains(t, replicaInstance.SelfBinlogCoordinates.LogFile, fmt.Sprintf("vt-0000000%d-bin", replica.TabletUID))
-	assert.Greater(t, replicaInstance.SelfBinlogCoordinates.LogPos, uint32(0))
+	assert.Greater(t, replicaInstance.SelfBinlogCoordinates.LogPos, uint64(0))
 	assert.False(t, replicaInstance.SemiSyncPrimaryEnabled)
 	assert.True(t, replicaInstance.SemiSyncReplicaEnabled)
 	assert.False(t, replicaInstance.SemiSyncPrimaryStatus)
+	assert.False(t, replicaInstance.SemiSyncBlocked)
 	assert.True(t, replicaInstance.SemiSyncReplicaStatus)
 	assert.EqualValues(t, 0, replicaInstance.SemiSyncPrimaryClients)
 	assert.EqualValues(t, 1, replicaInstance.SemiSyncPrimaryWaitForReplicaCount)
@@ -157,16 +173,15 @@ func TestReadTopologyInstanceBufferable(t *testing.T) {
 	assert.True(t, replicaInstance.ReplicationIOThreadRuning)
 	assert.True(t, replicaInstance.ReplicationSQLThreadRuning)
 	assert.Equal(t, replicaInstance.ReadBinlogCoordinates.LogFile, primaryInstance.SelfBinlogCoordinates.LogFile)
-	assert.Greater(t, replicaInstance.ReadBinlogCoordinates.LogPos, uint32(0))
+	assert.Greater(t, replicaInstance.ReadBinlogCoordinates.LogPos, uint64(0))
 	assert.Equal(t, replicaInstance.ExecBinlogCoordinates.LogFile, primaryInstance.SelfBinlogCoordinates.LogFile)
-	assert.Greater(t, replicaInstance.ExecBinlogCoordinates.LogPos, uint32(0))
+	assert.Greater(t, replicaInstance.ExecBinlogCoordinates.LogPos, uint64(0))
 	assert.Contains(t, replicaInstance.RelaylogCoordinates.LogFile, fmt.Sprintf("vt-0000000%d-relay", replica.TabletUID))
-	assert.Greater(t, replicaInstance.RelaylogCoordinates.LogPos, uint32(0))
+	assert.Greater(t, replicaInstance.RelaylogCoordinates.LogPos, uint64(0))
 	assert.Empty(t, replicaInstance.LastIOError)
 	assert.Empty(t, replicaInstance.LastSQLError)
 	assert.EqualValues(t, 0, replicaInstance.SQLDelay)
 	assert.True(t, replicaInstance.UsingOracleGTID)
-	assert.False(t, replicaInstance.UsingMariaDBGTID)
 	assert.Equal(t, replicaInstance.SourceUUID, primaryInstance.ServerUUID)
 	assert.False(t, replicaInstance.HasReplicationFilters)
 	assert.LessOrEqual(t, int(replicaInstance.SecondsBehindPrimary.Int64), 1)

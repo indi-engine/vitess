@@ -17,7 +17,6 @@ limitations under the License.
 package workflow
 
 import (
-	"bytes"
 	"context"
 	"encoding/json"
 	"fmt"
@@ -123,7 +122,8 @@ func validateNewWorkflow(ctx context.Context, ts *topo.Server, tmc tmclient.Tabl
 			}
 			for _, wf := range res.Workflows {
 				if wf.Workflow == workflow {
-					allErrors.RecordError(fmt.Errorf("workflow %s already exists in keyspace %s on tablet %v", workflow, keyspace, primary.Alias))
+					allErrors.RecordError(fmt.Errorf("workflow %s already exists in keyspace %s on tablet %s",
+						workflow, keyspace, topoproto.TabletAliasString(primary.Alias)))
 					return
 				}
 			}
@@ -217,21 +217,34 @@ func stripTableForeignKeys(ddl string, parser *sqlparser.Parser) (string, error)
 	return newDDL, nil
 }
 
-func stripAutoIncrement(ddl string, parser *sqlparser.Parser) (string, error) {
+// stripAutoIncrement will strip any MySQL auto_increment clause in the given
+// table definition. If an optional replace function is specified then that
+// callback will be used to e.g. replace the MySQL clause with a Vitess
+// VSchema AutoIncrement definition.
+func stripAutoIncrement(ddl string, parser *sqlparser.Parser, replace func(columnName string) error) (string, error) {
 	newDDL, err := parser.ParseStrictDDL(ddl)
 	if err != nil {
 		return "", err
 	}
 
-	_ = sqlparser.Walk(func(node sqlparser.SQLNode) (kontinue bool, err error) {
+	err = sqlparser.Walk(func(node sqlparser.SQLNode) (kontinue bool, err error) {
 		switch node := node.(type) {
 		case *sqlparser.ColumnDefinition:
 			if node.Type.Options.Autoincrement {
 				node.Type.Options.Autoincrement = false
+				if replace != nil {
+					if err := replace(sqlparser.String(node.Name)); err != nil {
+						return false, vterrors.Wrapf(err, "failed to replace auto_increment column %q in %q", sqlparser.String(node.Name), ddl)
+					}
+
+				}
 			}
 		}
 		return true, nil
 	}, newDDL)
+	if err != nil {
+		return "", err
+	}
 
 	return sqlparser.String(newDDL), nil
 }
@@ -279,7 +292,7 @@ func forAllShards(shards []*topo.ShardInfo, f func(*topo.ShardInfo) error) error
 }
 
 func matchColInSelect(col sqlparser.IdentifierCI, sel *sqlparser.Select) (*sqlparser.ColName, error) {
-	for _, selExpr := range sel.SelectExprs {
+	for _, selExpr := range sel.GetColumns() {
 		switch selExpr := selExpr.(type) {
 		case *sqlparser.StarExpr:
 			return &sqlparser.ColName{Name: col}, nil
@@ -446,11 +459,11 @@ func getSourceAndTargetKeyRanges(sourceShards, targetShards []string) (*topodata
 	sort.Strings(targetShards)
 	getFullKeyRange := func(shards []string) (*topodatapb.KeyRange, error) {
 		// Expect sorted shards.
-		kr1, err := getKeyRange(sourceShards[0])
+		kr1, err := getKeyRange(shards[0])
 		if err != nil {
 			return nil, err
 		}
-		kr2, err := getKeyRange(sourceShards[len(sourceShards)-1])
+		kr2, err := getKeyRange(shards[len(shards)-1])
 		if err != nil {
 			return nil, err
 		}
@@ -612,9 +625,7 @@ func ReverseWorkflowName(workflow string) string {
 // this public, but it doesn't belong in package workflow. Maybe package sqltypes,
 // or maybe package sqlescape?
 func encodeString(in string) string {
-	buf := bytes.NewBuffer(nil)
-	sqltypes.NewVarChar(in).EncodeSQL(buf)
-	return buf.String()
+	return sqltypes.EncodeStringSQL(in)
 }
 
 func getRenameFileName(tableName string) string {
@@ -623,12 +634,12 @@ func getRenameFileName(tableName string) string {
 
 func parseTabletTypes(tabletTypes []topodatapb.TabletType) (hasReplica, hasRdonly, hasPrimary bool, err error) {
 	for _, tabletType := range tabletTypes {
-		switch {
-		case tabletType == topodatapb.TabletType_REPLICA:
+		switch tabletType {
+		case topodatapb.TabletType_REPLICA:
 			hasReplica = true
-		case tabletType == topodatapb.TabletType_RDONLY:
+		case topodatapb.TabletType_RDONLY:
 			hasRdonly = true
-		case tabletType == topodatapb.TabletType_PRIMARY:
+		case topodatapb.TabletType_PRIMARY:
 			hasPrimary = true
 		default:
 			return false, false, false, fmt.Errorf("invalid tablet type passed %s", tabletType)
@@ -640,7 +651,7 @@ func parseTabletTypes(tabletTypes []topodatapb.TabletType) (hasReplica, hasRdonl
 func areTabletsAvailableToStreamFrom(ctx context.Context, req *vtctldatapb.WorkflowSwitchTrafficRequest, ts *trafficSwitcher, keyspace string, shards []*topo.ShardInfo) error {
 	// We use the value from the workflow for the TabletPicker.
 	tabletTypesStr := ts.optTabletTypes
-	cells := req.Cells
+	cells := req.GetCells()
 	// If no cells were provided in the command then use the value from the workflow.
 	if len(cells) == 0 && ts.optCells != "" {
 		cells = strings.Split(strings.TrimSpace(ts.optCells), ",")
@@ -670,7 +681,7 @@ func areTabletsAvailableToStreamFrom(ctx context.Context, req *vtctldatapb.Workf
 
 	wg.Wait()
 	if allErrors.HasErrors() {
-		ts.Logger().Errorf("%s", allErrors.Error())
+		ts.Logger().Error(allErrors.Error())
 		return allErrors.Error()
 	}
 	return nil
@@ -902,7 +913,7 @@ func validateTenantId(dataType querypb.Type, value string) error {
 }
 
 func updateKeyspaceRoutingState(ctx context.Context, ts *topo.Server, sourceKeyspace, targetKeyspace string, state *State) error {
-	// For multi-tenant migrations, we only support switching traffic to all cells at once
+	// For multi-tenant migrations, we only support switching traffic to all cells at once.
 	cells, err := ts.GetCellInfoNames(ctx)
 	if err != nil {
 		return err
@@ -1010,4 +1021,38 @@ func applyTargetShards(ts *trafficSwitcher, targetShards []string) error {
 		}
 	}
 	return nil
+}
+
+// validateSourceTablesExist validates that tables provided are present
+// in the source keyspace.
+func validateSourceTablesExist(sourceKeyspace string, ksTables, tables []string) error {
+	var missingTables []string
+	for _, table := range tables {
+		if schema.IsInternalOperationTableName(table) {
+			continue
+		}
+		found := false
+
+		for _, ksTable := range ksTables {
+			if table == ksTable {
+				found = true
+				break
+			}
+		}
+		if !found {
+			missingTables = append(missingTables, table)
+		}
+	}
+	if len(missingTables) > 0 {
+		return vterrors.Errorf(vtrpcpb.Code_FAILED_PRECONDITION, "table(s) not found in source keyspace %s: %s", sourceKeyspace, strings.Join(missingTables, ","))
+	}
+	return nil
+}
+
+func processWorkflowActionOptions(opts []WorkflowActionOption) workflowActionOptions {
+	var options workflowActionOptions
+	for _, o := range opts {
+		o.apply(&options)
+	}
+	return options
 }

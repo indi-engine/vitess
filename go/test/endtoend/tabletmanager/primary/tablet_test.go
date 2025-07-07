@@ -29,6 +29,7 @@ import (
 	"vitess.io/vitess/go/test/endtoend/cluster"
 
 	topodatapb "vitess.io/vitess/go/vt/proto/topodata"
+	"vitess.io/vitess/go/vt/utils"
 )
 
 var (
@@ -69,7 +70,6 @@ var (
 )
 
 func TestMain(m *testing.M) {
-	defer cluster.PanicHandler(nil)
 	flag.Parse()
 
 	exitCode := func() int {
@@ -84,9 +84,9 @@ func TestMain(m *testing.M) {
 
 		// Set extra tablet args for lock timeout
 		clusterInstance.VtTabletExtraArgs = []string{
-			"--lock_tables_timeout", "5s",
-			"--watch_replication_stream",
-			"--enable_replication_reporter",
+			utils.GetFlagVariantForTests("--lock-tables-timeout"), "5s",
+			utils.GetFlagVariantForTests("--watch-replication-stream"),
+			utils.GetFlagVariantForTests("--enable-replication-reporter"),
 		}
 
 		// Start keyspace
@@ -116,7 +116,6 @@ func TestMain(m *testing.M) {
 }
 
 func TestRepeatedInitShardPrimary(t *testing.T) {
-	defer cluster.PanicHandler(t)
 	// Test that using InitShardPrimary can go back and forth between 2 hosts.
 
 	// Make replica tablet as primary
@@ -155,7 +154,6 @@ func TestRepeatedInitShardPrimary(t *testing.T) {
 }
 
 func TestPrimaryRestartSetsPTSTimestamp(t *testing.T) {
-	defer cluster.PanicHandler(t)
 	// Test that PTS timestamp is set when we restart the PRIMARY vttablet.
 	// PTS = PrimaryTermStart.
 	// See StreamHealthResponse.primary_term_start_timestamp for details.

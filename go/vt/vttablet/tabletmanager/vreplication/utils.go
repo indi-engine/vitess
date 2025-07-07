@@ -52,6 +52,8 @@ const (
 	LogMessage = "Message"
 	// LogCopyStart is used when the copy phase is started.
 	LogCopyStart = "Started Copy Phase"
+	// LogCopyRestart is used when the copy phase is restarted.
+	LogCopyRestart = "Restarted Copy Phase"
 	// LogCopyEnd is used when the copy phase is done.
 	LogCopyEnd = "Ended Copy Phase"
 	// LogStateChange is used when the state of the stream changes.
@@ -129,7 +131,8 @@ func insertLogWithParams(dbClient *vdbClient, action string, vreplID int32, para
 	insertLog(dbClient, action, vreplID, params["state"], message)
 }
 
-// isUnrecoverableError returns true if vreplication cannot recover from the given error and should completely terminate.
+// isUnrecoverableError returns true if vreplication cannot recover from the given error and
+// should completely terminate.
 func isUnrecoverableError(err error) bool {
 	if err == nil {
 		return false
@@ -227,10 +230,29 @@ func isUnrecoverableError(err error) bool {
 		sqlerror.ERWrongParametersToProcedure,
 		sqlerror.ERWrongUsage,
 		sqlerror.ERWrongValue,
+		sqlerror.ERWrongParamcountToNativeFct,
 		sqlerror.ERVectorConversion,
 		sqlerror.ERWrongValueCountOnRow:
 		log.Errorf("Got unrecoverable error: %v", sqlErr)
 		return true
+	case sqlerror.ERErrorDuringCommit:
+		switch sqlErr.HaErrorCode() {
+		case
+			0, // Not really a HA error.
+			sqlerror.HaErrLockDeadlock,
+			sqlerror.HaErrLockTableFull,
+			sqlerror.HaErrLockWaitTimeout,
+			sqlerror.HaErrNotInLockPartitions,
+			sqlerror.HaErrQueryInterrupted,
+			sqlerror.HaErrRolledBack,
+			sqlerror.HaErrTooManyConcurrentTrxs,
+			sqlerror.HaErrUndoRecTooBig:
+			// These are recoverable errors.
+			return false
+		default:
+			log.Errorf("Got unrecoverable error: %v", sqlErr)
+			return true
+		}
 	}
 	return false
 }

@@ -21,6 +21,8 @@ import (
 	"slices"
 	"sort"
 
+	"vitess.io/vitess/go/vt/vtgate/planbuilder/operators/predicates"
+
 	"vitess.io/vitess/go/slice"
 	"vitess.io/vitess/go/vt/sqlparser"
 	"vitess.io/vitess/go/vt/vterrors"
@@ -37,8 +39,9 @@ type (
 	}
 )
 
-func (qb *queryBuilder) asSelectStatement() sqlparser.SelectStatement {
-	return qb.stmt.(sqlparser.SelectStatement)
+func (qb *queryBuilder) asSelectStatement() sqlparser.TableStatement {
+	return qb.stmt.(sqlparser.TableStatement)
+
 }
 func (qb *queryBuilder) asOrderAndLimit() sqlparser.OrderAndLimit {
 	return qb.stmt.(sqlparser.OrderAndLimit)
@@ -115,9 +118,12 @@ func (qb *queryBuilder) addTableExpr(
 }
 
 func (qb *queryBuilder) addPredicate(expr sqlparser.Expr) {
-	if qb.ctx.ShouldSkip(expr) {
-		// This is a predicate that was added to the RHS of an ApplyJoin.
-		// The original predicate will be added, so we don't have to add this here
+	if jp, ok := expr.(*predicates.JoinPredicate); ok {
+		// we have to strip out the join predicate containers,
+		// otherwise precedence calculations get messed up
+		expr = jp.Current()
+	}
+	if expr == nil {
 		return
 	}
 
@@ -141,7 +147,7 @@ func (qb *queryBuilder) addPredicate(expr sqlparser.Expr) {
 		addPred = sel.AddWhere
 		qb.stmt = sel
 	default:
-		panic(fmt.Sprintf("cant add WHERE to %T", qb.stmt))
+		panic(fmt.Sprintf("cant add WHERE to %T, %s", qb.stmt, sqlparser.String(expr)))
 	}
 
 	for _, exp := range sqlparser.SplitAndExpression(nil, expr) {
@@ -162,7 +168,7 @@ func (qb *queryBuilder) setWithRollup() {
 func (qb *queryBuilder) addProjection(projection sqlparser.SelectExpr) {
 	switch stmt := qb.stmt.(type) {
 	case *sqlparser.Select:
-		stmt.SelectExprs = append(stmt.SelectExprs, projection)
+		stmt.AddSelectExpr(projection)
 		return
 	case *sqlparser.Union:
 		if ae, ok := projection.(*sqlparser.AliasedExpr); ok {
@@ -191,11 +197,13 @@ func (qb *queryBuilder) pushUnionInsideDerived() {
 			As:   sqlparser.NewIdentifierCS("dt"),
 		}},
 	}
-	sel.SelectExprs = unionSelects(sqlparser.GetFirstSelect(selStmt).SelectExprs)
+	firstSelect := getFirstSelect(selStmt)
+	sel.SetSelectExprs(unionSelects(firstSelect.GetColumns())...)
 	qb.stmt = sel
 }
 
-func unionSelects(exprs sqlparser.SelectExprs) (selectExprs sqlparser.SelectExprs) {
+func unionSelects(exprs []sqlparser.SelectExpr) []sqlparser.SelectExpr {
+	var selectExprs []sqlparser.SelectExpr
 	for _, col := range exprs {
 		switch col := col.(type) {
 		case *sqlparser.AliasedExpr:
@@ -205,12 +213,13 @@ func unionSelects(exprs sqlparser.SelectExprs) (selectExprs sqlparser.SelectExpr
 			selectExprs = append(selectExprs, col)
 		}
 	}
-	return
+	return selectExprs
 }
 
-func checkUnionColumnByName(column *sqlparser.ColName, sel sqlparser.SelectStatement) {
+func checkUnionColumnByName(column *sqlparser.ColName, sel sqlparser.TableStatement) {
 	colName := column.Name.String()
-	exprs := sqlparser.GetFirstSelect(sel).SelectExprs
+	firstSelect := getFirstSelect(sel)
+	exprs := firstSelect.GetColumns()
 	offset := slices.IndexFunc(exprs, func(expr sqlparser.SelectExpr) bool {
 		switch ae := expr.(type) {
 		case *sqlparser.StarExpr:
@@ -242,10 +251,10 @@ func (qb *queryBuilder) unionWith(other *queryBuilder, distinct bool) {
 	}
 }
 
-func (qb *queryBuilder) recursiveCteWith(other *queryBuilder, name, alias string, distinct bool) {
+func (qb *queryBuilder) recursiveCteWith(other *queryBuilder, name, alias string, distinct bool, columns sqlparser.Columns) {
 	cteUnion := &sqlparser.Union{
-		Left:     qb.stmt.(sqlparser.SelectStatement),
-		Right:    other.stmt.(sqlparser.SelectStatement),
+		Left:     qb.stmt.(sqlparser.TableStatement),
+		Right:    other.stmt.(sqlparser.TableStatement),
 		Distinct: distinct,
 	}
 
@@ -254,7 +263,7 @@ func (qb *queryBuilder) recursiveCteWith(other *queryBuilder, name, alias string
 			Recursive: true,
 			CTEs: []*sqlparser.CommonTableExpr{{
 				ID:       sqlparser.NewIdentifierCS(name),
-				Columns:  nil,
+				Columns:  columns,
 				Subquery: cteUnion,
 			}},
 		},
@@ -280,7 +289,9 @@ func (qb *queryBuilder) joinWith(other *queryBuilder, onCondition sqlparser.Expr
 
 	if sel, isSel := stmt.(*sqlparser.Select); isSel {
 		otherSel := otherStmt.(*sqlparser.Select)
-		sel.SelectExprs = append(sel.SelectExprs, otherSel.SelectExprs...)
+		for _, expr := range otherSel.GetColumns() {
+			sel.AddSelectExpr(expr)
+		}
 	}
 
 	qb.mergeWhereClauses(stmt, otherStmt)
@@ -393,7 +404,7 @@ func removeKeyspaceFromSelectExpr(expr sqlparser.SelectExpr) {
 	}
 }
 
-func stripDownQuery(from, to sqlparser.SelectStatement) {
+func stripDownQuery(from, to sqlparser.TableStatement) {
 	switch node := from.(type) {
 	case *sqlparser.Select:
 		toNode, ok := to.(*sqlparser.Select)
@@ -407,7 +418,7 @@ func stripDownQuery(from, to sqlparser.SelectStatement) {
 		toNode.Comments = node.Comments
 		toNode.Limit = node.Limit
 		toNode.SelectExprs = node.SelectExprs
-		for _, expr := range toNode.SelectExprs {
+		for _, expr := range toNode.SelectExprs.Exprs {
 			removeKeyspaceFromSelectExpr(expr)
 		}
 	case *sqlparser.Union:
@@ -418,6 +429,7 @@ func stripDownQuery(from, to sqlparser.SelectStatement) {
 		stripDownQuery(node.Left, toNode.Left)
 		stripDownQuery(node.Right, toNode.Right)
 		toNode.OrderBy = node.OrderBy
+		toNode.Limit = node.Limit
 	default:
 		panic(vterrors.VT13001(fmt.Sprintf("this should not happen - we have covered all implementations of SelectStatement %T", from)))
 	}
@@ -450,7 +462,12 @@ func buildQuery(op Operator, qb *queryBuilder) {
 		buildUnion(op, qb)
 	case *Distinct:
 		buildQuery(op.Source, qb)
-		qb.asSelectStatement().MakeDistinct()
+		statement := qb.asSelectStatement()
+		d, ok := statement.(sqlparser.Distinctable)
+		if !ok {
+			panic(vterrors.VT13001("expected a select statement with distinct"))
+		}
+		d.MakeDistinct()
 	case *Update:
 		buildUpdate(op, qb)
 	case *Delete:
@@ -591,23 +608,20 @@ func buildProjection(op *Projection, qb *queryBuilder) {
 	}
 
 	if !isSel {
-		cols := op.GetSelectExprs(qb.ctx)
-		for _, column := range cols {
+		for _, column := range op.GetSelectExprs(qb.ctx) {
 			qb.addProjection(column)
 		}
 	}
 }
 
 func buildApplyJoin(op *ApplyJoin, qb *queryBuilder) {
-	predicates := slice.Map(op.JoinPredicates.columns, func(jc applyJoinColumn) sqlparser.Expr {
-		// since we are adding these join predicates, we need to mark to broken up version (RHSExpr) of it as done
-		err := qb.ctx.SkipJoinPredicates(jc.Original)
-		if err != nil {
-			panic(err)
+	preds := slice.Map(op.JoinPredicates.columns, func(jc applyJoinColumn) sqlparser.Expr {
+		if jc.JoinPredicateID != nil {
+			qb.ctx.PredTracker.Skip(*jc.JoinPredicateID)
 		}
 		return jc.Original
 	})
-	pred := sqlparser.AndExpressions(predicates...)
+	pred := sqlparser.AndExpressions(preds...)
 
 	buildQuery(op.LHS, qb)
 
@@ -708,25 +722,15 @@ func buildHorizon(op *Horizon, qb *queryBuilder) {
 }
 
 func buildRecursiveCTE(op *RecurseCTE, qb *queryBuilder) {
-	predicates := slice.Map(op.Predicates, func(jc *plancontext.RecurseExpression) sqlparser.Expr {
-		// since we are adding these join predicates, we need to mark to broken up version (RHSExpr) of it as done
-		err := qb.ctx.SkipJoinPredicates(jc.Original)
-		if err != nil {
-			panic(err)
-		}
-		return jc.Original
-	})
-	pred := sqlparser.AndExpressions(predicates...)
 	buildQuery(op.Seed(), qb)
 	qbR := &queryBuilder{ctx: qb.ctx}
 	buildQuery(op.Term(), qbR)
-	qbR.addPredicate(pred)
 	infoFor, err := qb.ctx.SemTable.TableInfoFor(op.OuterID)
 	if err != nil {
 		panic(err)
 	}
 
-	qb.recursiveCteWith(qbR, op.Def.Name, infoFor.GetAliasedTableExpr().As.String(), op.Distinct)
+	qb.recursiveCteWith(qbR, op.Def.Name, infoFor.GetAliasedTableExpr().As.String(), op.Distinct, op.Def.Columns)
 }
 
 func mergeHaving(h1, h2 *sqlparser.Where) *sqlparser.Where {

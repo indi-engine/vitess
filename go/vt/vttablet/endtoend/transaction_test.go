@@ -22,12 +22,9 @@ import (
 	"testing"
 	"time"
 
-	"vitess.io/vitess/go/vt/vttablet/tabletserver/tabletenv/tabletenvtest"
-
-	"google.golang.org/protobuf/proto"
-
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+	"google.golang.org/protobuf/proto"
 
 	"vitess.io/vitess/go/mysql"
 	"vitess.io/vitess/go/test/utils"
@@ -35,7 +32,6 @@ import (
 	topodatapb "vitess.io/vitess/go/vt/proto/topodata"
 	"vitess.io/vitess/go/vt/vttablet/endtoend/framework"
 	"vitess.io/vitess/go/vt/vttablet/tabletserver"
-	"vitess.io/vitess/go/vt/vttablet/tabletserver/tabletenv"
 )
 
 func TestCommit(t *testing.T) {
@@ -200,30 +196,6 @@ func TestAutoCommit(t *testing.T) {
 			t.Errorf("%s: %d, must be at least %d", expected.tag, got, want)
 		}
 	}
-}
-
-func TestTxPoolSize(t *testing.T) {
-	tabletenvtest.LoadTabletEnvFlags()
-
-	vstart := framework.DebugVars()
-
-	client1 := framework.NewClient()
-	err := client1.Begin(false)
-	require.NoError(t, err)
-	defer client1.Rollback()
-	verifyIntValue(t, framework.DebugVars(), "TransactionPoolAvailable", tabletenv.NewCurrentConfig().TxPool.Size-1)
-
-	revert := changeVar(t, "TxPoolSize", "1")
-	defer revert()
-	vend := framework.DebugVars()
-	verifyIntValue(t, vend, "TransactionPoolAvailable", 0)
-	verifyIntValue(t, vend, "TransactionPoolCapacity", 1)
-
-	client2 := framework.NewClient()
-	err = client2.Begin(false)
-	require.Error(t, err)
-	require.Contains(t, err.Error(), "connection limit exceeded")
-	compareIntDiff(t, framework.DebugVars(), "Errors/RESOURCE_EXHAUSTED", vstart, 1)
 }
 
 func TestForUpdate(t *testing.T) {
@@ -529,8 +501,9 @@ func TestMMCommitFlow(t *testing.T) {
 	require.Error(t, err)
 	require.Contains(t, err.Error(), "Duplicate entry")
 
-	err = client.StartCommit("aa")
+	state, err := client.StartCommit("aa")
 	require.NoError(t, err)
+	assert.Equal(t, querypb.StartCommitState_Success, state)
 
 	err = client.SetRollback("aa", 0)
 	require.EqualError(t, err, "could not transition to ROLLBACK: aa (CallerID: dev)")
@@ -872,4 +845,82 @@ func TestUnresolvedTransactionsOrdering(t *testing.T) {
 		assert.Equal(t, want[i].State, transaction.State)
 		assert.Equal(t, want[i].Participants, transaction.Participants)
 	}
+}
+
+// TestSkipUserMetrics tests the SkipUserMetrics flag in the config that disables user label in the metrics.
+func TestSkipUserMetrics(t *testing.T) {
+	client := framework.NewClient()
+	query := "select * from vitess_test"
+
+	runQueries := func() {
+		// non-tx execute
+		_, err := client.Execute(query, nil)
+		require.NoError(t, err)
+
+		// tx execute
+		_, err = client.BeginExecute(query, nil, nil)
+		require.NoError(t, err)
+		require.NoError(t, client.Commit())
+	}
+
+	// Initial test with user metrics enabled
+	vstart := framework.DebugVars()
+	runQueries()
+
+	expectedDiffs := []struct {
+		tag  string
+		diff int
+	}{{ // not dependent on user
+		tag: "Transactions/TotalCount", diff: 1,
+	}, { // not dependent on user
+		tag: "Transactions/Histograms/commit/Count", diff: 1,
+	}, { // dependent on user
+		tag: "TableACLAllowed/vitess_test.vitess_test.Select.dev", diff: 2,
+	}, { // user metric enabled so this should be zero.
+		tag: "TableACLAllowed/vitess_test.vitess_test.Select.UserLabelDisabled", diff: 0,
+	}, { // dependent on user
+		tag: "UserTableQueryCount/vitess_test.dev.Execute", diff: 2,
+	}, { // user metric enabled so this should be zero.
+		tag: "UserTableQueryCount/vitess_test.UserLabelDisabled.Execute", diff: 0,
+	}, { // dependent on user
+		tag: "UserTransactionCount/dev.commit", diff: 1,
+	}}
+	vend := framework.DebugVars()
+	for _, expected := range expectedDiffs {
+		compareIntDiff(t, vend, expected.tag, vstart, expected.diff)
+	}
+
+	// Enable SkipUserMetrics and re-run tests
+	framework.Server.Config().SkipUserMetrics = true
+	defer func() {
+		framework.Server.Config().SkipUserMetrics = false
+	}()
+	vstart = framework.DebugVars()
+	runQueries()
+
+	expectedDiffs = []struct {
+		tag  string
+		diff int
+	}{{ // not dependent on user
+		tag: "Transactions/TotalCount", diff: 1,
+	}, { // not dependent on user
+		tag: "Transactions/Histograms/commit/Count", diff: 1,
+	}, { // dependent on user - should be zero now
+		tag: "TableACLAllowed/vitess_test.vitess_test.Select.dev", diff: 0,
+	}, { // user metric disabled so this should be non-zero.
+		tag: "TableACLAllowed/vitess_test.vitess_test.Select.UserLabelDisabled", diff: 2,
+	}, { // dependent on user - should be zero now
+		tag: "UserTableQueryCount/vitess_test.dev.Execute", diff: 0,
+	}, { // user metric disabled so this should be non-zero.
+		tag: "UserTableQueryCount/vitess_test.UserLabelDisabled.Execute", diff: 2,
+	}, { // dependent on user
+		tag: "UserTransactionCount/dev.commit", diff: 0,
+	}, { // no need to publish this as "Transactions" histogram already captures this.
+		tag: "UserTransactionCount/UserLabelDisabled.commit", diff: 0,
+	}}
+	vend = framework.DebugVars()
+	for _, expected := range expectedDiffs {
+		compareIntDiff(t, vend, expected.tag, vstart, expected.diff)
+	}
+
 }

@@ -127,6 +127,15 @@ func (s *server) SetReadWrite(ctx context.Context, request *tabletmanagerdatapb.
 	return response, s.tm.SetReadOnly(ctx, false)
 }
 
+func (s *server) ChangeTags(ctx context.Context, request *tabletmanagerdatapb.ChangeTagsRequest) (response *tabletmanagerdatapb.ChangeTagsResponse, err error) {
+	defer s.tm.HandleRPCPanic(ctx, "ChangeTags", request, response, false /*verbose*/, &err)
+	ctx = callinfo.GRPCCallInfo(ctx)
+	afterTags, err := s.tm.ChangeTags(ctx, request.Tags, request.Replace)
+	return &tabletmanagerdatapb.ChangeTagsResponse{
+		Tags: afterTags,
+	}, err
+}
+
 func (s *server) ChangeType(ctx context.Context, request *tabletmanagerdatapb.ChangeTypeRequest) (response *tabletmanagerdatapb.ChangeTypeResponse, err error) {
 	defer s.tm.HandleRPCPanic(ctx, "ChangeType", request, response, true /*verbose*/, &err)
 	ctx = callinfo.GRPCCallInfo(ctx)
@@ -275,16 +284,44 @@ func (s *server) ExecuteFetchAsApp(ctx context.Context, request *tabletmanagerda
 	return response, nil
 }
 
+//
+// Distributed Transaction related methods
+//
+
 func (s *server) GetUnresolvedTransactions(ctx context.Context, request *tabletmanagerdatapb.GetUnresolvedTransactionsRequest) (response *tabletmanagerdatapb.GetUnresolvedTransactionsResponse, err error) {
 	defer s.tm.HandleRPCPanic(ctx, "GetUnresolvedTransactions", request, response, false /*verbose*/, &err)
 	ctx = callinfo.GRPCCallInfo(ctx)
 
-	transactions, err := s.tm.GetUnresolvedTransactions(ctx)
+	transactions, err := s.tm.GetUnresolvedTransactions(ctx, request.AbandonAge)
 	if err != nil {
 		return nil, vterrors.ToGRPC(err)
 	}
 
 	return &tabletmanagerdatapb.GetUnresolvedTransactionsResponse{Transactions: transactions}, nil
+}
+
+func (s *server) ReadTransaction(ctx context.Context, request *tabletmanagerdatapb.ReadTransactionRequest) (response *tabletmanagerdatapb.ReadTransactionResponse, err error) {
+	defer s.tm.HandleRPCPanic(ctx, "ReadTransaction", request, response, false /*verbose*/, &err)
+	ctx = callinfo.GRPCCallInfo(ctx)
+
+	transaction, err := s.tm.ReadTransaction(ctx, request)
+	if err != nil {
+		return nil, vterrors.ToGRPC(err)
+	}
+
+	return &tabletmanagerdatapb.ReadTransactionResponse{Transaction: transaction}, nil
+}
+
+func (s *server) GetTransactionInfo(ctx context.Context, request *tabletmanagerdatapb.GetTransactionInfoRequest) (response *tabletmanagerdatapb.GetTransactionInfoResponse, err error) {
+	defer s.tm.HandleRPCPanic(ctx, "GetTransactionInfo", request, response, false /*verbose*/, &err)
+	ctx = callinfo.GRPCCallInfo(ctx)
+
+	response, err = s.tm.GetTransactionInfo(ctx, request)
+	if err != nil {
+		return nil, vterrors.ToGRPC(err)
+	}
+
+	return response, nil
 }
 
 func (s *server) ConcludeTransaction(ctx context.Context, request *tabletmanagerdatapb.ConcludeTransactionRequest) (response *tabletmanagerdatapb.ConcludeTransactionResponse, err error) {
@@ -297,6 +334,17 @@ func (s *server) ConcludeTransaction(ctx context.Context, request *tabletmanager
 	}
 
 	return &tabletmanagerdatapb.ConcludeTransactionResponse{}, nil
+}
+
+func (s *server) MysqlHostMetrics(ctx context.Context, request *tabletmanagerdatapb.MysqlHostMetricsRequest) (response *tabletmanagerdatapb.MysqlHostMetricsResponse, err error) {
+	defer s.tm.HandleRPCPanic(ctx, "MysqlHostMetrics", request, response, false /*verbose*/, &err)
+	ctx = callinfo.GRPCCallInfo(ctx)
+
+	resp, err := s.tm.MysqlHostMetrics(ctx, request)
+	if err != nil {
+		return nil, vterrors.ToGRPC(err)
+	}
+	return resp, nil
 }
 
 //
@@ -408,6 +456,13 @@ func (s *server) CreateVReplicationWorkflow(ctx context.Context, request *tablet
 	return s.tm.CreateVReplicationWorkflow(ctx, request)
 }
 
+func (s *server) DeleteTableData(ctx context.Context, request *tabletmanagerdatapb.DeleteTableDataRequest) (response *tabletmanagerdatapb.DeleteTableDataResponse, err error) {
+	defer s.tm.HandleRPCPanic(ctx, "DeleteTableData", request, response, true /*verbose*/, &err)
+	ctx = callinfo.GRPCCallInfo(ctx)
+	response = &tabletmanagerdatapb.DeleteTableDataResponse{}
+	return s.tm.DeleteTableData(ctx, request)
+}
+
 func (s *server) DeleteVReplicationWorkflow(ctx context.Context, request *tabletmanagerdatapb.DeleteVReplicationWorkflowRequest) (response *tabletmanagerdatapb.DeleteVReplicationWorkflowResponse, err error) {
 	defer s.tm.HandleRPCPanic(ctx, "DeleteVReplicationWorkflow", request, response, true /*verbose*/, &err)
 	ctx = callinfo.GRPCCallInfo(ctx)
@@ -434,6 +489,14 @@ func (s *server) ReadVReplicationWorkflow(ctx context.Context, request *tabletma
 	ctx = callinfo.GRPCCallInfo(ctx)
 	response = &tabletmanagerdatapb.ReadVReplicationWorkflowResponse{}
 	return s.tm.ReadVReplicationWorkflow(ctx, request)
+}
+
+func (s *server) ValidateVReplicationPermissions(ctx context.Context, request *tabletmanagerdatapb.ValidateVReplicationPermissionsRequest) (response *tabletmanagerdatapb.ValidateVReplicationPermissionsResponse, err error) {
+	defer s.tm.HandleRPCPanic(ctx, "ValidateVReplicationPermissions", request, response, true /*verbose*/, &err)
+	ctx = callinfo.GRPCCallInfo(ctx)
+	response = &tabletmanagerdatapb.ValidateVReplicationPermissionsResponse{}
+	response, err = s.tm.ValidateVReplicationPermissions(ctx, request)
+	return response, err
 }
 
 func (s *server) VReplicationExec(ctx context.Context, request *tabletmanagerdatapb.VReplicationExecRequest) (response *tabletmanagerdatapb.VReplicationExecResponse, err error) {
@@ -472,6 +535,20 @@ func (s *server) VDiff(ctx context.Context, request *tabletmanagerdatapb.VDiffRe
 	return response, err
 }
 
+func (s *server) UpdateSequenceTables(ctx context.Context, request *tabletmanagerdatapb.UpdateSequenceTablesRequest) (response *tabletmanagerdatapb.UpdateSequenceTablesResponse, err error) {
+	defer s.tm.HandleRPCPanic(ctx, "UpdateSequenceTables", request, response, true /*verbose*/, &err)
+	ctx = callinfo.GRPCCallInfo(ctx)
+	response, err = s.tm.UpdateSequenceTables(ctx, request)
+	return response, err
+}
+
+func (s *server) GetMaxValueForSequences(ctx context.Context, request *tabletmanagerdatapb.GetMaxValueForSequencesRequest) (response *tabletmanagerdatapb.GetMaxValueForSequencesResponse, err error) {
+	defer s.tm.HandleRPCPanic(ctx, "GetMaxValueForSequences", request, response, true /*verbose*/, &err)
+	ctx = callinfo.GRPCCallInfo(ctx)
+	response, err = s.tm.GetMaxValueForSequences(ctx, request)
+	return response, err
+}
+
 //
 // Reparenting related functions
 //
@@ -499,6 +576,17 @@ func (s *server) PopulateReparentJournal(ctx context.Context, request *tabletman
 	ctx = callinfo.GRPCCallInfo(ctx)
 	response = &tabletmanagerdatapb.PopulateReparentJournalResponse{}
 	return response, s.tm.PopulateReparentJournal(ctx, request.TimeCreatedNs, request.ActionName, request.PrimaryAlias, request.ReplicationPosition)
+}
+
+func (s *server) ReadReparentJournalInfo(ctx context.Context, request *tabletmanagerdatapb.ReadReparentJournalInfoRequest) (response *tabletmanagerdatapb.ReadReparentJournalInfoResponse, err error) {
+	defer s.tm.HandleRPCPanic(ctx, "ReadReparentJournalInfo", request, response, true /*verbose*/, &err)
+	ctx = callinfo.GRPCCallInfo(ctx)
+	response = &tabletmanagerdatapb.ReadReparentJournalInfoResponse{}
+	length, err := s.tm.ReadReparentJournalInfo(ctx)
+	if err == nil {
+		response.Length = length
+	}
+	return response, err
 }
 
 func (s *server) InitReplica(ctx context.Context, request *tabletmanagerdatapb.InitReplicaRequest) (response *tabletmanagerdatapb.InitReplicaResponse, err error) {
@@ -563,6 +651,7 @@ func (s *server) StopReplicationAndGetStatus(ctx context.Context, request *table
 	if err == nil {
 		response.Status = statusResponse.Status
 	}
+
 	return response, err
 }
 

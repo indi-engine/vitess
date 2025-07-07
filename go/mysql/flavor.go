@@ -50,6 +50,9 @@ const (
 	// mysql8VersionPrefix is the prefix for 8.x mysql version, such as 8.0.19,
 	// but also newer ones like 8.4.0.
 	mysql8VersionPrefix = "8."
+	// mysql9VersionPrefix is the prefix for 9.x mysql version, such as 9.0.0,
+	// 9.1.0, 9.2.0, etc.
+	mysql9VersionPrefix = "9."
 )
 
 // flavor is the abstract interface for a flavor.
@@ -151,6 +154,11 @@ type flavor interface {
 
 	baseShowTables() string
 	baseShowTablesWithSizes() string
+	baseShowInnodbTableSizes() string
+	baseShowPartitions() string
+	baseShowTableRowCountClusteredIndex() string
+	baseShowIndexSizes() string
+	baseShowIndexCardinalities() string
 
 	supportsCapability(capability capabilities.FlavorCapability) (bool, error)
 }
@@ -195,6 +203,8 @@ func GetFlavor(serverVersion string, flavorFunc func(serverVersion string) flavo
 		} else {
 			f = mysqlFlavor8Legacy{mysqlFlavorLegacy{mysqlFlavor{serverVersion: serverVersion}}}
 		}
+	case strings.HasPrefix(serverVersion, mysql9VersionPrefix):
+		f = mysqlFlavor9{mysqlFlavor{serverVersion: serverVersion}}
 	default:
 		// If unknown, return the most basic flavor: MySQL 57.
 		f = mysqlFlavor57{mysqlFlavorLegacy{mysqlFlavor{serverVersion: serverVersion}}}
@@ -452,6 +462,27 @@ func (c *Conn) BaseShowTables() string {
 // BaseShowTablesWithSizes returns a query that shows tables and their sizes
 func (c *Conn) BaseShowTablesWithSizes() string {
 	return c.flavor.baseShowTablesWithSizes()
+}
+
+// BaseShowInnodbTableSizes returns a query that shows innodb-internal FULLTEXT index tables and their sizes
+func (c *Conn) BaseShowInnodbTableSizes() string {
+	return c.flavor.baseShowInnodbTableSizes()
+}
+
+func (c *Conn) BaseShowPartitions() string {
+	return c.flavor.baseShowPartitions()
+}
+
+func (c *Conn) BaseShowTableRowCountClusteredIndex() string {
+	return c.flavor.baseShowTableRowCountClusteredIndex()
+}
+
+func (c *Conn) BaseShowIndexSizes() string {
+	return c.flavor.baseShowIndexSizes()
+}
+
+func (c *Conn) BaseShowIndexCardinalities() string {
+	return c.flavor.baseShowIndexCardinalities()
 }
 
 // SupportsCapability checks if the database server supports the given capability

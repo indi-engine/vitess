@@ -236,6 +236,9 @@ type messageManager struct {
 	ackQuery                  *sqlparser.ParsedQuery
 	postponeQuery             *sqlparser.ParsedQuery
 	purgeQuery                *sqlparser.ParsedQuery
+
+	// idType is the type of the id column in the message table.
+	idType sqltypes.Type
 }
 
 // newMessageManager creates a new message manager.
@@ -259,6 +262,7 @@ func newMessageManager(tsv TabletService, vs VStreamer, table *schema.Table, pos
 		purgeTicks:      timer.NewTimer(table.MessageInfo.PollInterval),
 		postponeSema:    postponeSema,
 		messagesPending: true,
+		idType:          table.MessageInfo.IDType,
 	}
 	mm.cond.L = &mm.mu
 
@@ -300,7 +304,7 @@ func buildPostponeQuery(name sqlparser.IdentifierCS, minBackoff, maxBackoff time
 	//
 	// if the jittered backoff is less than min_backoff, just set it to :min_backoff
 	//
-	buf.WriteString(fmt.Sprintf("IF(%s < %%a, %%a, ", jitteredBackoff))
+	fmt.Fprintf(buf, "IF(%s < %%a, %%a, ", jitteredBackoff)
 	// jitteredBackoff < :min_backoff
 	args = append(args, ":min_backoff", ":jitter", ":min_backoff")
 	// if it is less, then use :min_backoff
@@ -313,7 +317,7 @@ func buildPostponeQuery(name sqlparser.IdentifierCS, minBackoff, maxBackoff time
 		args = append(args, ":min_backoff", ":jitter")
 	} else {
 		// make sure that it doesn't exceed max_backoff
-		buf.WriteString(fmt.Sprintf("IF(%s > %%a, %%a, %s)", jitteredBackoff, jitteredBackoff))
+		fmt.Fprintf(buf, "IF(%s > %%a, %%a, %s)", jitteredBackoff, jitteredBackoff)
 		// jitteredBackoff > :max_backoff
 		args = append(args, ":min_backoff", ":jitter", ":max_backoff")
 		// if it is greater, then use :max_backoff
@@ -856,7 +860,7 @@ func (mm *messageManager) GenerateAckQuery(ids []string) (string, map[string]*qu
 	}
 	for _, id := range ids {
 		idbvs.Values = append(idbvs.Values, &querypb.Value{
-			Type:  querypb.Type_VARBINARY,
+			Type:  mm.idType,
 			Value: []byte(id),
 		})
 	}
@@ -874,7 +878,7 @@ func (mm *messageManager) GeneratePostponeQuery(ids []string) (string, map[strin
 	}
 	for _, id := range ids {
 		idbvs.Values = append(idbvs.Values, &querypb.Value{
-			Type:  querypb.Type_VARBINARY,
+			Type:  mm.idType,
 			Value: []byte(id),
 		})
 	}

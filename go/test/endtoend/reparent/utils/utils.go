@@ -32,6 +32,8 @@ import (
 	"github.com/stretchr/testify/require"
 
 	querypb "vitess.io/vitess/go/vt/proto/query"
+	"vitess.io/vitess/go/vt/utils"
+	"vitess.io/vitess/go/vt/vtctl/reparentutil/policy"
 	"vitess.io/vitess/go/vt/vttablet/tabletconn"
 
 	"vitess.io/vitess/go/mysql"
@@ -42,13 +44,14 @@ import (
 )
 
 var (
-	KeyspaceName = "ks"
-	dbName       = "vt_" + KeyspaceName
-	username     = "vt_dba"
-	Hostname     = "localhost"
-	insertVal    = 1
-	insertSQL    = "insert into vt_insert_test(id, msg) values (%d, 'test %d')"
-	sqlSchema    = `
+	KeyspaceName            = "ks"
+	dbName                  = "vt_" + KeyspaceName
+	username                = "vt_dba"
+	Hostname                = "localhost"
+	insertVal               = 1
+	insertSQL               = "insert into vt_insert_test(id, msg) values (%d, 'test %d')"
+	insertSQLMultipleValues = "insert into vt_insert_test(id, msg) values (%d, 'test %d'), (%d, 'test %d'), (%d, 'test %d'), (%d, 'test %d')"
+	sqlSchema               = `
 	create table vt_insert_test (
 	id bigint,
 	msg varchar(64),
@@ -71,7 +74,64 @@ func SetupReparentCluster(t *testing.T, durability string) *cluster.LocalProcess
 
 // SetupRangeBasedCluster sets up the range based cluster
 func SetupRangeBasedCluster(ctx context.Context, t *testing.T) *cluster.LocalProcessCluster {
-	return setupCluster(ctx, t, ShardName, []string{cell1}, []int{2}, "semi_sync")
+	return setupCluster(ctx, t, ShardName, []string{cell1}, []int{2}, policy.DurabilitySemiSync)
+}
+
+// SetupShardedReparentCluster is used to setup a sharded cluster for testing
+func SetupShardedReparentCluster(t *testing.T, durability string, extraVttabletFlags []string) *cluster.LocalProcessCluster {
+	clusterInstance := cluster.NewCluster(cell1, Hostname)
+	// Start topo server
+	err := clusterInstance.StartTopo()
+	require.NoError(t, err)
+
+	clusterInstance.VtTabletExtraArgs = append(clusterInstance.VtTabletExtraArgs,
+		utils.GetFlagVariantForTests("--lock-tables-timeout"), "5s",
+		// Fast health checks help find corner cases.
+		utils.GetFlagVariantForTests("--health-check-interval"), "1s",
+		"--track_schema_versions=true",
+		utils.GetFlagVariantForTests("--queryserver-enable-online-ddl")+"=false")
+
+	if len(extraVttabletFlags) > 0 {
+		clusterInstance.VtTabletExtraArgs = append(clusterInstance.VtTabletExtraArgs, extraVttabletFlags...)
+	}
+
+	clusterInstance.VtGateExtraArgs = append(clusterInstance.VtGateExtraArgs,
+		"--enable_buffer",
+		// Long timeout in case failover is slow.
+		utils.GetFlagVariantForTests("--buffer-window"), "10m",
+		utils.GetFlagVariantForTests("--buffer-max-failover-duration"), "10m",
+		utils.GetFlagVariantForTests("--buffer-min-time-between-failovers"), "20m",
+	)
+
+	// Start keyspace
+	keyspace := &cluster.Keyspace{
+		Name:             KeyspaceName,
+		SchemaSQL:        sqlSchema,
+		VSchema:          `{"sharded": true, "vindexes": {"hash_index": {"type": "hash"}}, "tables": {"vt_insert_test": {"column_vindexes": [{"column": "id", "name": "hash_index"}]}}}`,
+		DurabilityPolicy: durability,
+	}
+	err = clusterInstance.StartKeyspace(*keyspace, []string{"-40", "40-80", "80-"}, 2, false)
+	require.NoError(t, err)
+
+	// Start Vtgate
+	err = clusterInstance.StartVtgate()
+	require.NoError(t, err)
+	return clusterInstance
+}
+
+// GetInsertQuery returns a built insert query to insert a row.
+func GetInsertQuery(idx int) string {
+	return fmt.Sprintf(insertSQL, idx, idx)
+}
+
+// GetInsertMultipleValuesQuery returns a built insert query to insert multiple rows at once.
+func GetInsertMultipleValuesQuery(idx1, idx2, idx3, idx4 int) string {
+	return fmt.Sprintf(insertSQLMultipleValues, idx1, idx1, idx2, idx2, idx3, idx3, idx4, idx4)
+}
+
+// GetSelectionQuery returns a built selection query read the data.
+func GetSelectionQuery() string {
+	return `select * from vt_insert_test`
 }
 
 // TeardownCluster is used to teardown the reparent cluster. When
@@ -107,7 +167,7 @@ func setupCluster(ctx context.Context, t *testing.T, shardName string, cells []s
 	require.NoError(t, err, "Error managing topo")
 	numCell := 1
 	for numCell < len(cells) {
-		err = clusterInstance.VtctlProcess.AddCellInfo(cells[numCell])
+		err = clusterInstance.VtctldClientProcess.AddCellInfo(cells[numCell])
 		require.NoError(t, err, "Error managing topo")
 		numCell++
 	}
@@ -128,6 +188,7 @@ func setupCluster(ctx context.Context, t *testing.T, shardName string, cells []s
 	shard.Vttablets = tablets
 
 	clusterInstance.VtTabletExtraArgs = append(clusterInstance.VtTabletExtraArgs,
+		//TODO: Remove underscore(_) flags in v25, replace them with dashed(-) notation
 		"--lock_tables_timeout", "5s",
 		"--track_schema_versions=true",
 		// disabling online-ddl for reparent tests. This is done to reduce flakiness.
@@ -136,7 +197,7 @@ func setupCluster(ctx context.Context, t *testing.T, shardName string, cells []s
 		// In this case, the close method and initSchema method of the onlineDDL executor race.
 		// If the initSchema acquires the lock, then it takes about 30 seconds for it to run during which time the
 		// DemotePrimary rpc is stalled!
-		"--queryserver_enable_online_ddl=false")
+		"--queryserver_enable_online_ddl"+"=false")
 
 	// Initialize Cluster
 	err = clusterInstance.SetupCluster(keyspace, []cluster.Shard{*shard})
@@ -161,7 +222,7 @@ func setupCluster(ctx context.Context, t *testing.T, shardName string, cells []s
 		}
 	}
 	if clusterInstance.VtctlMajorVersion >= 14 {
-		clusterInstance.VtctldClientProcess = *cluster.VtctldClientProcessInstance("localhost", clusterInstance.VtctldProcess.GrpcPort, clusterInstance.TmpDirectory)
+		clusterInstance.VtctldClientProcess = *cluster.VtctldClientProcessInstance(clusterInstance.VtctldProcess.GrpcPort, clusterInstance.TopoPort, "localhost", clusterInstance.TmpDirectory)
 		out, err := clusterInstance.VtctldClientProcess.ExecuteCommandWithOutput("SetKeyspaceDurabilityPolicy", KeyspaceName, fmt.Sprintf("--durability-policy=%s", durability))
 		require.NoError(t, err, out)
 	}
@@ -222,9 +283,10 @@ func StartNewVTTablet(t *testing.T, clusterInstance *cluster.LocalProcessCluster
 		clusterInstance.Hostname,
 		clusterInstance.TmpDirectory,
 		[]string{
+			//TODO: Remove underscore(_) flags in v25, replace them with dashed(-) notation
 			"--lock_tables_timeout", "5s",
 			"--track_schema_versions=true",
-			"--queryserver_enable_online_ddl=false",
+			"--queryserver_enable_online_ddl" + "=false",
 		},
 		clusterInstance.DefaultCharset)
 	tablet.VttabletProcess.SupportsBackup = supportsBackup
@@ -359,10 +421,10 @@ func ErsIgnoreTablet(clusterInstance *cluster.LocalProcessCluster, tab *cluster.
 	return clusterInstance.VtctldClientProcess.ExecuteCommandWithOutput(args...)
 }
 
-// ErsWithVtctl runs ERS via vtctl binary
-func ErsWithVtctl(clusterInstance *cluster.LocalProcessCluster) (string, error) {
-	args := []string{"EmergencyReparentShard", "--", "--keyspace_shard", fmt.Sprintf("%s/%s", KeyspaceName, ShardName)}
-	return clusterInstance.VtctlProcess.ExecuteCommandWithOutput(args...)
+// ErsWithVtctldClient runs ERS via a vtctldclient binary.
+func ErsWithVtctldClient(clusterInstance *cluster.LocalProcessCluster) (string, error) {
+	args := []string{"EmergencyReparentShard", fmt.Sprintf("%s/%s", KeyspaceName, ShardName)}
+	return clusterInstance.VtctldClientProcess.ExecuteCommandWithOutput(args...)
 }
 
 // endregion
@@ -630,7 +692,7 @@ func CheckReparentFromOutside(t *testing.T, clusterInstance *cluster.LocalProces
 			assert.Len(t, result[cell1].Nodes, 2)
 		}
 	} else {
-		result, err := clusterInstance.VtctlclientProcess.ExecuteCommandWithOutput("GetShardReplication", cell1, KeyspaceShard)
+		result, err := clusterInstance.VtctldClientProcess.ExecuteCommandWithOutput("GetShardReplication", cell1, KeyspaceShard)
 		require.Nil(t, err, "error should be Nil")
 		if !downPrimary {
 			assertNodeCount(t, result, int(3))

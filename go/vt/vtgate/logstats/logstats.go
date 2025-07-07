@@ -33,30 +33,35 @@ import (
 
 // LogStats records the stats for a single vtgate query
 type LogStats struct {
-	Ctx            context.Context
-	Method         string
-	TabletType     string
-	StmtType       string
-	SQL            string
-	BindVariables  map[string]*querypb.BindVariable
-	StartTime      time.Time
-	EndTime        time.Time
-	ShardQueries   uint64
-	RowsAffected   uint64
-	RowsReturned   uint64
-	PlanTime       time.Duration
-	ExecuteTime    time.Duration
-	CommitTime     time.Duration
-	Error          error
-	TablesUsed     []string
-	SessionUUID    string
-	CachedPlan     bool
-	ActiveKeyspace string // ActiveKeyspace is the selected keyspace `use ks`
+	Config streamlog.QueryLogConfig
+
+	Ctx                     context.Context
+	Method                  string
+	TabletType              string
+	StmtType                string
+	SQL                     string
+	BindVariables           map[string]*querypb.BindVariable
+	StartTime               time.Time
+	EndTime                 time.Time
+	ShardQueries            uint64
+	RowsAffected            uint64
+	RowsReturned            uint64
+	PlanTime                time.Duration
+	ExecuteTime             time.Duration
+	CommitTime              time.Duration
+	Error                   error
+	TablesUsed              []string
+	SessionUUID             string
+	CachedPlan              bool
+	ActiveKeyspace          string // ActiveKeyspace is the selected keyspace `use ks`
+	MirrorSourceExecuteTime time.Duration
+	MirrorTargetExecuteTime time.Duration
+	MirrorTargetError       error
 }
 
 // NewLogStats constructs a new LogStats with supplied Method and ctx
 // field values, and the StartTime field set to the present time.
-func NewLogStats(ctx context.Context, methodName, sql, sessionUUID string, bindVars map[string]*querypb.BindVariable) *LogStats {
+func NewLogStats(ctx context.Context, methodName, sql, sessionUUID string, bindVars map[string]*querypb.BindVariable, config streamlog.QueryLogConfig) *LogStats {
 	return &LogStats{
 		Ctx:           ctx,
 		Method:        methodName,
@@ -64,6 +69,7 @@ func NewLogStats(ctx context.Context, methodName, sql, sessionUUID string, bindV
 		SessionUUID:   sessionUUID,
 		BindVariables: bindVars,
 		StartTime:     time.Now(),
+		Config:        config,
 	}
 }
 
@@ -116,19 +122,26 @@ func (stats *LogStats) RemoteAddrUsername() (string, string) {
 	return ci.RemoteAddr(), ci.Username()
 }
 
+// MirorTargetErrorStr returns the mirror target error string or ""
+func (stats *LogStats) MirrorTargetErrorStr() string {
+	if stats.MirrorTargetError != nil {
+		return stats.MirrorTargetError.Error()
+	}
+	return ""
+}
+
 // Logf formats the log record to the given writer, either as
 // tab-separated list of logged fields or as JSON.
 func (stats *LogStats) Logf(w io.Writer, params url.Values) error {
-	if !streamlog.ShouldEmitLog(stats.SQL, stats.RowsAffected, stats.RowsReturned) {
+	if !stats.Config.ShouldEmitLog(stats.SQL, stats.RowsAffected, stats.RowsReturned, stats.Error != nil) {
 		return nil
 	}
 
-	redacted := streamlog.GetRedactDebugUIQueries()
 	_, fullBindParams := params["full"]
 	remoteAddr, username := stats.RemoteAddrUsername()
 
 	log := logstats.NewLogger()
-	log.Init(streamlog.GetQueryLogFormat() == streamlog.QueryLogFormatJSON)
+	log.Init(stats.Config.Format == streamlog.QueryLogFormatJSON)
 	log.Key("Method")
 	log.StringUnquoted(stats.Method)
 	log.Key("RemoteAddr")
@@ -156,7 +169,7 @@ func (stats *LogStats) Logf(w io.Writer, params url.Values) error {
 	log.Key("SQL")
 	log.String(stats.SQL)
 	log.Key("BindVars")
-	if redacted {
+	if stats.Config.RedactDebugUIQueries {
 		log.Redacted()
 	} else {
 		log.BindVariables(stats.BindVariables, fullBindParams)
@@ -177,6 +190,12 @@ func (stats *LogStats) Logf(w io.Writer, params url.Values) error {
 	log.Strings(stats.TablesUsed)
 	log.Key("ActiveKeyspace")
 	log.String(stats.ActiveKeyspace)
+	log.Key("MirrorSourceExecuteTime")
+	log.Duration(stats.MirrorSourceExecuteTime)
+	log.Key("MirrorTargetExecuteTime")
+	log.Duration(stats.MirrorTargetExecuteTime)
+	log.Key("MirrorTargetError")
+	log.String(stats.MirrorTargetErrorStr())
 
 	return log.Flush(w)
 }

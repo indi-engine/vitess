@@ -21,9 +21,11 @@ import (
 	"fmt"
 	"regexp"
 	"strconv"
+	"sync/atomic"
 	"testing"
+	"time"
 
-	vttablet "vitess.io/vitess/go/vt/vttablet/common"
+	"vitess.io/vitess/go/vt/utils"
 
 	"github.com/stretchr/testify/require"
 
@@ -31,6 +33,7 @@ import (
 	"vitess.io/vitess/go/mysql/collations"
 	"vitess.io/vitess/go/sqltypes"
 	"vitess.io/vitess/go/vt/log"
+	vttablet "vitess.io/vitess/go/vt/vttablet/common"
 
 	binlogdatapb "vitess.io/vitess/go/vt/proto/binlogdata"
 )
@@ -202,7 +205,7 @@ func TestStreamRowsScan(t *testing.T) {
 		`fields:{name:"id" type:INT32 table:"t3" org_table:"t3" database:"vttest" org_name:"id" column_length:11 charset:63 column_type:"int(11)"} fields:{name:"val" type:VARBINARY table:"t3" org_table:"t3" database:"vttest" org_name:"val" column_length:128 charset:63 column_type:"varbinary(128)"} pkfields:{name:"id" type:INT32 charset:63} pkfields:{name:"val" type:VARBINARY charset:63}`,
 		`rows:{lengths:1 lengths:3 values:"2bbb"} lastpk:{lengths:1 lengths:3 values:"2bbb"}`,
 	}
-	wantQuery = "select /*+ MAX_EXECUTION_TIME(3600000) */ id, val from t3 where (id = 1 and val > 'aaa') or (id > 1) order by id, val"
+	wantQuery = "select /*+ MAX_EXECUTION_TIME(3600000) */ id, val from t3 where (id = 1 and val > _binary'aaa') or (id > 1) order by id, val"
 	checkStream(t, "select * from t3", []sqltypes.Value{sqltypes.NewInt64(1), sqltypes.NewVarBinary("aaa")}, wantQuery, wantStream)
 
 	// t4: all rows
@@ -343,13 +346,92 @@ func TestStreamRowsFilterInt(t *testing.T) {
 
 	wantStream := []string{
 		`fields:{name:"id1" type:INT32 table:"t1" org_table:"t1" database:"vttest" org_name:"id1" column_length:11 charset:63 column_type:"int(11)"} fields:{name:"val" type:VARBINARY table:"t1" org_table:"t1" database:"vttest" org_name:"val" column_length:128 charset:63 column_type:"varbinary(128)"} pkfields:{name:"id1" type:INT32 charset:63}`,
-		`rows:{lengths:1 lengths:3 values:"1aaa"} rows:{lengths:1 lengths:3 values:"4ddd"} lastpk:{lengths:1 values:"5"}`,
+		`rows:{lengths:1 lengths:3 values:"1aaa"} rows:{lengths:1 lengths:3 values:"4ddd"} lastpk:{lengths:1 values:"4"}`,
 	}
-	wantQuery := "select /*+ MAX_EXECUTION_TIME(3600000) */ id1, id2, val from t1 force index (`PRIMARY`) order by id1"
-	checkStream(t, "select id1, val from t1 where id2 = 100", nil, wantQuery, wantStream)
+	wantQuery := "select /*+ MAX_EXECUTION_TIME(3600000) */ id1, id2, val from t1 where (id2 = 100) order by id1"
+	checkStream(t, "select id1, val from t1 where (id2 = 100)", nil, wantQuery, wantStream)
 	require.Equal(t, int64(0), engine.rowStreamerNumPackets.Get())
 	require.Equal(t, int64(2), engine.rowStreamerNumRows.Get())
 	require.Less(t, int64(0), engine.vstreamerPacketSize.Get())
+}
+
+func TestStreamRowsFilterBetween(t *testing.T) {
+	if testing.Short() {
+		t.Skip()
+	}
+	engine.rowStreamerNumPackets.Reset()
+	engine.rowStreamerNumRows.Reset()
+
+	if err := env.SetVSchema(shardedVSchema); err != nil {
+		t.Fatal(err)
+	}
+	defer env.SetVSchema("{}")
+
+	execStatements(t, []string{
+		"create table t1(id1 int, id2 int, val varbinary(128), primary key(id1))",
+		"insert into t1 values (1, 100, 'aaa'), (2, 200, 'bbb'), (3, 200, 'ccc'), (4, 100, 'ddd'), (5, 200, 'eee')",
+	})
+
+	defer execStatements(t, []string{
+		"drop table t1",
+	})
+
+	// Test for BETWEEN
+	wantStream := []string{
+		`fields:{name:"id1" type:INT32 table:"t1" org_table:"t1" database:"vttest" org_name:"id1" column_length:11 charset:63 column_type:"int(11)"} fields:{name:"val" type:VARBINARY table:"t1" org_table:"t1" database:"vttest" org_name:"val" column_length:128 charset:63 column_type:"varbinary(128)"} pkfields:{name:"id1" type:INT32 charset:63}`,
+		`rows:{lengths:1 lengths:3 values:"2bbb"} rows:{lengths:1 lengths:3 values:"3ccc"} rows:{lengths:1 lengths:3 values:"4ddd"} lastpk:{lengths:1 values:"4"}`,
+	}
+	wantQuery := "select /*+ MAX_EXECUTION_TIME(3600000) */ id1, id2, val from t1 where (id1 between 2 and 4) order by id1"
+	checkStream(t, "select id1, val from t1 where (id1 between 2 and 4)", nil, wantQuery, wantStream)
+	require.Equal(t, int64(0), engine.rowStreamerNumPackets.Get())
+	require.Equal(t, int64(3), engine.rowStreamerNumRows.Get())
+	require.NotZero(t, engine.vstreamerPacketSize.Get())
+
+	engine.rowStreamerNumPackets.Reset()
+	engine.rowStreamerNumRows.Reset()
+
+	// Test for NOT BETWEEN
+	wantStream = []string{
+		`fields:{name:"id1" type:INT32 table:"t1" org_table:"t1" database:"vttest" org_name:"id1" column_length:11 charset:63 column_type:"int(11)"} fields:{name:"val" type:VARBINARY table:"t1" org_table:"t1" database:"vttest" org_name:"val" column_length:128 charset:63 column_type:"varbinary(128)"} pkfields:{name:"id1" type:INT32 charset:63}`,
+		`rows:{lengths:1 lengths:3 values:"1aaa"} rows:{lengths:1 lengths:3 values:"5eee"} lastpk:{lengths:1 values:"5"}`,
+	}
+	wantQuery = "select /*+ MAX_EXECUTION_TIME(3600000) */ id1, id2, val from t1 where (id1 not between 2 and 4) order by id1"
+	checkStream(t, "select id1, val from t1 where (id1 not between 2 and 4)", nil, wantQuery, wantStream)
+	require.Equal(t, int64(0), engine.rowStreamerNumPackets.Get())
+	require.Equal(t, int64(2), engine.rowStreamerNumRows.Get())
+	require.NotZero(t, engine.vstreamerPacketSize.Get())
+}
+
+func TestStreamRowsFilterIn(t *testing.T) {
+	if testing.Short() {
+		t.Skip()
+	}
+	engine.rowStreamerNumPackets.Reset()
+	engine.rowStreamerNumRows.Reset()
+
+	if err := env.SetVSchema(shardedVSchema); err != nil {
+		t.Fatal(err)
+	}
+	defer env.SetVSchema("{}")
+
+	execStatements(t, []string{
+		"create table t1(id1 int, id2 int, val varbinary(128), primary key(id1))",
+		"insert into t1 values (1, 100, 'aaa'), (2, 200, 'bbb'), (3, 200, 'ccc'), (4, 100, 'ddd'), (5, 200, 'eee')",
+	})
+
+	defer execStatements(t, []string{
+		"drop table t1",
+	})
+
+	wantStream := []string{
+		`fields:{name:"id1" type:INT32 table:"t1" org_table:"t1" database:"vttest" org_name:"id1" column_length:11 charset:63 column_type:"int(11)"} fields:{name:"val" type:VARBINARY table:"t1" org_table:"t1" database:"vttest" org_name:"val" column_length:128 charset:63 column_type:"varbinary(128)"} pkfields:{name:"id1" type:INT32 charset:63}`,
+		`rows:{lengths:1 lengths:3 values:"1aaa"} rows:{lengths:1 lengths:3 values:"2bbb"} rows:{lengths:1 lengths:3 values:"3ccc"} lastpk:{lengths:1 values:"3"}`,
+	}
+	wantQuery := "select /*+ MAX_EXECUTION_TIME(3600000) */ id1, id2, val from t1 where (id1 in (1, 2, 3)) order by id1"
+	checkStream(t, "select id1, val from t1 where id1 in (1, 2, 3)", nil, wantQuery, wantStream)
+	require.Equal(t, int64(0), engine.rowStreamerNumPackets.Get())
+	require.Equal(t, int64(3), engine.rowStreamerNumRows.Get())
+	require.NotZero(t, engine.vstreamerPacketSize.Get())
 }
 
 func TestStreamRowsFilterVarBinary(t *testing.T) {
@@ -373,10 +455,35 @@ func TestStreamRowsFilterVarBinary(t *testing.T) {
 
 	wantStream := []string{
 		`fields:{name:"id1" type:INT32 table:"t1" org_table:"t1" database:"vttest" org_name:"id1" column_length:11 charset:63 column_type:"int(11)"} fields:{name:"val" type:VARBINARY table:"t1" org_table:"t1" database:"vttest" org_name:"val" column_length:128 charset:63 column_type:"varbinary(128)"} pkfields:{name:"id1" type:INT32 charset:63}`,
-		`rows:{lengths:1 lengths:6 values:"2newton"} rows:{lengths:1 lengths:6 values:"3newton"} rows:{lengths:1 lengths:6 values:"5newton"} lastpk:{lengths:1 values:"6"}`,
+		`rows:{lengths:1 lengths:6 values:"2newton"} rows:{lengths:1 lengths:6 values:"3newton"} rows:{lengths:1 lengths:6 values:"5newton"} lastpk:{lengths:1 values:"5"}`,
 	}
-	wantQuery := "select /*+ MAX_EXECUTION_TIME(3600000) */ id1, val from t1 force index (`PRIMARY`) order by id1"
-	checkStream(t, "select id1, val from t1 where val = 'newton'", nil, wantQuery, wantStream)
+	wantQuery := "select /*+ MAX_EXECUTION_TIME(3600000) */ id1, val from t1 where (val = 'newton') order by id1"
+	checkStream(t, "select id1, val from t1 where (val = 'newton')", nil, wantQuery, wantStream)
+}
+
+func TestStreamRowsFilterVarChar(t *testing.T) {
+	if testing.Short() {
+		t.Skip()
+	}
+
+	err := env.SetVSchema(shardedVSchema)
+	require.NoError(t, err)
+	defer env.SetVSchema("{}")
+
+	execStatements(t, []string{
+		"create table t1(id1 int, val varchar(128), primary key(id1)) character set utf8mb4 collate utf8mb4_general_ci", // Use general_ci so that we have the same behavior across 5.7 and 8.0
+		"insert into t1 values (1,'kepler'), (2, 'Ñewton'), (3, 'nEwton'), (4, 'kepler'), (5, 'neẅton'), (6, 'kepler')",
+	})
+	defer execStatements(t, []string{
+		"drop table t1",
+	})
+
+	wantStream := []string{
+		`fields:{name:"id1" type:INT32 table:"t1" org_table:"t1" database:"vttest" org_name:"id1" column_length:11 charset:63 column_type:"int(11)"} fields:{name:"val" type:VARCHAR table:"t1" org_table:"t1" database:"vttest" org_name:"val" column_length:512 charset:45 column_type:"varchar(128)"} pkfields:{name:"id1" type:INT32 charset:63}`,
+		`rows:{lengths:1 lengths:7 values:"2Ñewton"} rows:{lengths:1 lengths:6 values:"3nEwton"} rows:{lengths:1 lengths:8 values:"5neẅton"} lastpk:{lengths:1 values:"5"}`,
+	}
+	wantQuery := "select /*+ MAX_EXECUTION_TIME(3600000) */ id1, val from t1 where (val = 'newton') order by id1"
+	checkStream(t, "select id1, val from t1 where (val = 'newton')", nil, wantQuery, wantStream)
 }
 
 func TestStreamRowsMultiPacket(t *testing.T) {
@@ -428,14 +535,90 @@ func TestStreamRowsCancel(t *testing.T) {
 
 	var options binlogdatapb.VStreamOptions
 	options.ConfigOverrides = make(map[string]string)
-	options.ConfigOverrides["vstream_dynamic_packet_size"] = "false"
-	options.ConfigOverrides["vstream_packet_size"] = "10"
+
+	// Support both formats for backwards compatibility
+	// TODO(v25): Remove underscore versions
+	utils.SetFlagVariantsForTests(options.ConfigOverrides, "vstream-dynamic-packet-size", "false")
+	utils.SetFlagVariantsForTests(options.ConfigOverrides, "vstream-packet-size", "10")
+
 	err := engine.StreamRows(ctx, "select * from t1", nil, func(rows *binlogdatapb.VStreamRowsResponse) error {
 		cancel()
 		return nil
 	}, &options)
 	if got, want := err.Error(), "stream ended: context canceled"; got != want {
 		t.Errorf("err: %v, want %s", err, want)
+	}
+}
+
+func TestStreamRowsHeartbeat(t *testing.T) {
+	if testing.Short() {
+		t.Skip()
+	}
+
+	// Save original heartbeat interval and restore it after test
+	originalInterval := rowStreamertHeartbeatInterval
+	defer func() {
+		rowStreamertHeartbeatInterval = originalInterval
+	}()
+
+	// Set a very short heartbeat interval for testing (100ms)
+	rowStreamertHeartbeatInterval = 10 * time.Millisecond
+
+	execStatements(t, []string{
+		"create table t1(id int, val varchar(128), primary key(id))",
+		"insert into t1 values (1, 'test1')",
+		"insert into t1 values (2, 'test2')",
+		"insert into t1 values (3, 'test3')",
+		"insert into t1 values (4, 'test4')",
+		"insert into t1 values (5, 'test5')",
+	})
+
+	defer execStatements(t, []string{
+		"drop table t1",
+	})
+
+	ctx, cancel := context.WithTimeout(context.Background(), 1*time.Second)
+	defer cancel()
+
+	var heartbeatCount int32
+	dataReceived := false
+
+	var options binlogdatapb.VStreamOptions
+	options.ConfigOverrides = make(map[string]string)
+	options.ConfigOverrides["vstream_dynamic_packet_size"] = "false"
+	options.ConfigOverrides["vstream_packet_size"] = "10"
+
+	err := engine.StreamRows(ctx, "select * from t1", nil, func(rows *binlogdatapb.VStreamRowsResponse) error {
+		if rows.Heartbeat {
+			atomic.AddInt32(&heartbeatCount, 1)
+			// After receiving at least 3 heartbeats, we can be confident the fix is working
+			if atomic.LoadInt32(&heartbeatCount) >= 3 {
+				cancel()
+				return nil
+			}
+		} else if len(rows.Rows) > 0 {
+			dataReceived = true
+		}
+		// Add a small delay to allow heartbeats to be sent
+		time.Sleep(50 * time.Millisecond)
+		return nil
+	}, &options)
+
+	// We expect context canceled error since we cancel after receiving heartbeats
+	if err != nil && err.Error() != "stream ended: context canceled" {
+		t.Errorf("unexpected error: %v", err)
+	}
+
+	// Verify we received data
+	if !dataReceived {
+		t.Error("expected to receive data rows")
+	}
+
+	// This is the critical test: we should receive multiple heartbeats
+	// Without the fix (missing for loop), we would only get 1 heartbeat
+	// With the fix, we should get at least 3 heartbeats
+	if atomic.LoadInt32(&heartbeatCount) < 3 {
+		t.Errorf("expected at least 3 heartbeats, got %d. This indicates the heartbeat goroutine is not running continuously", heartbeatCount)
 	}
 }
 
@@ -451,8 +634,12 @@ func checkStream(t *testing.T, query string, lastpk []sqltypes.Value, wantQuery 
 		defer close(ch)
 		var options binlogdatapb.VStreamOptions
 		options.ConfigOverrides = make(map[string]string)
-		options.ConfigOverrides["vstream_dynamic_packet_size"] = strconv.FormatBool(vttablet.VStreamerUseDynamicPacketSize)
-		options.ConfigOverrides["vstream_packet_size"] = strconv.Itoa(vttablet.VStreamerDefaultPacketSize)
+
+		// Support both formats for backwards compatibility
+		// TODO(v25): Remove underscore versions
+		utils.SetFlagVariantsForTests(options.ConfigOverrides, "vstream-dynamic-packet-size", strconv.FormatBool(vttablet.VStreamerUseDynamicPacketSize))
+		utils.SetFlagVariantsForTests(options.ConfigOverrides, "vstream-packet-size", strconv.Itoa(vttablet.VStreamerDefaultPacketSize))
+
 		err := engine.StreamRows(context.Background(), query, lastpk, func(rows *binlogdatapb.VStreamRowsResponse) error {
 			if first {
 				if rows.Gtid == "" {

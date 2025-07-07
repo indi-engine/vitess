@@ -65,14 +65,15 @@ type Action string
 const (
 	/* generic actions */
 
-	CancelAction Action = "cancel"
-	CreateAction Action = "create"
-	DeleteAction Action = "delete"
-	GetAction    Action = "get"
-	PingAction   Action = "ping"
-	PutAction    Action = "put"
-	ReloadAction Action = "reload"
-	RetryAction  Action = "retry"
+	CancelAction   Action = "cancel"
+	CompleteAction Action = "complete"
+	CreateAction   Action = "create"
+	DeleteAction   Action = "delete"
+	GetAction      Action = "get"
+	PingAction     Action = "ping"
+	PutAction      Action = "put"
+	ReloadAction   Action = "reload"
+	RetryAction    Action = "retry"
 
 	// cancel, complete, cleanup, launch, retry
 
@@ -134,6 +135,8 @@ const (
 	WorkflowResource                 Resource = "Workflow"
 
 	VTExplainResource Resource = "VTExplain"
+
+	VExplainResource Resource = "VExplain"
 
 	TabletFullStatusResource Resource = "TabletFullStatus"
 )

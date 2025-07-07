@@ -60,6 +60,7 @@ const (
 	PlanOtherRead
 	// PlanOtherAdmin is for statements like repair, lock table, etc.
 	PlanOtherAdmin
+	PlanSelectNoLimit
 	PlanSelectStream
 	// PlanMessageStream is for "stream" statements.
 	PlanMessageStream
@@ -71,7 +72,6 @@ const (
 	PlanLoad
 	// PlanFlush is for FLUSH statements
 	PlanFlush
-	PlanLockTables
 	PlanUnlockTables
 	PlanCallProc
 	PlanAlterMigration
@@ -99,6 +99,7 @@ var planName = []string{
 	"Set",
 	"OtherRead",
 	"OtherAdmin",
+	"SelectNoLimit",
 	"SelectStream",
 	"MessageStream",
 	"Savepoint",
@@ -107,7 +108,6 @@ var planName = []string{
 	"Show",
 	"Load",
 	"Flush",
-	"LockTables",
 	"UnlockTables",
 	"CallProcedure",
 	"AlterMigration",
@@ -202,15 +202,12 @@ func (plan *Plan) TableNames() (names []string) {
 }
 
 // Build builds a plan based on the schema.
-func Build(env *vtenv.Environment, statement sqlparser.Statement, tables map[string]*schema.Table, dbName string, viewsEnabled bool) (plan *Plan, err error) {
+func Build(env *vtenv.Environment, statement sqlparser.Statement, tables map[string]*schema.Table, dbName string, noRowsLimit bool) (plan *Plan, err error) {
 	switch stmt := statement.(type) {
 	case *sqlparser.Union:
-		plan, err = &Plan{
-			PlanID:    PlanSelect,
-			FullQuery: GenerateLimitQuery(stmt),
-		}, nil
+		plan = analyzeUnion(stmt, noRowsLimit)
 	case *sqlparser.Select:
-		plan, err = analyzeSelect(env, stmt, tables)
+		plan, err = analyzeSelect(env, stmt, tables, noRowsLimit)
 	case *sqlparser.Insert:
 		plan, err = analyzeInsert(stmt, tables)
 	case *sqlparser.Update:
@@ -218,39 +215,44 @@ func Build(env *vtenv.Environment, statement sqlparser.Statement, tables map[str
 	case *sqlparser.Delete:
 		plan, err = analyzeDelete(stmt, tables)
 	case *sqlparser.Set:
-		plan, err = analyzeSet(stmt), nil
+		plan = analyzeSet(stmt)
 	case sqlparser.DDLStatement:
 		plan, err = analyzeDDL(stmt)
 	case *sqlparser.AlterMigration:
-		plan, err = &Plan{PlanID: PlanAlterMigration, FullStmt: stmt}, nil
+		plan = &Plan{PlanID: PlanAlterMigration, FullStmt: stmt}
 	case *sqlparser.RevertMigration:
-		plan, err = &Plan{PlanID: PlanRevertMigration, FullStmt: stmt}, nil
+		plan = &Plan{PlanID: PlanRevertMigration, FullStmt: stmt}
 	case *sqlparser.ShowMigrationLogs:
-		plan, err = &Plan{PlanID: PlanShowMigrationLogs, FullStmt: stmt}, nil
+		plan = &Plan{PlanID: PlanShowMigrationLogs, FullStmt: stmt}
 	case *sqlparser.ShowThrottledApps:
-		plan, err = &Plan{PlanID: PlanShowThrottledApps, FullStmt: stmt}, nil
+		plan = &Plan{PlanID: PlanShowThrottledApps, FullStmt: stmt}
 	case *sqlparser.ShowThrottlerStatus:
-		plan, err = &Plan{PlanID: PlanShowThrottlerStatus, FullStmt: stmt}, nil
+		plan = &Plan{PlanID: PlanShowThrottlerStatus, FullStmt: stmt}
 	case *sqlparser.Show:
 		plan, err = analyzeShow(stmt, dbName)
 	case *sqlparser.Analyze, sqlparser.Explain:
-		plan, err = &Plan{PlanID: PlanOtherRead}, nil
+		// Analyze and Explain are treated as read-only queries.
+		// We send down a string, and get a table result back.
+		plan = &Plan{
+			PlanID:    PlanSelect,
+			FullQuery: GenerateFullQuery(stmt),
+		}
 	case *sqlparser.OtherAdmin:
-		plan, err = &Plan{PlanID: PlanOtherAdmin}, nil
+		plan = &Plan{PlanID: PlanOtherAdmin}
 	case *sqlparser.Savepoint:
-		plan, err = &Plan{PlanID: PlanSavepoint}, nil
+		plan = &Plan{PlanID: PlanSavepoint, FullStmt: stmt}
 	case *sqlparser.Release:
-		plan, err = &Plan{PlanID: PlanRelease}, nil
+		plan = &Plan{PlanID: PlanRelease}
 	case *sqlparser.SRollback:
-		plan, err = &Plan{PlanID: PlanSRollback}, nil
+		plan = &Plan{PlanID: PlanSRollback, FullStmt: stmt}
 	case *sqlparser.Load:
-		plan, err = &Plan{PlanID: PlanLoad}, nil
+		plan = &Plan{PlanID: PlanLoad}
 	case *sqlparser.Flush:
 		plan, err = analyzeFlush(stmt, tables)
 	case *sqlparser.UnlockTables:
-		plan, err = &Plan{PlanID: PlanUnlockTables}, nil
+		plan = &Plan{PlanID: PlanUnlockTables}
 	case *sqlparser.CallProc:
-		plan, err = &Plan{PlanID: PlanCallProc, FullQuery: GenerateFullQuery(stmt)}, nil
+		plan = &Plan{PlanID: PlanCallProc, FullQuery: GenerateFullQuery(stmt)}
 	default:
 		return nil, vterrors.New(vtrpcpb.Code_INVALID_ARGUMENT, "invalid SQL")
 	}
@@ -343,7 +345,7 @@ func BuildSettingQuery(settings []string, parser *sqlparser.Parser) (query strin
 		setExprs = append(setExprs, set.Exprs...)
 		for _, sExpr := range set.Exprs {
 			sysVar := sExpr.Var
-			if sysVar.Scope != sqlparser.SessionScope {
+			if sysVar.Scope != sqlparser.SessionScope && sysVar.Scope != sqlparser.NoScope {
 				return "", "", vterrors.Errorf(vtrpcpb.Code_INTERNAL, "[BUG]: session scope expected, got: %s", sysVar.Scope.ToString())
 			}
 			resetSetExprs = append(resetSetExprs, &sqlparser.SetExpr{Var: sysVar, Expr: lDefault})

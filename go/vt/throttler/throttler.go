@@ -38,7 +38,6 @@ import (
 	"vitess.io/vitess/go/vt/proto/topodata"
 
 	throttlerdatapb "vitess.io/vitess/go/vt/proto/throttlerdata"
-	topodatapb "vitess.io/vitess/go/vt/proto/topodata"
 )
 
 const (
@@ -78,7 +77,7 @@ type Throttler interface {
 	GetConfiguration() *throttlerdatapb.Configuration
 	UpdateConfiguration(configuration *throttlerdatapb.Configuration, copyZeroValues bool) error
 	ResetConfiguration()
-	MaxLag(tabletType topodatapb.TabletType) uint32
+	MaxLag(tabletType topodata.TabletType) uint32
 	Log() []Result
 }
 
@@ -245,22 +244,10 @@ func (t *ThrottlerImpl) Throttle(threadID int) time.Duration {
 // the provided type, excluding ignored tablets.
 func (t *ThrottlerImpl) MaxLag(tabletType topodata.TabletType) uint32 {
 	cache := t.maxReplicationLagModule.lagCacheByType(tabletType)
-
-	var maxLag uint32
-	cacheEntries := cache.entries
-
-	for key := range cacheEntries {
-		if cache.isIgnored(key) {
-			continue
-		}
-
-		lag := cache.latest(key).Stats.ReplicationLagSeconds
-		if lag > maxLag {
-			maxLag = lag
-		}
+	if cache == nil {
+		return 0
 	}
-
-	return maxLag
+	return cache.maxLag()
 }
 
 // ThreadFinished marks threadID as finished and redistributes the thread's

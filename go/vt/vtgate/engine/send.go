@@ -39,7 +39,7 @@ type Send struct {
 	Keyspace *vindexes.Keyspace
 
 	// TargetDestination specifies an explicit target destination to send the query to.
-	TargetDestination key.Destination
+	TargetDestination key.ShardDestination
 
 	// Query specifies the query to be executed.
 	Query string
@@ -72,25 +72,6 @@ func (s *Send) NeedsTransaction() bool {
 	return s.IsDML
 }
 
-// RouteType implements Primitive interface
-func (s *Send) RouteType() string {
-	if s.IsDML {
-		return "SendDML"
-	}
-
-	return "Send"
-}
-
-// GetKeyspaceName implements Primitive interface
-func (s *Send) GetKeyspaceName() string {
-	return s.Keyspace.Name
-}
-
-// GetTableName implements Primitive interface
-func (s *Send) GetTableName() string {
-	return ""
-}
-
 // TryExecute implements Primitive interface
 func (s *Send) TryExecute(ctx context.Context, vcursor VCursor, bindVars map[string]*querypb.BindVariable, wantfields bool) (*sqltypes.Result, error) {
 	if err := s.commitIfDDL(ctx, vcursor); err != nil {
@@ -116,7 +97,7 @@ func (s *Send) TryExecute(ctx context.Context, vcursor VCursor, bindVars map[str
 	}
 
 	rollbackOnError := s.IsDML // for non-dml queries, there's no need to do a rollback
-	result, errs := vcursor.ExecuteMultiShard(ctx, s, rss, queries, rollbackOnError, s.canAutoCommit(vcursor, rss))
+	result, errs := vcursor.ExecuteMultiShard(ctx, s, rss, queries, rollbackOnError, s.canAutoCommit(vcursor, rss), false)
 	err = vterrors.Aggregate(errs)
 	if err != nil {
 		return nil, err
@@ -125,7 +106,7 @@ func (s *Send) TryExecute(ctx context.Context, vcursor VCursor, bindVars map[str
 }
 
 func (s *Send) checkAndReturnShards(ctx context.Context, vcursor VCursor) ([]*srvtopo.ResolvedShard, error) {
-	rss, _, err := vcursor.ResolveDestinations(ctx, s.Keyspace.Name, nil, []key.Destination{s.TargetDestination})
+	rss, _, err := vcursor.ResolveDestinations(ctx, s.Keyspace.Name, nil, []key.ShardDestination{s.TargetDestination})
 	if err != nil {
 		return nil, err
 	}
@@ -179,12 +160,15 @@ func (s *Send) TryStreamExecute(ctx context.Context, vcursor VCursor, bindVars m
 		}
 		multiBindVars[i] = bv
 	}
-	errors := vcursor.StreamExecuteMulti(ctx, s, s.Query, rss, multiBindVars, s.IsDML, s.canAutoCommit(vcursor, rss), callback)
+	errors := vcursor.StreamExecuteMulti(ctx, s, s.Query, rss, multiBindVars, s.IsDML, s.canAutoCommit(vcursor, rss), false, callback)
 	return vterrors.Aggregate(errors)
 }
 
 // GetFields implements Primitive interface
 func (s *Send) GetFields(ctx context.Context, vcursor VCursor, bindVars map[string]*querypb.BindVariable) (*sqltypes.Result, error) {
+	if s.IsDML || s.IsDDL {
+		return &sqltypes.Result{}, nil
+	}
 	qr, err := vcursor.ExecutePrimitive(ctx, s, bindVars, false)
 	if err != nil {
 		return nil, err
@@ -196,7 +180,6 @@ func (s *Send) GetFields(ctx context.Context, vcursor VCursor, bindVars map[stri
 func (s *Send) description() PrimitiveDescription {
 	other := map[string]any{
 		"Query":                    s.Query,
-		"Table":                    s.GetTableName(),
 		"IsDML":                    s.IsDML,
 		"SingleShardOnly":          s.SingleShardOnly,
 		"ShardNameNeeded":          s.ShardNameNeeded,

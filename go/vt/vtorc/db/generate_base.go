@@ -44,6 +44,8 @@ CREATE TABLE database_instance (
 	alias varchar(256) NOT NULL,
 	hostname varchar(128) NOT NULL,
 	port smallint NOT NULL,
+	tablet_type smallint(5) NOT NULL,
+	cell varchar(32) NOT NULL,
 	last_checked timestamp not null default (''),
 	last_seen timestamp NULL DEFAULT NULL,
 	server_id int NOT NULL,
@@ -69,14 +71,10 @@ CREATE TABLE database_instance (
 	last_sql_error TEXT not null default '',
 	last_io_error TEXT not null default '',
 	oracle_gtid TINYint not null default 0,
-	mariadb_gtid TINYint not null default 0,
 	relay_log_file varchar(128) not null default '',
 	relay_log_pos bigint not null default 0,
-	pseudo_gtid TINYint not null default 0,
 	replication_depth TINYint not null default 0,
 	has_replication_filters TINYint not null default 0,
-	data_center varchar(32) not null default '',
-	physical_environment varchar(32) not null default '',
 	is_co_primary TINYint not null default 0,
 	sql_delay int not null default 0,
 	binlog_server TINYint not null default 0,
@@ -101,12 +99,13 @@ CREATE TABLE database_instance (
 	ancestry_uuid text not null default '',
 	replication_sql_thread_state tinyint signed not null default 0,
 	replication_io_thread_state tinyint signed not null default 0,
-	region varchar(32) not null default '',
 	semi_sync_primary_timeout int NOT NULL DEFAULT 0,
 	semi_sync_primary_wait_for_replica_count int NOT NULL DEFAULT 0,
 	semi_sync_primary_status TINYint NOT NULL DEFAULT 0,
 	semi_sync_replica_status TINYint NOT NULL DEFAULT 0,
 	semi_sync_primary_clients int NOT NULL DEFAULT 0,
+	semi_sync_blocked tinyint NOT NULL DEFAULT 0,
+	is_disk_stalled TINYint NOT NULL DEFAULT 0,
 	PRIMARY KEY (alias)
 )`,
 	`
@@ -114,6 +113,9 @@ CREATE INDEX last_checked_idx_database_instance ON database_instance(last_checke
 	`,
 	`
 CREATE INDEX last_seen_idx_database_instance ON database_instance(last_seen)
+	`,
+	`
+CREATE INDEX hostname_port_database_instance ON database_instance(hostname, port)
 	`,
 	`
 DROP TABLE IF EXISTS audit

@@ -40,7 +40,6 @@ import (
 )
 
 func TestVtgateHealthCheck(t *testing.T) {
-	defer cluster.PanicHandler(t)
 	// Healthcheck interval on tablet is set to 1s, so sleep for 2s
 	time.Sleep(2 * time.Second)
 	verifyVtgateVariables(t, clusterInstance.VtgateProcess.VerifyURL)
@@ -54,7 +53,6 @@ func TestVtgateHealthCheck(t *testing.T) {
 }
 
 func TestVtgateReplicationStatusCheck(t *testing.T) {
-	defer cluster.PanicHandler(t)
 	// Healthcheck interval on tablet is set to 1s, so sleep for 2s
 	time.Sleep(2 * time.Second)
 	verifyVtgateVariables(t, clusterInstance.VtgateProcess.VerifyURL)
@@ -104,7 +102,6 @@ func TestVtgateReplicationStatusCheck(t *testing.T) {
 }
 
 func TestVtgateReplicationStatusCheckWithTabletTypeChange(t *testing.T) {
-	defer cluster.PanicHandler(t)
 	// Healthcheck interval on tablet is set to 1s, so sleep for 2s
 	time.Sleep(2 * time.Second)
 	verifyVtgateVariables(t, clusterInstance.VtgateProcess.VerifyURL)
@@ -180,7 +177,6 @@ func retryNTimes(t *testing.T, maxRetries int, f func() bool) {
 
 func TestReplicaTransactions(t *testing.T) {
 	// TODO(deepthi): this test seems to depend on previous test. Fix tearDown so that tests are independent
-	defer cluster.PanicHandler(t)
 	// Healthcheck interval on tablet is set to 1s, so sleep for 2s
 	time.Sleep(2 * time.Second)
 	ctx := context.Background()
@@ -265,7 +261,7 @@ func TestReplicaTransactions(t *testing.T) {
 	_ = replicaTablet.VttabletProcess.TearDown()
 	// Healthcheck interval on tablet is set to 1s, so sleep for 2s
 	time.Sleep(2 * time.Second)
-	utils.AssertContainsError(t, readConn, fetchAllCustomers, "is either down or nonexistent")
+	utils.AssertContainsMultipleErrors(t, readConn, fetchAllCustomers, "VT15001", "is either down or nonexistent")
 
 	// bring up the tablet again
 	// trying to use the same session/transaction should fail as the vtgate has
@@ -275,7 +271,8 @@ func TestReplicaTransactions(t *testing.T) {
 	require.NoError(t, err)
 	serving := replicaTablet.VttabletProcess.WaitForStatus("SERVING", 60*time.Second)
 	assert.Equal(t, serving, true, "Tablet did not become ready within a reasonable time")
-	utils.AssertContainsError(t, readConn, fetchAllCustomers, "not found")
+	utils.AssertContainsError(t, readConn, fetchAllCustomers, "VT09032")
+	utils.Exec(t, readConn, "rollback")
 
 	// create a new connection, should be able to query again
 	readConn, err = mysql.Connect(ctx, &vtParams)
@@ -287,7 +284,6 @@ func TestReplicaTransactions(t *testing.T) {
 
 // TestStreamingRPCStuck tests that StreamExecute calls don't get stuck on the vttablets if a client stop reading from a stream.
 func TestStreamingRPCStuck(t *testing.T) {
-	defer cluster.PanicHandler(t)
 	ctx := context.Background()
 	vtConn, err := mysql.Connect(ctx, &vtParams)
 	require.NoError(t, err)

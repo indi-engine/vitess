@@ -49,10 +49,12 @@ import (
 	"sync"
 
 	"github.com/spf13/pflag"
+	"golang.org/x/sync/semaphore"
 
 	"vitess.io/vitess/go/vt/log"
 	"vitess.io/vitess/go/vt/proto/topodata"
 	"vitess.io/vitess/go/vt/servenv"
+	"vitess.io/vitess/go/vt/utils"
 	"vitess.io/vitess/go/vt/vterrors"
 )
 
@@ -181,6 +183,9 @@ var (
 
 	FlagBinaries = []string{"vttablet", "vtctl", "vtctld", "vtcombo", "vtgate",
 		"vtorc", "vtbackup"}
+
+	// Default read concurrency to use in order to avoid overhwelming the topo server.
+	DefaultReadConcurrency int64 = 32
 )
 
 func init() {
@@ -190,9 +195,10 @@ func init() {
 }
 
 func registerTopoFlags(fs *pflag.FlagSet) {
-	fs.StringVar(&topoImplementation, "topo_implementation", topoImplementation, "the topology implementation to use")
-	fs.StringVar(&topoGlobalServerAddress, "topo_global_server_address", topoGlobalServerAddress, "the address of the global topology server")
-	fs.StringVar(&topoGlobalRoot, "topo_global_root", topoGlobalRoot, "the path of the global topology data in the global topology server")
+	utils.SetFlagStringVar(fs, &topoImplementation, "topo-implementation", topoImplementation, "the topology implementation to use")
+	utils.SetFlagStringVar(fs, &topoGlobalServerAddress, "topo-global-server-address", topoGlobalServerAddress, "the address of the global topology server")
+	utils.SetFlagStringVar(fs, &topoGlobalRoot, "topo-global-root", topoGlobalRoot, "the path of the global topology data in the global topology server")
+	utils.SetFlagInt64Var(fs, &DefaultReadConcurrency, "topo-read-concurrency", DefaultReadConcurrency, "Maximum concurrency of topo reads per global or local cell.")
 }
 
 // RegisterFactory registers a Factory for an implementation for a Server.
@@ -208,11 +214,12 @@ func RegisterFactory(name string, factory Factory) {
 // NewWithFactory creates a new Server based on the given Factory.
 // It also opens the global cell connection.
 func NewWithFactory(factory Factory, serverAddress, root string) (*Server, error) {
+	globalReadSem := semaphore.NewWeighted(DefaultReadConcurrency)
 	conn, err := factory.Create(GlobalCell, serverAddress, root)
 	if err != nil {
 		return nil, err
 	}
-	conn = NewStatsConn(GlobalCell, conn)
+	conn = NewStatsConn(GlobalCell, conn, globalReadSem)
 
 	var connReadOnly Conn
 	if factory.HasGlobalReadOnlyCell(serverAddress, root) {
@@ -220,7 +227,7 @@ func NewWithFactory(factory Factory, serverAddress, root string) (*Server, error
 		if err != nil {
 			return nil, err
 		}
-		connReadOnly = NewStatsConn(GlobalReadOnlyCell, connReadOnly)
+		connReadOnly = NewStatsConn(GlobalReadOnlyCell, connReadOnly, globalReadSem)
 	} else {
 		connReadOnly = conn
 	}
@@ -247,10 +254,10 @@ func OpenServer(implementation, serverAddress, root string) (*Server, error) {
 // for implementation, address and root. It log.Exits out if an error occurs.
 func Open() *Server {
 	if topoGlobalServerAddress == "" {
-		log.Exitf("topo_global_server_address must be configured")
+		log.Exitf("topo-global-server-address must be configured")
 	}
 	if topoGlobalRoot == "" {
-		log.Exit("topo_global_root must be non-empty")
+		log.Exit("topo-global-root must be non-empty")
 	}
 	ts, err := OpenServer(topoImplementation, topoGlobalServerAddress, topoGlobalRoot)
 	if err != nil {
@@ -262,11 +269,12 @@ func Open() *Server {
 // ConnForCell returns a Conn object for the given cell.
 // It caches Conn objects from previously requested cells.
 func (ts *Server) ConnForCell(ctx context.Context, cell string) (Conn, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+
 	// Global cell is the easy case.
 	if cell == GlobalCell {
-		if ctx.Err() != nil {
-			return nil, ctx.Err()
-		}
 		return ts.globalCell, nil
 	}
 
@@ -301,7 +309,8 @@ func (ts *Server) ConnForCell(ctx context.Context, cell string) (Conn, error) {
 	conn, err := ts.factory.Create(cell, ci.ServerAddress, ci.Root)
 	switch {
 	case err == nil:
-		conn = NewStatsConn(cell, conn)
+		cellReadSem := semaphore.NewWeighted(DefaultReadConcurrency)
+		conn = NewStatsConn(cell, conn, cellReadSem)
 		ts.cellConns[cell] = cellConn{ci, conn}
 		return conn, nil
 	case IsErrType(err, NoNode):
@@ -343,8 +352,10 @@ func GetAliasByCell(ctx context.Context, ts *Server, cell string) string {
 // Close will close all connections to underlying topo Server.
 // It will nil all member variables, so any further access will panic.
 func (ts *Server) Close() {
-	ts.globalCell.Close()
-	if ts.globalReadOnlyCell != ts.globalCell {
+	if ts.globalCell != nil {
+		ts.globalCell.Close()
+	}
+	if ts.globalReadOnlyCell != nil && ts.globalReadOnlyCell != ts.globalCell {
 		ts.globalReadOnlyCell.Close()
 	}
 	ts.globalCell = nil

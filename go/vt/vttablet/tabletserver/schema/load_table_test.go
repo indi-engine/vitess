@@ -70,17 +70,8 @@ func TestLoadView(t *testing.T) {
 	want := &Table{
 		Name: sqlparser.NewIdentifierCS("test_table"),
 		Type: View,
-		Fields: []*querypb.Field{{
-			Name: "pk",
-			Type: sqltypes.Int32,
-		}, {
-			Name: "name",
-			Type: sqltypes.Int32,
-		}, {
-			Name: "addr",
-			Type: sqltypes.Int32,
-		}},
 	}
+	// empty fields
 	assert.Equal(t, want, table)
 }
 
@@ -149,6 +140,7 @@ func TestLoadTableMessage(t *testing.T) {
 			BatchSize:          1,
 			CacheSize:          10,
 			PollInterval:       30 * time.Second,
+			IDType:             sqltypes.Int64,
 		},
 	}
 	assert.Equal(t, want, table)

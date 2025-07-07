@@ -43,6 +43,7 @@ import (
 	"vitess.io/vitess/go/vt/sqlparser"
 	"vitess.io/vitess/go/vt/vterrors"
 	"vitess.io/vitess/go/vt/vtgate/planbuilder/plancontext"
+	"vitess.io/vitess/go/vt/vtgate/semantics"
 )
 
 type (
@@ -69,17 +70,48 @@ func PlanQuery(ctx *plancontext.PlanningContext, stmt sqlparser.Statement) (resu
 		fmt.Println(ToTree(op))
 	}
 
-	op = compact(ctx, op)
 	checkValid(op)
 	op = planQuery(ctx, op)
 
-	_, isRoute := op.(*Route)
-	if !isRoute && ctx.SemTable.NotSingleRouteErr != nil {
-		// If we got here, we don't have a single shard plan
-		return nil, ctx.SemTable.NotSingleRouteErr
+	if err := checkSingleRouteError(ctx, op); err != nil {
+		return nil, err
 	}
 
-	return op, err
+	return op, nil
+}
+
+// checkSingleRouteError checks if the query has a NotSingleRouteErr and more than one route, and returns an error if it does
+func checkSingleRouteError(ctx *plancontext.PlanningContext, op Operator) error {
+	if ctx.SemTable.NotSingleRouteErr == nil && ctx.SemTable.NotSingleShardErr == nil {
+		return nil
+	}
+	err := ctx.SemTable.NotSingleRouteErr
+	if err == nil {
+		err = ctx.SemTable.NotSingleShardErr
+	}
+	routes := 0
+	var singleShard bool
+	visitF := func(op Operator, _ semantics.TableSet, _ bool) (Operator, *ApplyResult) {
+		switch op := op.(type) {
+		case *Route:
+
+			routes++
+			singleShard = op.IsSingleShard()
+		}
+		return op, NoRewrite
+	}
+
+	// we'll walk the tree and count the number of routes
+	TopDown(op, TableID, visitF, stopAtRoute)
+
+	if routes > 1 {
+		return err
+	}
+
+	if ctx.SemTable.NotSingleShardErr != nil && !singleShard {
+		return ctx.SemTable.NotSingleShardErr
+	}
+	return nil
 }
 
 func PanicHandler(err *error) {
@@ -124,7 +156,7 @@ func (noColumns) FindCol(*plancontext.PlanningContext, sqlparser.Expr, bool) int
 	panic(vterrors.VT13001("noColumns operators have no column"))
 }
 
-func (noColumns) GetSelectExprs(*plancontext.PlanningContext) sqlparser.SelectExprs {
+func (noColumns) GetSelectExprs(*plancontext.PlanningContext) []sqlparser.SelectExpr {
 	panic(vterrors.VT13001("noColumns operators have no column"))
 }
 
@@ -169,7 +201,7 @@ func tryTruncateColumnsAt(op Operator, truncateAt int) bool {
 	}
 }
 
-func transformColumnsToSelectExprs(ctx *plancontext.PlanningContext, op Operator) sqlparser.SelectExprs {
+func transformColumnsToSelectExprs(ctx *plancontext.PlanningContext, op Operator) []sqlparser.SelectExpr {
 	columns := op.GetColumns(ctx)
 	if trunc, ok := op.(columnTruncator); ok {
 		count := trunc.getTruncateColumnCount()
@@ -178,8 +210,7 @@ func transformColumnsToSelectExprs(ctx *plancontext.PlanningContext, op Operator
 		}
 	}
 
-	selExprs := slice.Map(columns, func(from *sqlparser.AliasedExpr) sqlparser.SelectExpr {
+	return slice.Map(columns, func(from *sqlparser.AliasedExpr) sqlparser.SelectExpr {
 		return from
 	})
-	return selExprs
 }

@@ -31,6 +31,7 @@ import (
 
 	"vitess.io/vitess/go/mysql"
 	"vitess.io/vitess/go/test/endtoend/cluster"
+	"vitess.io/vitess/go/vt/utils"
 )
 
 var (
@@ -46,8 +47,7 @@ var (
 		PRIMARY KEY (id)
 	) Engine=InnoDB;`
 	vschemaDDL      = "alter vschema create vindex test_vdx using hash"
-	vschemaDDLError = fmt.Sprintf("Error 1105 (HY000): cannot perform Update on keyspaces/%s/VSchema as the topology server connection is read-only",
-		keyspaceUnshardedName)
+	vschemaDDLError = "Error 1105 (HY000): cannot update VSchema as the topology server connection is read-only"
 )
 
 // createConfig creates a config file in TmpDir in vtdataroot and writes the given data.
@@ -97,7 +97,7 @@ func createCluster(extraVTGateArgs []string) (*cluster.LocalProcessCluster, int)
 
 	vtGateArgs := []string{
 		"--mysql_auth_server_static_file", clusterInstance.TmpDirectory + "/" + mysqlAuthServerStatic,
-		"--keyspaces_to_watch", keyspaceUnshardedName,
+		utils.GetFlagVariantForTests("--keyspaces-to-watch"), keyspaceUnshardedName,
 	}
 
 	if extraVTGateArgs != nil {
@@ -117,7 +117,6 @@ func createCluster(extraVTGateArgs []string) (*cluster.LocalProcessCluster, int)
 }
 
 func TestRoutingWithKeyspacesToWatch(t *testing.T) {
-	defer cluster.PanicHandler(t)
 
 	clusterInstance, exitCode := createCluster(nil)
 	defer clusterInstance.Teardown()
@@ -141,7 +140,6 @@ func TestRoutingWithKeyspacesToWatch(t *testing.T) {
 }
 
 func TestVSchemaDDLWithKeyspacesToWatch(t *testing.T) {
-	defer cluster.PanicHandler(t)
 
 	extraVTGateArgs := []string{
 		"--vschema_ddl_authorized_users", "%",
@@ -162,7 +160,7 @@ func TestVSchemaDDLWithKeyspacesToWatch(t *testing.T) {
 	require.Nil(t, err)
 	defer db.Close()
 
-	// The topo server must be read-only when using keyspaces_to_watch in order to prevent
+	// The topo server must be read-only when using keyspaces-to-watch in order to prevent
 	// potentially corrupting the VSchema based on this vtgates limited view of the world
 	_, err = db.Exec(vschemaDDL)
 	require.EqualError(t, err, vschemaDDLError)

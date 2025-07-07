@@ -12,10 +12,19 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-FROM --platform=linux/amd64 golang:1.23.1-bullseye AS builder
+FROM --platform=linux/amd64 golang:1.24.4-bookworm AS builder
 
 # Allows docker builds to set the BUILD_NUMBER
 ARG BUILD_NUMBER
+
+# Allows docker builds to set the BUILD_GIT_BRANCH
+ARG BUILD_GIT_BRANCH
+
+# Allows docker builds to set the BUILD_GIT_REV
+ARG BUILD_GIT_REV
+
+# Allows docker builds to set the BUILD_TIME
+ARG BUILD_TIME
 
 WORKDIR /vt/src/vitess.io/vitess
 
@@ -31,7 +40,12 @@ COPY --chown=vitess:vitess . /vt/src/vitess.io/vitess
 RUN make install PREFIX=/vt/install
 
 # Start over and build the final image.
-FROM --platform=linux/amd64 debian:bullseye-slim
+FROM --platform=linux/amd64 debian:bookworm-slim
+
+# Install locale required for mysqlsh
+RUN apt-get update && apt-get install -y locales \
+    && echo "en_US.UTF-8 UTF-8" > /etc/locale.gen \
+    && locale-gen en_US.UTF-8
 
 # Install dependencies
 COPY docker/utils/install_dependencies.sh /vt/dist/install_dependencies.sh
@@ -39,7 +53,7 @@ RUN /vt/dist/install_dependencies.sh mysql80
 
 # Set up Vitess user and directory tree.
 RUN groupadd -r vitess && useradd -r -g vitess vitess
-RUN mkdir -p /vt/vtdataroot && chown -R vitess:vitess /vt
+RUN mkdir -p /vt/vtdataroot /home/vitess && chown -R vitess:vitess /vt /home/vitess
 
 # Set up Vitess environment (just enough to run pre-built Go binaries)
 ENV VTROOT /vt

@@ -30,7 +30,7 @@ import (
 	topodatapb "vitess.io/vitess/go/vt/proto/topodata"
 	"vitess.io/vitess/go/vt/topo"
 	"vitess.io/vitess/go/vt/topo/topoproto"
-	"vitess.io/vitess/go/vt/vtctl/reparentutil"
+	"vitess.io/vitess/go/vt/vtctl/reparentutil/policy"
 	"vitess.io/vitess/go/vt/vtorc/config"
 	"vitess.io/vitess/go/vt/vtorc/db"
 	"vitess.io/vitess/go/vt/vtorc/util"
@@ -47,14 +47,14 @@ func init() {
 func initializeAnalysisDaoPostConfiguration() {
 	config.WaitForConfigurationToBeLoaded()
 
-	recentInstantAnalysis = cache.New(time.Duration(config.Config.RecoveryPollSeconds*2)*time.Second, time.Second)
+	recentInstantAnalysis = cache.New(config.GetRecoveryPollDuration()*2, time.Second)
 }
 
 type clusterAnalysis struct {
-	hasClusterwideAction bool
-	totalTablets         int
-	primaryAlias         string
-	durability           reparentutil.Durabler
+	hasShardWideAction bool
+	totalTablets       int
+	primaryAlias       string
+	durability         policy.Durabler
 }
 
 // GetReplicationAnalysis will check for replication problems (dead primary; unreachable primary; etc)
@@ -68,9 +68,8 @@ func GetReplicationAnalysis(keyspace string, shard string, hints *ReplicationAna
 	}
 
 	// TODO(sougou); deprecate ReduceReplicationAnalysisCount
-	args := sqlutils.Args(config.Config.ReasonableReplicationLagSeconds, ValidSecondsFromSeenToLastAttemptedCheck(), config.Config.ReasonableReplicationLagSeconds, keyspace, shard)
-	query := `
-	SELECT
+	args := sqlutils.Args(config.GetReasonableReplicationLagSeconds(), ValidSecondsFromSeenToLastAttemptedCheck(), config.GetReasonableReplicationLagSeconds(), keyspace, shard)
+	query := `SELECT
 		vitess_tablet.info AS tablet_info,
 		vitess_tablet.tablet_type,
 		vitess_tablet.primary_timestamp,
@@ -80,7 +79,7 @@ func GetReplicationAnalysis(keyspace string, shard string, hints *ReplicationAna
 		vitess_keyspace.durability_policy AS durability_policy,
 		vitess_shard.primary_timestamp AS shard_primary_term_timestamp,
 		primary_instance.read_only AS read_only,
-		MIN(primary_instance.gtid_errant) AS gtid_errant, 
+		MIN(primary_instance.gtid_errant) AS gtid_errant,
 		MIN(primary_instance.alias) IS NULL AS is_invalid,
 		MIN(primary_instance.binary_log_file) AS binary_log_file,
 		MIN(primary_instance.binary_log_pos) AS binary_log_pos,
@@ -91,13 +90,13 @@ func GetReplicationAnalysis(keyspace string, shard string, hints *ReplicationAna
 			IFNULL(
 				primary_instance.binary_log_file = database_instance_stale_binlog_coordinates.binary_log_file
 				AND primary_instance.binary_log_pos = database_instance_stale_binlog_coordinates.binary_log_pos
-				AND database_instance_stale_binlog_coordinates.first_seen < NOW() - interval ? second,
+				AND database_instance_stale_binlog_coordinates.first_seen < DATETIME('now', PRINTF('-%d SECOND', ?)),
 				0
 			)
 		) AS is_stale_binlog_coordinates,
 		MIN(
 			primary_instance.last_checked <= primary_instance.last_seen
-			and primary_instance.last_attempted_check <= primary_instance.last_seen + interval ? second
+			and primary_instance.last_attempted_check <= DATETIME(primary_instance.last_seen, PRINTF('+%d SECOND', ?))
 		) = 1 AS is_last_check_valid,
 		/* To be considered a primary, traditional async replication must not be present/valid AND the host should either */
 		/* not be a replication group member OR be the primary of the replication group */
@@ -154,8 +153,14 @@ func GetReplicationAnalysis(keyspace string, shard string, hints *ReplicationAna
 			primary_instance.semi_sync_primary_status
 		) AS semi_sync_primary_status,
 		MIN(
+			primary_instance.semi_sync_blocked
+		) AS semi_sync_blocked,
+		MIN(
 			primary_instance.semi_sync_replica_enabled
 		) AS semi_sync_replica_enabled,
+		MIN(
+			primary_instance.tablet_type
+		) AS current_tablet_type,
 		SUM(replica_instance.oracle_gtid) AS count_oracle_gtid_replicas,
 		IFNULL(
 			SUM(
@@ -184,17 +189,6 @@ func GetReplicationAnalysis(keyspace string, shard string, hints *ReplicationAna
 			),
 			0
 		) AS count_valid_semi_sync_replicas,
-		MIN(
-			primary_instance.mariadb_gtid
-		) AS is_mariadb_gtid,
-		SUM(replica_instance.mariadb_gtid) AS count_mariadb_gtid_replicas,
-		IFNULL(
-			SUM(
-				replica_instance.last_checked <= replica_instance.last_seen
-				AND replica_instance.mariadb_gtid != 0
-			),
-			0
-		) AS count_valid_mariadb_gtid_replicas,
 		IFNULL(
 			SUM(
 				replica_instance.log_bin
@@ -245,7 +239,8 @@ func GetReplicationAnalysis(keyspace string, shard string, hints *ReplicationAna
 		COUNT(
 			DISTINCT case when replica_instance.log_bin
 			AND replica_instance.log_replica_updates then replica_instance.major_version else NULL end
-		) AS count_distinct_logging_major_versions
+		) AS count_distinct_logging_major_versions,
+		primary_instance.is_disk_stalled != 0 AS is_disk_stalled
 	FROM
 		vitess_tablet
 		JOIN vitess_keyspace ON (
@@ -294,6 +289,11 @@ func GetReplicationAnalysis(keyspace string, shard string, hints *ReplicationAna
 			return nil
 		}
 
+		// We don't want to run any fixes on any non-replica type tablet.
+		if tablet.Type != topodatapb.TabletType_PRIMARY && !topo.IsReplicaType(tablet.Type) {
+			return nil
+		}
+
 		primaryTablet := &topodatapb.Tablet{}
 		if str := m.GetString("primary_tablet_info"); str != "" {
 			if err := opts.Unmarshal([]byte(str), primaryTablet); err != nil {
@@ -303,6 +303,7 @@ func GetReplicationAnalysis(keyspace string, shard string, hints *ReplicationAna
 		}
 
 		a.TabletType = tablet.Type
+		a.CurrentTabletType = topodatapb.TabletType(m.GetInt("current_tablet_type"))
 		a.AnalyzedKeyspace = m.GetString("keyspace")
 		a.AnalyzedShard = m.GetString("shard")
 		a.PrimaryTimeStamp = m.GetTime("primary_timestamp")
@@ -312,18 +313,16 @@ func GetReplicationAnalysis(keyspace string, shard string, hints *ReplicationAna
 			return nil
 		}
 
-		a.ShardPrimaryTermTimestamp = m.GetString("shard_primary_term_timestamp")
+		a.ShardPrimaryTermTimestamp = m.GetTime("shard_primary_term_timestamp")
 		a.IsPrimary = m.GetBool("is_primary")
 		a.AnalyzedInstanceAlias = topoproto.TabletAliasString(tablet.Alias)
 		a.AnalyzedInstancePrimaryAlias = topoproto.TabletAliasString(primaryTablet.Alias)
 		a.AnalyzedInstanceBinlogCoordinates = BinlogCoordinates{
 			LogFile: m.GetString("binary_log_file"),
-			LogPos:  m.GetUint32("binary_log_pos"),
+			LogPos:  m.GetUint64("binary_log_pos"),
 			Type:    BinaryLog,
 		}
 		isStaleBinlogCoordinates := m.GetBool("is_stale_binlog_coordinates")
-		a.ClusterDetails.Keyspace = m.GetString("keyspace")
-		a.ClusterDetails.Shard = m.GetString("shard")
 		a.GTIDMode = m.GetString("gtid_mode")
 		a.LastCheckValid = m.GetBool("is_last_check_valid")
 		a.LastCheckPartialSuccess = m.GetBool("last_check_partial_success")
@@ -335,12 +334,11 @@ func GetReplicationAnalysis(keyspace string, shard string, hints *ReplicationAna
 
 		countValidOracleGTIDReplicas := m.GetUint("count_valid_oracle_gtid_replicas")
 		a.OracleGTIDImmediateTopology = countValidOracleGTIDReplicas == a.CountValidReplicas && a.CountValidReplicas > 0
-		countValidMariaDBGTIDReplicas := m.GetUint("count_valid_mariadb_gtid_replicas")
-		a.MariaDBGTIDImmediateTopology = countValidMariaDBGTIDReplicas == a.CountValidReplicas && a.CountValidReplicas > 0
 		countValidBinlogServerReplicas := m.GetUint("count_valid_binlog_server_replicas")
 		a.BinlogServerImmediateTopology = countValidBinlogServerReplicas == a.CountValidReplicas && a.CountValidReplicas > 0
 		a.SemiSyncPrimaryEnabled = m.GetBool("semi_sync_primary_enabled")
 		a.SemiSyncPrimaryStatus = m.GetBool("semi_sync_primary_status")
+		a.SemiSyncBlocked = m.GetBool("semi_sync_blocked")
 		a.SemiSyncReplicaEnabled = m.GetBool("semi_sync_replica_enabled")
 		a.CountSemiSyncReplicasEnabled = m.GetUint("count_semi_sync_replicas")
 		// countValidSemiSyncReplicasEnabled := m.GetUint("count_valid_semi_sync_replicas")
@@ -363,16 +361,17 @@ func GetReplicationAnalysis(keyspace string, shard string, hints *ReplicationAna
 		a.HeartbeatInterval = m.GetFloat64("heartbeat_interval")
 
 		a.IsReadOnly = m.GetUint("read_only") == 1
+		a.IsDiskStalled = m.GetBool("is_disk_stalled")
 
 		if !a.LastCheckValid {
 			analysisMessage := fmt.Sprintf("analysis: Alias: %+v, Keyspace: %+v, Shard: %+v, IsPrimary: %+v, LastCheckValid: %+v, LastCheckPartialSuccess: %+v, CountReplicas: %+v, CountValidReplicas: %+v, CountValidReplicatingReplicas: %+v, CountLaggingReplicas: %+v, CountDelayedReplicas: %+v",
-				a.AnalyzedInstanceAlias, a.ClusterDetails.Keyspace, a.ClusterDetails.Shard, a.IsPrimary, a.LastCheckValid, a.LastCheckPartialSuccess, a.CountReplicas, a.CountValidReplicas, a.CountValidReplicatingReplicas, a.CountLaggingReplicas, a.CountDelayedReplicas,
+				a.AnalyzedInstanceAlias, a.AnalyzedKeyspace, a.AnalyzedShard, a.IsPrimary, a.LastCheckValid, a.LastCheckPartialSuccess, a.CountReplicas, a.CountValidReplicas, a.CountValidReplicatingReplicas, a.CountLaggingReplicas, a.CountDelayedReplicas,
 			)
 			if util.ClearToLog("analysis_dao", analysisMessage) {
 				log.Infof(analysisMessage)
 			}
 		}
-		keyspaceShard := getKeyspaceShardName(a.ClusterDetails.Keyspace, a.ClusterDetails.Shard)
+		keyspaceShard := getKeyspaceShardName(a.AnalyzedKeyspace, a.AnalyzedShard)
 		if clusters[keyspaceShard] == nil {
 			clusters[keyspaceShard] = &clusterAnalysis{}
 			if a.TabletType == topodatapb.TabletType_PRIMARY {
@@ -384,7 +383,7 @@ func GetReplicationAnalysis(keyspace string, shard string, hints *ReplicationAna
 				log.Errorf("ignoring keyspace %v because no durability_policy is set. Please set it using SetKeyspaceDurabilityPolicy", a.AnalyzedKeyspace)
 				return nil
 			}
-			durability, err := reparentutil.GetDurabilityPolicy(durabilityPolicy)
+			durability, err := policy.GetDurabilityPolicy(durabilityPolicy)
 			if err != nil {
 				log.Errorf("can't get the durability policy %v - %v. Skipping keyspace - %v.", durabilityPolicy, err, a.AnalyzedKeyspace)
 				return nil
@@ -395,8 +394,8 @@ func GetReplicationAnalysis(keyspace string, shard string, hints *ReplicationAna
 		ca := clusters[keyspaceShard]
 		// Increment the total number of tablets.
 		ca.totalTablets += 1
-		if ca.hasClusterwideAction {
-			// We can only take one cluster level action at a time.
+		if ca.hasShardWideAction {
+			// We can only take one shard level action at a time.
 			return nil
 		}
 		if ca.durability == nil {
@@ -410,57 +409,71 @@ func GetReplicationAnalysis(keyspace string, shard string, hints *ReplicationAna
 		} else if isInvalid {
 			a.Analysis = InvalidReplica
 			a.Description = "VTOrc hasn't been able to reach the replica even once since restart/shutdown"
+		} else if a.IsClusterPrimary && !a.LastCheckValid && a.IsDiskStalled {
+			a.Analysis = PrimaryDiskStalled
+			a.Description = "Primary has a stalled disk"
+			ca.hasShardWideAction = true
 		} else if a.IsClusterPrimary && !a.LastCheckValid && a.CountReplicas == 0 {
 			a.Analysis = DeadPrimaryWithoutReplicas
 			a.Description = "Primary cannot be reached by vtorc and has no replica"
-			ca.hasClusterwideAction = true
+			ca.hasShardWideAction = true
 			//
 		} else if a.IsClusterPrimary && !a.LastCheckValid && a.CountValidReplicas == a.CountReplicas && a.CountValidReplicatingReplicas == 0 {
 			a.Analysis = DeadPrimary
 			a.Description = "Primary cannot be reached by vtorc and none of its replicas is replicating"
-			ca.hasClusterwideAction = true
+			ca.hasShardWideAction = true
 			//
 		} else if a.IsClusterPrimary && !a.LastCheckValid && a.CountReplicas > 0 && a.CountValidReplicas == 0 && a.CountValidReplicatingReplicas == 0 {
 			a.Analysis = DeadPrimaryAndReplicas
 			a.Description = "Primary cannot be reached by vtorc and none of its replicas is replicating"
-			ca.hasClusterwideAction = true
+			ca.hasShardWideAction = true
 			//
 		} else if a.IsClusterPrimary && !a.LastCheckValid && a.CountValidReplicas < a.CountReplicas && a.CountValidReplicas > 0 && a.CountValidReplicatingReplicas == 0 {
 			a.Analysis = DeadPrimaryAndSomeReplicas
 			a.Description = "Primary cannot be reached by vtorc; some of its replicas are unreachable and none of its reachable replicas is replicating"
-			ca.hasClusterwideAction = true
+			ca.hasShardWideAction = true
 			//
 		} else if a.IsClusterPrimary && !a.IsPrimary {
 			a.Analysis = PrimaryHasPrimary
 			a.Description = "Primary is replicating from somewhere else"
-			ca.hasClusterwideAction = true
+			ca.hasShardWideAction = true
 			//
 		} else if a.IsClusterPrimary && a.IsReadOnly {
 			a.Analysis = PrimaryIsReadOnly
 			a.Description = "Primary is read-only"
 			//
-		} else if a.IsClusterPrimary && reparentutil.SemiSyncAckers(ca.durability, tablet) != 0 && !a.SemiSyncPrimaryEnabled {
+		} else if a.IsClusterPrimary && policy.SemiSyncAckers(ca.durability, tablet) != 0 && !a.SemiSyncPrimaryEnabled {
 			a.Analysis = PrimarySemiSyncMustBeSet
 			a.Description = "Primary semi-sync must be set"
 			//
-		} else if a.IsClusterPrimary && reparentutil.SemiSyncAckers(ca.durability, tablet) == 0 && a.SemiSyncPrimaryEnabled {
+		} else if a.IsClusterPrimary && policy.SemiSyncAckers(ca.durability, tablet) == 0 && a.SemiSyncPrimaryEnabled {
 			a.Analysis = PrimarySemiSyncMustNotBeSet
 			a.Description = "Primary semi-sync must not be set"
 			//
+		} else if a.IsClusterPrimary && a.CurrentTabletType != topodatapb.TabletType_UNKNOWN && a.CurrentTabletType != topodatapb.TabletType_PRIMARY {
+			a.Analysis = PrimaryCurrentTypeMismatch
+			a.Description = "Primary tablet's current type is not PRIMARY"
 		} else if topo.IsReplicaType(a.TabletType) && a.ErrantGTID != "" {
 			a.Analysis = ErrantGTIDDetected
 			a.Description = "Tablet has errant GTIDs"
-		} else if topo.IsReplicaType(a.TabletType) && ca.primaryAlias == "" && a.ShardPrimaryTermTimestamp == "" {
+		} else if topo.IsReplicaType(a.TabletType) && ca.primaryAlias == "" && a.ShardPrimaryTermTimestamp.IsZero() {
 			// ClusterHasNoPrimary should only be detected when the shard record doesn't have any primary term start time specified either.
 			a.Analysis = ClusterHasNoPrimary
 			a.Description = "Cluster has no primary"
-			ca.hasClusterwideAction = true
-		} else if topo.IsReplicaType(a.TabletType) && ca.primaryAlias == "" && a.ShardPrimaryTermTimestamp != "" {
+			ca.hasShardWideAction = true
+		} else if topo.IsReplicaType(a.TabletType) && ca.primaryAlias == "" && !a.ShardPrimaryTermTimestamp.IsZero() {
 			// If there are no primary tablets, but the shard primary start time isn't empty, then we know
 			// the primary tablet was deleted.
 			a.Analysis = PrimaryTabletDeleted
 			a.Description = "Primary tablet has been deleted"
-			ca.hasClusterwideAction = true
+			ca.hasShardWideAction = true
+		} else if a.IsPrimary && a.SemiSyncBlocked && a.CountSemiSyncReplicasEnabled >= a.SemiSyncPrimaryWaitForReplicaCount {
+			// The primary is reporting that semi-sync monitor is blocked on writes.
+			// There are enough replicas configured to send semi-sync ACKs such that the primary shouldn't be blocked.
+			// There is some network diruption in progress. We should run an ERS.
+			a.Analysis = PrimarySemiSyncBlocked
+			a.Description = "Writes seem to be blocked on semi-sync acks on the primary, even though sufficient replicas are configured to send ACKs"
+			ca.hasShardWideAction = true
 		} else if topo.IsReplicaType(a.TabletType) && !a.IsReadOnly {
 			a.Analysis = ReplicaIsWritable
 			a.Description = "Replica is writable"
@@ -481,11 +494,11 @@ func GetReplicationAnalysis(keyspace string, shard string, hints *ReplicationAna
 			a.Analysis = ReplicationStopped
 			a.Description = "Replication is stopped"
 			//
-		} else if topo.IsReplicaType(a.TabletType) && !a.IsPrimary && reparentutil.IsReplicaSemiSync(ca.durability, primaryTablet, tablet) && !a.SemiSyncReplicaEnabled {
+		} else if topo.IsReplicaType(a.TabletType) && !a.IsPrimary && policy.IsReplicaSemiSync(ca.durability, primaryTablet, tablet) && !a.SemiSyncReplicaEnabled {
 			a.Analysis = ReplicaSemiSyncMustBeSet
 			a.Description = "Replica semi-sync must be set"
 			//
-		} else if topo.IsReplicaType(a.TabletType) && !a.IsPrimary && !reparentutil.IsReplicaSemiSync(ca.durability, primaryTablet, tablet) && a.SemiSyncReplicaEnabled {
+		} else if topo.IsReplicaType(a.TabletType) && !a.IsPrimary && !policy.IsReplicaSemiSync(ca.durability, primaryTablet, tablet) && a.SemiSyncReplicaEnabled {
 			a.Analysis = ReplicaSemiSyncMustNotBeSet
 			a.Description = "Replica semi-sync must not be set"
 			//
@@ -537,7 +550,6 @@ func GetReplicationAnalysis(keyspace string, shard string, hints *ReplicationAna
 			}
 			if a.IsPrimary && a.CountReplicas > 1 &&
 				!a.OracleGTIDImmediateTopology &&
-				!a.MariaDBGTIDImmediateTopology &&
 				!a.BinlogServerImmediateTopology {
 				a.StructureAnalysis = append(a.StructureAnalysis, NoFailoverSupportStructureWarning)
 			}
@@ -600,14 +612,14 @@ func postProcessAnalyses(result []*ReplicationAnalysis, clusters map[string]*clu
 			// If one of them is an InvalidPrimary, then we see if all the other tablets in this keyspace shard are
 			// unable to replicate or not.
 			if analysis.Analysis == InvalidPrimary {
-				keyspaceName := analysis.ClusterDetails.Keyspace
-				shardName := analysis.ClusterDetails.Shard
+				keyspaceName := analysis.AnalyzedKeyspace
+				shardName := analysis.AnalyzedShard
 				keyspaceShard := getKeyspaceShardName(keyspaceName, shardName)
 				totalReplicas := clusters[keyspaceShard].totalTablets - 1
 				var notReplicatingReplicas []int
 				for idx, replicaAnalysis := range result {
-					if replicaAnalysis.ClusterDetails.Keyspace == keyspaceName &&
-						replicaAnalysis.ClusterDetails.Shard == shardName && topo.IsReplicaType(replicaAnalysis.TabletType) {
+					if replicaAnalysis.AnalyzedKeyspace == keyspaceName &&
+						replicaAnalysis.AnalyzedShard == shardName && topo.IsReplicaType(replicaAnalysis.TabletType) {
 						// If the replica's last check is invalid or its replication is stopped, then we consider as not replicating.
 						if !replicaAnalysis.LastCheckValid || replicaAnalysis.ReplicationStopped {
 							notReplicatingReplicas = append(notReplicatingReplicas, idx)
@@ -650,13 +662,13 @@ func auditInstanceAnalysisInChangelog(tabletAlias string, analysisCode AnalysisC
 	// Find if the lastAnalysisHasChanged or not while updating the row if it has.
 	lastAnalysisChanged := false
 	{
-		sqlResult, err := db.ExecVTOrc(`
-			update database_instance_last_analysis set
+		sqlResult, err := db.ExecVTOrc(`UPDATE database_instance_last_analysis
+			SET
 				analysis = ?,
-				analysis_timestamp = now()
-			where
+				analysis_timestamp = DATETIME('now')
+			WHERE
 				alias = ?
-				and analysis != ?
+				AND analysis != ?
 			`,
 			string(analysisCode), tabletAlias, string(analysisCode),
 		)
@@ -677,13 +689,16 @@ func auditInstanceAnalysisInChangelog(tabletAlias string, analysisCode AnalysisC
 	firstInsertion := false
 	if !lastAnalysisChanged {
 		// The insert only returns more than 1 row changed if this is the first insertion.
-		sqlResult, err := db.ExecVTOrc(`
-			insert ignore into database_instance_last_analysis (
-					alias, analysis_timestamp, analysis
-				) values (
-					?, now(), ?
-				)
-			`,
+		sqlResult, err := db.ExecVTOrc(`INSERT OR IGNORE
+			INTO database_instance_last_analysis (
+				alias,
+				analysis_timestamp,
+				analysis
+			) VALUES (
+				?,
+				DATETIME('now'),
+				?
+			)`,
 			tabletAlias, string(analysisCode),
 		)
 		if err != nil {
@@ -703,13 +718,16 @@ func auditInstanceAnalysisInChangelog(tabletAlias string, analysisCode AnalysisC
 		return nil
 	}
 
-	_, err := db.ExecVTOrc(`
-			insert into database_instance_analysis_changelog (
-					alias, analysis_timestamp, analysis
-				) values (
-					?, now(), ?
-				)
-			`,
+	_, err := db.ExecVTOrc(`INSERT
+		INTO database_instance_analysis_changelog (
+			alias,
+			analysis_timestamp,
+			analysis
+		) VALUES (
+			?,
+			DATETIME('now'),
+			?
+		)`,
 		tabletAlias, string(analysisCode),
 	)
 	if err == nil {
@@ -722,12 +740,11 @@ func auditInstanceAnalysisInChangelog(tabletAlias string, analysisCode AnalysisC
 
 // ExpireInstanceAnalysisChangelog removes old-enough analysis entries from the changelog
 func ExpireInstanceAnalysisChangelog() error {
-	_, err := db.ExecVTOrc(`
-			delete
-				from database_instance_analysis_changelog
-			where
-				analysis_timestamp < now() - interval ? hour
-			`,
+	_, err := db.ExecVTOrc(`DELETE
+		FROM database_instance_analysis_changelog
+		WHERE
+			analysis_timestamp < DATETIME('now', PRINTF('-%d HOUR', ?))
+		`,
 		config.UnseenInstanceForgetHours,
 	)
 	if err != nil {

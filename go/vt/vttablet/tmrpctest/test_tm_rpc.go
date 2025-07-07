@@ -61,6 +61,11 @@ func (fra *fakeRPCTM) CreateVReplicationWorkflow(ctx context.Context, req *table
 	panic("implement me")
 }
 
+func (fra *fakeRPCTM) DeleteTableData(ctx context.Context, req *tabletmanagerdatapb.DeleteTableDataRequest) (*tabletmanagerdatapb.DeleteTableDataResponse, error) {
+	// TODO implement me
+	panic("implement me")
+}
+
 func (fra *fakeRPCTM) DeleteVReplicationWorkflow(ctx context.Context, req *tabletmanagerdatapb.DeleteVReplicationWorkflowRequest) (*tabletmanagerdatapb.DeleteVReplicationWorkflowResponse, error) {
 	// TODO implement me
 	panic("implement me")
@@ -91,7 +96,22 @@ func (fra *fakeRPCTM) UpdateVReplicationWorkflows(ctx context.Context, req *tabl
 	panic("implement me")
 }
 
+func (fra *fakeRPCTM) UpdateSequenceTables(ctx context.Context, req *tabletmanagerdatapb.UpdateSequenceTablesRequest) (*tabletmanagerdatapb.UpdateSequenceTablesResponse, error) {
+	// TODO implement me
+	panic("implement me")
+}
+
+func (fra *fakeRPCTM) GetMaxValueForSequences(ctx context.Context, req *tabletmanagerdatapb.GetMaxValueForSequencesRequest) (*tabletmanagerdatapb.GetMaxValueForSequencesResponse, error) {
+	// TODO implement me
+	panic("implement me")
+}
+
 func (fra *fakeRPCTM) ResetSequences(ctx context.Context, tables []string) error {
+	// TODO implement me
+	panic("implement me")
+}
+
+func (fra *fakeRPCTM) ValidateVReplicationPermissions(ctx context.Context, req *tabletmanagerdatapb.ValidateVReplicationPermissionsRequest) (*tabletmanagerdatapb.ValidateVReplicationPermissionsResponse, error) {
 	// TODO implement me
 	panic("implement me")
 }
@@ -106,6 +126,11 @@ func (fra *fakeRPCTM) LockTables(ctx context.Context) error {
 }
 
 func (fra *fakeRPCTM) UnlockTables(ctx context.Context) error {
+	panic("implement me")
+}
+
+func (fra *fakeRPCTM) MysqlHostMetrics(ctx context.Context, req *tabletmanagerdatapb.MysqlHostMetricsRequest) (*tabletmanagerdatapb.MysqlHostMetricsResponse, error) {
+	// TODO implement me
 	panic("implement me")
 }
 
@@ -406,13 +431,33 @@ func tmRPCTestGetGlobalStatusVarsPanic(ctx context.Context, t *testing.T, client
 }
 
 func tmRPCTestGetUnresolvedTransactions(ctx context.Context, t *testing.T, client tmclient.TabletManagerClient, tablet *topodatapb.Tablet) {
-	_, err := client.GetUnresolvedTransactions(ctx, tablet)
+	_, err := client.GetUnresolvedTransactions(ctx, tablet, 0)
 	require.NoError(t, err)
 }
 
 func tmRPCTestGetUnresolvedTransactionsPanic(ctx context.Context, t *testing.T, client tmclient.TabletManagerClient, tablet *topodatapb.Tablet) {
-	_, err := client.GetUnresolvedTransactions(ctx, tablet)
+	_, err := client.GetUnresolvedTransactions(ctx, tablet, 0)
 	expectHandleRPCPanic(t, "GetUnresolvedTransactions", false /*verbose*/, err)
+}
+
+func tmRPCTestReadTransaction(ctx context.Context, t *testing.T, client tmclient.TabletManagerClient, tablet *topodatapb.Tablet) {
+	_, err := client.ReadTransaction(ctx, tablet, "aa")
+	require.NoError(t, err)
+}
+
+func tmRPCTestReadTransactionPanic(ctx context.Context, t *testing.T, client tmclient.TabletManagerClient, tablet *topodatapb.Tablet) {
+	_, err := client.ReadTransaction(ctx, tablet, "aa")
+	expectHandleRPCPanic(t, "ReadTransaction", false /*verbose*/, err)
+}
+
+func tmRPCTestGetTransactionInfo(ctx context.Context, t *testing.T, client tmclient.TabletManagerClient, tablet *topodatapb.Tablet) {
+	_, err := client.GetTransactionInfo(ctx, tablet, "aa")
+	require.NoError(t, err)
+}
+
+func tmRPCTestGetTransactionInfoPanic(ctx context.Context, t *testing.T, client tmclient.TabletManagerClient, tablet *topodatapb.Tablet) {
+	_, err := client.GetTransactionInfo(ctx, tablet, "aa")
+	expectHandleRPCPanic(t, "GetTransactionInfo", false /*verbose*/, err)
 }
 
 //
@@ -449,6 +494,30 @@ func tmRPCTestSetReadOnlyPanic(ctx context.Context, t *testing.T, client tmclien
 	expectHandleRPCPanic(t, "SetReadOnly", true /*verbose*/, err)
 	err = client.SetReadWrite(ctx, tablet)
 	expectHandleRPCPanic(t, "SetReadWrite", true /*verbose*/, err)
+}
+
+var testChangeTagsValue = map[string]string{
+	"test": "12345",
+}
+
+func (fra *fakeRPCTM) ChangeTags(ctx context.Context, tabletTags map[string]string, replace bool) (map[string]string, error) {
+	if fra.panics {
+		panic(fmt.Errorf("test-triggered panic"))
+	}
+	compare(fra.t, "ChangeTags tabletType", tabletTags, testChangeTagsValue)
+	return tabletTags, nil
+}
+
+func tmRPCTestChangeTags(ctx context.Context, t *testing.T, client tmclient.TabletManagerClient, tablet *topodatapb.Tablet) {
+	_, err := client.ChangeTags(ctx, tablet, testChangeTagsValue, false)
+	if err != nil {
+		t.Errorf("ChangeTags failed: %v", err)
+	}
+}
+
+func tmRPCTestChangeTagsPanic(ctx context.Context, t *testing.T, client tmclient.TabletManagerClient, tablet *topodatapb.Tablet) {
+	_, err := client.ChangeTags(ctx, tablet, testChangeTagsValue, false)
+	expectHandleRPCPanic(t, "ChangeTags", true /*verbose*/, err)
 }
 
 var testChangeTypeValue = topodatapb.TabletType_REPLICA
@@ -737,7 +806,21 @@ func (fra *fakeRPCTM) ExecuteFetchAsApp(ctx context.Context, req *tabletmanagerd
 	return testExecuteFetchResult, nil
 }
 
-func (fra *fakeRPCTM) GetUnresolvedTransactions(ctx context.Context) ([]*querypb.TransactionMetadata, error) {
+func (fra *fakeRPCTM) GetUnresolvedTransactions(ctx context.Context, abandonAgeSeconds int64) ([]*querypb.TransactionMetadata, error) {
+	if fra.panics {
+		panic(fmt.Errorf("test-triggered panic"))
+	}
+	return nil, nil
+}
+
+func (fra *fakeRPCTM) ReadTransaction(ctx context.Context, req *tabletmanagerdatapb.ReadTransactionRequest) (*querypb.TransactionMetadata, error) {
+	if fra.panics {
+		panic(fmt.Errorf("test-triggered panic"))
+	}
+	return nil, nil
+}
+
+func (fra *fakeRPCTM) GetTransactionInfo(ctx context.Context, req *tabletmanagerdatapb.GetTransactionInfoRequest) (*tabletmanagerdatapb.GetTransactionInfoResponse, error) {
 	if fra.panics {
 		panic(fmt.Errorf("test-triggered panic"))
 	}
@@ -1106,6 +1189,15 @@ func (fra *fakeRPCTM) PopulateReparentJournal(ctx context.Context, timeCreatedNS
 	return nil
 }
 
+var testReparentJournalLen int32 = 10
+
+func (fra *fakeRPCTM) ReadReparentJournalInfo(context.Context) (int32, error) {
+	if fra.panics {
+		panic(fmt.Errorf("test-triggered panic"))
+	}
+	return testReparentJournalLen, nil
+}
+
 func tmRPCTestPopulateReparentJournal(ctx context.Context, t *testing.T, client tmclient.TabletManagerClient, tablet *topodatapb.Tablet) {
 	err := client.PopulateReparentJournal(ctx, tablet, testTimeCreatedNS, testActionName, testPrimaryAlias, testReplicationPosition)
 	compareError(t, "PopulateReparentJournal", err, true, testPopulateReparentJournalCalled)
@@ -1114,6 +1206,16 @@ func tmRPCTestPopulateReparentJournal(ctx context.Context, t *testing.T, client 
 func tmRPCTestPopulateReparentJournalPanic(ctx context.Context, t *testing.T, client tmclient.TabletManagerClient, tablet *topodatapb.Tablet) {
 	err := client.PopulateReparentJournal(ctx, tablet, testTimeCreatedNS, testActionName, testPrimaryAlias, testReplicationPosition)
 	expectHandleRPCPanic(t, "PopulateReparentJournal", true /*verbose*/, err)
+}
+
+func tmRPCTestReadReparentJournalInfo(ctx context.Context, t *testing.T, client tmclient.TabletManagerClient, tablet *topodatapb.Tablet) {
+	length, err := client.ReadReparentJournalInfo(ctx, tablet)
+	compareError(t, "ReadReparentJournalInfo", err, length, testReparentJournalLen)
+}
+
+func tmRPCTestReadReparentJournalInfoPanic(ctx context.Context, t *testing.T, client tmclient.TabletManagerClient, tablet *topodatapb.Tablet) {
+	_, err := client.ReadReparentJournalInfo(ctx, tablet)
+	expectHandleRPCPanic(t, "ReadReparentJournalInfo", true /*verbose*/, err)
 }
 
 func tmRPCTestWaitForPositionPanic(ctx context.Context, t *testing.T, client tmclient.TabletManagerClient, tablet *topodatapb.Tablet) {
@@ -1336,6 +1438,10 @@ func (fra *fakeRPCTM) Backup(ctx context.Context, logger logutil.Logger, request
 	return nil
 }
 
+func (fra *fakeRPCTM) IsBackupRunning() bool {
+	return false
+}
+
 func tmRPCTestBackup(ctx context.Context, t *testing.T, client tmclient.TabletManagerClient, tablet *topodatapb.Tablet) {
 	req := &tabletmanagerdatapb.BackupRequest{Concurrency: testBackupConcurrency, AllowPrimary: testBackupAllowPrimary}
 	stream, err := client.Backup(ctx, tablet, req)
@@ -1450,6 +1556,8 @@ func Run(t *testing.T, client tmclient.TabletManagerClient, tablet *topodatapb.T
 	tmRPCTestGetPermissions(ctx, t, client, tablet)
 	tmRPCTestGetGlobalStatusVars(ctx, t, client, tablet)
 	tmRPCTestGetUnresolvedTransactions(ctx, t, client, tablet)
+	tmRPCTestReadTransaction(ctx, t, client, tablet)
+	tmRPCTestGetTransactionInfo(ctx, t, client, tablet)
 
 	// Various read-write methods
 	tmRPCTestSetReadOnly(ctx, t, client, tablet)
@@ -1483,6 +1591,7 @@ func Run(t *testing.T, client tmclient.TabletManagerClient, tablet *topodatapb.T
 	tmRPCTestResetReplication(ctx, t, client, tablet)
 	tmRPCTestInitPrimary(ctx, t, client, tablet)
 	tmRPCTestPopulateReparentJournal(ctx, t, client, tablet)
+	tmRPCTestReadReparentJournalInfo(ctx, t, client, tablet)
 	tmRPCTestDemotePrimary(ctx, t, client, tablet)
 	tmRPCTestUndoDemotePrimary(ctx, t, client, tablet)
 	tmRPCTestSetReplicationSource(ctx, t, client, tablet)
@@ -1512,6 +1621,8 @@ func Run(t *testing.T, client tmclient.TabletManagerClient, tablet *topodatapb.T
 	tmRPCTestGetPermissionsPanic(ctx, t, client, tablet)
 	tmRPCTestGetGlobalStatusVarsPanic(ctx, t, client, tablet)
 	tmRPCTestGetUnresolvedTransactionsPanic(ctx, t, client, tablet)
+	tmRPCTestReadTransactionPanic(ctx, t, client, tablet)
+	tmRPCTestGetTransactionInfoPanic(ctx, t, client, tablet)
 
 	// Various read-write methods
 	tmRPCTestSetReadOnlyPanic(ctx, t, client, tablet)
@@ -1541,6 +1652,7 @@ func Run(t *testing.T, client tmclient.TabletManagerClient, tablet *topodatapb.T
 	tmRPCTestResetReplicationPanic(ctx, t, client, tablet)
 	tmRPCTestInitPrimaryPanic(ctx, t, client, tablet)
 	tmRPCTestPopulateReparentJournalPanic(ctx, t, client, tablet)
+	tmRPCTestReadReparentJournalInfoPanic(ctx, t, client, tablet)
 	tmRPCTestWaitForPositionPanic(ctx, t, client, tablet)
 	tmRPCTestDemotePrimaryPanic(ctx, t, client, tablet)
 	tmRPCTestUndoDemotePrimaryPanic(ctx, t, client, tablet)

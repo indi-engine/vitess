@@ -163,6 +163,8 @@ type VtctldClient interface {
 	BackupShard(ctx context.Context, in *vtctldata.BackupShardRequest, opts ...grpc.CallOption) (Vtctld_BackupShardClient, error)
 	// CancelSchemaMigration cancels one or all migrations, terminating any running ones as needed.
 	CancelSchemaMigration(ctx context.Context, in *vtctldata.CancelSchemaMigrationRequest, opts ...grpc.CallOption) (*vtctldata.CancelSchemaMigrationResponse, error)
+	// ChangeTabletTags changes the tags of the specified tablet, if possible.
+	ChangeTabletTags(ctx context.Context, in *vtctldata.ChangeTabletTagsRequest, opts ...grpc.CallOption) (*vtctldata.ChangeTabletTagsResponse, error)
 	// ChangeTabletType changes the db type for the specified tablet, if possible.
 	// This is used primarily to arrange replicas, and it will not convert a
 	// primary. For that, use InitShardPrimary.
@@ -177,6 +179,8 @@ type VtctldClient interface {
 	CompleteSchemaMigration(ctx context.Context, in *vtctldata.CompleteSchemaMigrationRequest, opts ...grpc.CallOption) (*vtctldata.CompleteSchemaMigrationResponse, error)
 	// CompleteSchemaMigration completes one or all migrations executed with --postpone-completion.
 	ConcludeTransaction(ctx context.Context, in *vtctldata.ConcludeTransactionRequest, opts ...grpc.CallOption) (*vtctldata.ConcludeTransactionResponse, error)
+	// CopySchemaShard copies the schema from a source tablet to all tablets in a keyspace/shard.
+	CopySchemaShard(ctx context.Context, in *vtctldata.CopySchemaShardRequest, opts ...grpc.CallOption) (*vtctldata.CopySchemaShardResponse, error)
 	// CreateKeyspace creates the specified keyspace in the topology. For a
 	// SNAPSHOT keyspace, the request must specify the name of a base keyspace,
 	// as well as a snapshot time.
@@ -276,6 +280,8 @@ type VtctldClient interface {
 	GetThrottlerStatus(ctx context.Context, in *vtctldata.GetThrottlerStatusRequest, opts ...grpc.CallOption) (*vtctldata.GetThrottlerStatusResponse, error)
 	// GetTopologyPath returns the topology cell at a given path.
 	GetTopologyPath(ctx context.Context, in *vtctldata.GetTopologyPathRequest, opts ...grpc.CallOption) (*vtctldata.GetTopologyPathResponse, error)
+	// GetTransactionInfo reads a given transactions information.
+	GetTransactionInfo(ctx context.Context, in *vtctldata.GetTransactionInfoRequest, opts ...grpc.CallOption) (*vtctldata.GetTransactionInfoResponse, error)
 	// GetTransactions returns the unresolved transactions for the request.
 	GetUnresolvedTransactions(ctx context.Context, in *vtctldata.GetUnresolvedTransactionsRequest, opts ...grpc.CallOption) (*vtctldata.GetUnresolvedTransactionsResponse, error)
 	// GetVersion returns the version of a tablet from its debug vars.
@@ -293,11 +299,15 @@ type VtctldClient interface {
 	InitShardPrimary(ctx context.Context, in *vtctldata.InitShardPrimaryRequest, opts ...grpc.CallOption) (*vtctldata.InitShardPrimaryResponse, error)
 	// LaunchSchemaMigration launches one or all migrations executed with --postpone-launch.
 	LaunchSchemaMigration(ctx context.Context, in *vtctldata.LaunchSchemaMigrationRequest, opts ...grpc.CallOption) (*vtctldata.LaunchSchemaMigrationResponse, error)
+	LookupVindexComplete(ctx context.Context, in *vtctldata.LookupVindexCompleteRequest, opts ...grpc.CallOption) (*vtctldata.LookupVindexCompleteResponse, error)
 	LookupVindexCreate(ctx context.Context, in *vtctldata.LookupVindexCreateRequest, opts ...grpc.CallOption) (*vtctldata.LookupVindexCreateResponse, error)
 	LookupVindexExternalize(ctx context.Context, in *vtctldata.LookupVindexExternalizeRequest, opts ...grpc.CallOption) (*vtctldata.LookupVindexExternalizeResponse, error)
+	LookupVindexInternalize(ctx context.Context, in *vtctldata.LookupVindexInternalizeRequest, opts ...grpc.CallOption) (*vtctldata.LookupVindexInternalizeResponse, error)
 	// MaterializeCreate creates a workflow to materialize one or more tables
 	// from a source keyspace to a target keyspace using a provided expressions.
 	MaterializeCreate(ctx context.Context, in *vtctldata.MaterializeCreateRequest, opts ...grpc.CallOption) (*vtctldata.MaterializeCreateResponse, error)
+	// WorkflowAddTables adds tables to the existing materialize/movetables workflow.
+	WorkflowAddTables(ctx context.Context, in *vtctldata.WorkflowAddTablesRequest, opts ...grpc.CallOption) (*vtctldata.WorkflowAddTablesResponse, error)
 	// MigrateCreate creates a workflow which migrates one or more tables from an
 	// external cluster into Vitess.
 	MigrateCreate(ctx context.Context, in *vtctldata.MigrateCreateRequest, opts ...grpc.CallOption) (*vtctldata.WorkflowStatusResponse, error)
@@ -445,6 +455,8 @@ type VtctldClient interface {
 	// ValidateKeyspace validates that all nodes reachable from the specified
 	// keyspace are consistent.
 	ValidateKeyspace(ctx context.Context, in *vtctldata.ValidateKeyspaceRequest, opts ...grpc.CallOption) (*vtctldata.ValidateKeyspaceResponse, error)
+	// ValidatePermissionsKeyspace validates that all the permissions are the same in a keyspace.
+	ValidatePermissionsKeyspace(ctx context.Context, in *vtctldata.ValidatePermissionsKeyspaceRequest, opts ...grpc.CallOption) (*vtctldata.ValidatePermissionsKeyspaceResponse, error)
 	// ValidateSchemaKeyspace validates that the schema on the primary tablet for shard 0 matches the schema on all of the other tablets in the keyspace.
 	ValidateSchemaKeyspace(ctx context.Context, in *vtctldata.ValidateSchemaKeyspaceRequest, opts ...grpc.CallOption) (*vtctldata.ValidateSchemaKeyspaceResponse, error)
 	// ValidateShard validates that all nodes reachable from the specified shard
@@ -617,6 +629,15 @@ func (c *vtctldClient) CancelSchemaMigration(ctx context.Context, in *vtctldata.
 	return out, nil
 }
 
+func (c *vtctldClient) ChangeTabletTags(ctx context.Context, in *vtctldata.ChangeTabletTagsRequest, opts ...grpc.CallOption) (*vtctldata.ChangeTabletTagsResponse, error) {
+	out := new(vtctldata.ChangeTabletTagsResponse)
+	err := c.cc.Invoke(ctx, "/vtctlservice.Vtctld/ChangeTabletTags", in, out, opts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
 func (c *vtctldClient) ChangeTabletType(ctx context.Context, in *vtctldata.ChangeTabletTypeRequest, opts ...grpc.CallOption) (*vtctldata.ChangeTabletTypeResponse, error) {
 	out := new(vtctldata.ChangeTabletTypeResponse)
 	err := c.cc.Invoke(ctx, "/vtctlservice.Vtctld/ChangeTabletType", in, out, opts...)
@@ -656,6 +677,15 @@ func (c *vtctldClient) CompleteSchemaMigration(ctx context.Context, in *vtctldat
 func (c *vtctldClient) ConcludeTransaction(ctx context.Context, in *vtctldata.ConcludeTransactionRequest, opts ...grpc.CallOption) (*vtctldata.ConcludeTransactionResponse, error) {
 	out := new(vtctldata.ConcludeTransactionResponse)
 	err := c.cc.Invoke(ctx, "/vtctlservice.Vtctld/ConcludeTransaction", in, out, opts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (c *vtctldClient) CopySchemaShard(ctx context.Context, in *vtctldata.CopySchemaShardRequest, opts ...grpc.CallOption) (*vtctldata.CopySchemaShardResponse, error) {
+	out := new(vtctldata.CopySchemaShardResponse)
+	err := c.cc.Invoke(ctx, "/vtctlservice.Vtctld/CopySchemaShard", in, out, opts...)
 	if err != nil {
 		return nil, err
 	}
@@ -1013,6 +1043,15 @@ func (c *vtctldClient) GetTopologyPath(ctx context.Context, in *vtctldata.GetTop
 	return out, nil
 }
 
+func (c *vtctldClient) GetTransactionInfo(ctx context.Context, in *vtctldata.GetTransactionInfoRequest, opts ...grpc.CallOption) (*vtctldata.GetTransactionInfoResponse, error) {
+	out := new(vtctldata.GetTransactionInfoResponse)
+	err := c.cc.Invoke(ctx, "/vtctlservice.Vtctld/GetTransactionInfo", in, out, opts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
 func (c *vtctldClient) GetUnresolvedTransactions(ctx context.Context, in *vtctldata.GetUnresolvedTransactionsRequest, opts ...grpc.CallOption) (*vtctldata.GetUnresolvedTransactionsResponse, error) {
 	out := new(vtctldata.GetUnresolvedTransactionsResponse)
 	err := c.cc.Invoke(ctx, "/vtctlservice.Vtctld/GetUnresolvedTransactions", in, out, opts...)
@@ -1067,6 +1106,15 @@ func (c *vtctldClient) LaunchSchemaMigration(ctx context.Context, in *vtctldata.
 	return out, nil
 }
 
+func (c *vtctldClient) LookupVindexComplete(ctx context.Context, in *vtctldata.LookupVindexCompleteRequest, opts ...grpc.CallOption) (*vtctldata.LookupVindexCompleteResponse, error) {
+	out := new(vtctldata.LookupVindexCompleteResponse)
+	err := c.cc.Invoke(ctx, "/vtctlservice.Vtctld/LookupVindexComplete", in, out, opts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
 func (c *vtctldClient) LookupVindexCreate(ctx context.Context, in *vtctldata.LookupVindexCreateRequest, opts ...grpc.CallOption) (*vtctldata.LookupVindexCreateResponse, error) {
 	out := new(vtctldata.LookupVindexCreateResponse)
 	err := c.cc.Invoke(ctx, "/vtctlservice.Vtctld/LookupVindexCreate", in, out, opts...)
@@ -1085,9 +1133,27 @@ func (c *vtctldClient) LookupVindexExternalize(ctx context.Context, in *vtctldat
 	return out, nil
 }
 
+func (c *vtctldClient) LookupVindexInternalize(ctx context.Context, in *vtctldata.LookupVindexInternalizeRequest, opts ...grpc.CallOption) (*vtctldata.LookupVindexInternalizeResponse, error) {
+	out := new(vtctldata.LookupVindexInternalizeResponse)
+	err := c.cc.Invoke(ctx, "/vtctlservice.Vtctld/LookupVindexInternalize", in, out, opts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
 func (c *vtctldClient) MaterializeCreate(ctx context.Context, in *vtctldata.MaterializeCreateRequest, opts ...grpc.CallOption) (*vtctldata.MaterializeCreateResponse, error) {
 	out := new(vtctldata.MaterializeCreateResponse)
 	err := c.cc.Invoke(ctx, "/vtctlservice.Vtctld/MaterializeCreate", in, out, opts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (c *vtctldClient) WorkflowAddTables(ctx context.Context, in *vtctldata.WorkflowAddTablesRequest, opts ...grpc.CallOption) (*vtctldata.WorkflowAddTablesResponse, error) {
+	out := new(vtctldata.WorkflowAddTablesResponse)
+	err := c.cc.Invoke(ctx, "/vtctlservice.Vtctld/WorkflowAddTables", in, out, opts...)
 	if err != nil {
 		return nil, err
 	}
@@ -1495,6 +1561,15 @@ func (c *vtctldClient) ValidateKeyspace(ctx context.Context, in *vtctldata.Valid
 	return out, nil
 }
 
+func (c *vtctldClient) ValidatePermissionsKeyspace(ctx context.Context, in *vtctldata.ValidatePermissionsKeyspaceRequest, opts ...grpc.CallOption) (*vtctldata.ValidatePermissionsKeyspaceResponse, error) {
+	out := new(vtctldata.ValidatePermissionsKeyspaceResponse)
+	err := c.cc.Invoke(ctx, "/vtctlservice.Vtctld/ValidatePermissionsKeyspace", in, out, opts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
 func (c *vtctldClient) ValidateSchemaKeyspace(ctx context.Context, in *vtctldata.ValidateSchemaKeyspaceRequest, opts ...grpc.CallOption) (*vtctldata.ValidateSchemaKeyspaceResponse, error) {
 	out := new(vtctldata.ValidateSchemaKeyspaceResponse)
 	err := c.cc.Invoke(ctx, "/vtctlservice.Vtctld/ValidateSchemaKeyspace", in, out, opts...)
@@ -1670,6 +1745,8 @@ type VtctldServer interface {
 	BackupShard(*vtctldata.BackupShardRequest, Vtctld_BackupShardServer) error
 	// CancelSchemaMigration cancels one or all migrations, terminating any running ones as needed.
 	CancelSchemaMigration(context.Context, *vtctldata.CancelSchemaMigrationRequest) (*vtctldata.CancelSchemaMigrationResponse, error)
+	// ChangeTabletTags changes the tags of the specified tablet, if possible.
+	ChangeTabletTags(context.Context, *vtctldata.ChangeTabletTagsRequest) (*vtctldata.ChangeTabletTagsResponse, error)
 	// ChangeTabletType changes the db type for the specified tablet, if possible.
 	// This is used primarily to arrange replicas, and it will not convert a
 	// primary. For that, use InitShardPrimary.
@@ -1684,6 +1761,8 @@ type VtctldServer interface {
 	CompleteSchemaMigration(context.Context, *vtctldata.CompleteSchemaMigrationRequest) (*vtctldata.CompleteSchemaMigrationResponse, error)
 	// CompleteSchemaMigration completes one or all migrations executed with --postpone-completion.
 	ConcludeTransaction(context.Context, *vtctldata.ConcludeTransactionRequest) (*vtctldata.ConcludeTransactionResponse, error)
+	// CopySchemaShard copies the schema from a source tablet to all tablets in a keyspace/shard.
+	CopySchemaShard(context.Context, *vtctldata.CopySchemaShardRequest) (*vtctldata.CopySchemaShardResponse, error)
 	// CreateKeyspace creates the specified keyspace in the topology. For a
 	// SNAPSHOT keyspace, the request must specify the name of a base keyspace,
 	// as well as a snapshot time.
@@ -1783,6 +1862,8 @@ type VtctldServer interface {
 	GetThrottlerStatus(context.Context, *vtctldata.GetThrottlerStatusRequest) (*vtctldata.GetThrottlerStatusResponse, error)
 	// GetTopologyPath returns the topology cell at a given path.
 	GetTopologyPath(context.Context, *vtctldata.GetTopologyPathRequest) (*vtctldata.GetTopologyPathResponse, error)
+	// GetTransactionInfo reads a given transactions information.
+	GetTransactionInfo(context.Context, *vtctldata.GetTransactionInfoRequest) (*vtctldata.GetTransactionInfoResponse, error)
 	// GetTransactions returns the unresolved transactions for the request.
 	GetUnresolvedTransactions(context.Context, *vtctldata.GetUnresolvedTransactionsRequest) (*vtctldata.GetUnresolvedTransactionsResponse, error)
 	// GetVersion returns the version of a tablet from its debug vars.
@@ -1800,11 +1881,15 @@ type VtctldServer interface {
 	InitShardPrimary(context.Context, *vtctldata.InitShardPrimaryRequest) (*vtctldata.InitShardPrimaryResponse, error)
 	// LaunchSchemaMigration launches one or all migrations executed with --postpone-launch.
 	LaunchSchemaMigration(context.Context, *vtctldata.LaunchSchemaMigrationRequest) (*vtctldata.LaunchSchemaMigrationResponse, error)
+	LookupVindexComplete(context.Context, *vtctldata.LookupVindexCompleteRequest) (*vtctldata.LookupVindexCompleteResponse, error)
 	LookupVindexCreate(context.Context, *vtctldata.LookupVindexCreateRequest) (*vtctldata.LookupVindexCreateResponse, error)
 	LookupVindexExternalize(context.Context, *vtctldata.LookupVindexExternalizeRequest) (*vtctldata.LookupVindexExternalizeResponse, error)
+	LookupVindexInternalize(context.Context, *vtctldata.LookupVindexInternalizeRequest) (*vtctldata.LookupVindexInternalizeResponse, error)
 	// MaterializeCreate creates a workflow to materialize one or more tables
 	// from a source keyspace to a target keyspace using a provided expressions.
 	MaterializeCreate(context.Context, *vtctldata.MaterializeCreateRequest) (*vtctldata.MaterializeCreateResponse, error)
+	// WorkflowAddTables adds tables to the existing materialize/movetables workflow.
+	WorkflowAddTables(context.Context, *vtctldata.WorkflowAddTablesRequest) (*vtctldata.WorkflowAddTablesResponse, error)
 	// MigrateCreate creates a workflow which migrates one or more tables from an
 	// external cluster into Vitess.
 	MigrateCreate(context.Context, *vtctldata.MigrateCreateRequest) (*vtctldata.WorkflowStatusResponse, error)
@@ -1952,6 +2037,8 @@ type VtctldServer interface {
 	// ValidateKeyspace validates that all nodes reachable from the specified
 	// keyspace are consistent.
 	ValidateKeyspace(context.Context, *vtctldata.ValidateKeyspaceRequest) (*vtctldata.ValidateKeyspaceResponse, error)
+	// ValidatePermissionsKeyspace validates that all the permissions are the same in a keyspace.
+	ValidatePermissionsKeyspace(context.Context, *vtctldata.ValidatePermissionsKeyspaceRequest) (*vtctldata.ValidatePermissionsKeyspaceResponse, error)
 	// ValidateSchemaKeyspace validates that the schema on the primary tablet for shard 0 matches the schema on all of the other tablets in the keyspace.
 	ValidateSchemaKeyspace(context.Context, *vtctldata.ValidateSchemaKeyspaceRequest) (*vtctldata.ValidateSchemaKeyspaceResponse, error)
 	// ValidateShard validates that all nodes reachable from the specified shard
@@ -2015,6 +2102,9 @@ func (UnimplementedVtctldServer) BackupShard(*vtctldata.BackupShardRequest, Vtct
 func (UnimplementedVtctldServer) CancelSchemaMigration(context.Context, *vtctldata.CancelSchemaMigrationRequest) (*vtctldata.CancelSchemaMigrationResponse, error) {
 	return nil, status.Errorf(codes.Unimplemented, "method CancelSchemaMigration not implemented")
 }
+func (UnimplementedVtctldServer) ChangeTabletTags(context.Context, *vtctldata.ChangeTabletTagsRequest) (*vtctldata.ChangeTabletTagsResponse, error) {
+	return nil, status.Errorf(codes.Unimplemented, "method ChangeTabletTags not implemented")
+}
 func (UnimplementedVtctldServer) ChangeTabletType(context.Context, *vtctldata.ChangeTabletTypeRequest) (*vtctldata.ChangeTabletTypeResponse, error) {
 	return nil, status.Errorf(codes.Unimplemented, "method ChangeTabletType not implemented")
 }
@@ -2029,6 +2119,9 @@ func (UnimplementedVtctldServer) CompleteSchemaMigration(context.Context, *vtctl
 }
 func (UnimplementedVtctldServer) ConcludeTransaction(context.Context, *vtctldata.ConcludeTransactionRequest) (*vtctldata.ConcludeTransactionResponse, error) {
 	return nil, status.Errorf(codes.Unimplemented, "method ConcludeTransaction not implemented")
+}
+func (UnimplementedVtctldServer) CopySchemaShard(context.Context, *vtctldata.CopySchemaShardRequest) (*vtctldata.CopySchemaShardResponse, error) {
+	return nil, status.Errorf(codes.Unimplemented, "method CopySchemaShard not implemented")
 }
 func (UnimplementedVtctldServer) CreateKeyspace(context.Context, *vtctldata.CreateKeyspaceRequest) (*vtctldata.CreateKeyspaceResponse, error) {
 	return nil, status.Errorf(codes.Unimplemented, "method CreateKeyspace not implemented")
@@ -2147,6 +2240,9 @@ func (UnimplementedVtctldServer) GetThrottlerStatus(context.Context, *vtctldata.
 func (UnimplementedVtctldServer) GetTopologyPath(context.Context, *vtctldata.GetTopologyPathRequest) (*vtctldata.GetTopologyPathResponse, error) {
 	return nil, status.Errorf(codes.Unimplemented, "method GetTopologyPath not implemented")
 }
+func (UnimplementedVtctldServer) GetTransactionInfo(context.Context, *vtctldata.GetTransactionInfoRequest) (*vtctldata.GetTransactionInfoResponse, error) {
+	return nil, status.Errorf(codes.Unimplemented, "method GetTransactionInfo not implemented")
+}
 func (UnimplementedVtctldServer) GetUnresolvedTransactions(context.Context, *vtctldata.GetUnresolvedTransactionsRequest) (*vtctldata.GetUnresolvedTransactionsResponse, error) {
 	return nil, status.Errorf(codes.Unimplemented, "method GetUnresolvedTransactions not implemented")
 }
@@ -2165,14 +2261,23 @@ func (UnimplementedVtctldServer) InitShardPrimary(context.Context, *vtctldata.In
 func (UnimplementedVtctldServer) LaunchSchemaMigration(context.Context, *vtctldata.LaunchSchemaMigrationRequest) (*vtctldata.LaunchSchemaMigrationResponse, error) {
 	return nil, status.Errorf(codes.Unimplemented, "method LaunchSchemaMigration not implemented")
 }
+func (UnimplementedVtctldServer) LookupVindexComplete(context.Context, *vtctldata.LookupVindexCompleteRequest) (*vtctldata.LookupVindexCompleteResponse, error) {
+	return nil, status.Errorf(codes.Unimplemented, "method LookupVindexComplete not implemented")
+}
 func (UnimplementedVtctldServer) LookupVindexCreate(context.Context, *vtctldata.LookupVindexCreateRequest) (*vtctldata.LookupVindexCreateResponse, error) {
 	return nil, status.Errorf(codes.Unimplemented, "method LookupVindexCreate not implemented")
 }
 func (UnimplementedVtctldServer) LookupVindexExternalize(context.Context, *vtctldata.LookupVindexExternalizeRequest) (*vtctldata.LookupVindexExternalizeResponse, error) {
 	return nil, status.Errorf(codes.Unimplemented, "method LookupVindexExternalize not implemented")
 }
+func (UnimplementedVtctldServer) LookupVindexInternalize(context.Context, *vtctldata.LookupVindexInternalizeRequest) (*vtctldata.LookupVindexInternalizeResponse, error) {
+	return nil, status.Errorf(codes.Unimplemented, "method LookupVindexInternalize not implemented")
+}
 func (UnimplementedVtctldServer) MaterializeCreate(context.Context, *vtctldata.MaterializeCreateRequest) (*vtctldata.MaterializeCreateResponse, error) {
 	return nil, status.Errorf(codes.Unimplemented, "method MaterializeCreate not implemented")
+}
+func (UnimplementedVtctldServer) WorkflowAddTables(context.Context, *vtctldata.WorkflowAddTablesRequest) (*vtctldata.WorkflowAddTablesResponse, error) {
+	return nil, status.Errorf(codes.Unimplemented, "method WorkflowAddTables not implemented")
 }
 func (UnimplementedVtctldServer) MigrateCreate(context.Context, *vtctldata.MigrateCreateRequest) (*vtctldata.WorkflowStatusResponse, error) {
 	return nil, status.Errorf(codes.Unimplemented, "method MigrateCreate not implemented")
@@ -2299,6 +2404,9 @@ func (UnimplementedVtctldServer) Validate(context.Context, *vtctldata.ValidateRe
 }
 func (UnimplementedVtctldServer) ValidateKeyspace(context.Context, *vtctldata.ValidateKeyspaceRequest) (*vtctldata.ValidateKeyspaceResponse, error) {
 	return nil, status.Errorf(codes.Unimplemented, "method ValidateKeyspace not implemented")
+}
+func (UnimplementedVtctldServer) ValidatePermissionsKeyspace(context.Context, *vtctldata.ValidatePermissionsKeyspaceRequest) (*vtctldata.ValidatePermissionsKeyspaceResponse, error) {
+	return nil, status.Errorf(codes.Unimplemented, "method ValidatePermissionsKeyspace not implemented")
 }
 func (UnimplementedVtctldServer) ValidateSchemaKeyspace(context.Context, *vtctldata.ValidateSchemaKeyspaceRequest) (*vtctldata.ValidateSchemaKeyspaceResponse, error) {
 	return nil, status.Errorf(codes.Unimplemented, "method ValidateSchemaKeyspace not implemented")
@@ -2547,6 +2655,24 @@ func _Vtctld_CancelSchemaMigration_Handler(srv interface{}, ctx context.Context,
 	return interceptor(ctx, in, info, handler)
 }
 
+func _Vtctld_ChangeTabletTags_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(vtctldata.ChangeTabletTagsRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(VtctldServer).ChangeTabletTags(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: "/vtctlservice.Vtctld/ChangeTabletTags",
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(VtctldServer).ChangeTabletTags(ctx, req.(*vtctldata.ChangeTabletTagsRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
 func _Vtctld_ChangeTabletType_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
 	in := new(vtctldata.ChangeTabletTypeRequest)
 	if err := dec(in); err != nil {
@@ -2633,6 +2759,24 @@ func _Vtctld_ConcludeTransaction_Handler(srv interface{}, ctx context.Context, d
 	}
 	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
 		return srv.(VtctldServer).ConcludeTransaction(ctx, req.(*vtctldata.ConcludeTransactionRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+func _Vtctld_CopySchemaShard_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(vtctldata.CopySchemaShardRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(VtctldServer).CopySchemaShard(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: "/vtctlservice.Vtctld/CopySchemaShard",
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(VtctldServer).CopySchemaShard(ctx, req.(*vtctldata.CopySchemaShardRequest))
 	}
 	return interceptor(ctx, in, info, handler)
 }
@@ -3339,6 +3483,24 @@ func _Vtctld_GetTopologyPath_Handler(srv interface{}, ctx context.Context, dec f
 	return interceptor(ctx, in, info, handler)
 }
 
+func _Vtctld_GetTransactionInfo_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(vtctldata.GetTransactionInfoRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(VtctldServer).GetTransactionInfo(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: "/vtctlservice.Vtctld/GetTransactionInfo",
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(VtctldServer).GetTransactionInfo(ctx, req.(*vtctldata.GetTransactionInfoRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
 func _Vtctld_GetUnresolvedTransactions_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
 	in := new(vtctldata.GetUnresolvedTransactionsRequest)
 	if err := dec(in); err != nil {
@@ -3447,6 +3609,24 @@ func _Vtctld_LaunchSchemaMigration_Handler(srv interface{}, ctx context.Context,
 	return interceptor(ctx, in, info, handler)
 }
 
+func _Vtctld_LookupVindexComplete_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(vtctldata.LookupVindexCompleteRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(VtctldServer).LookupVindexComplete(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: "/vtctlservice.Vtctld/LookupVindexComplete",
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(VtctldServer).LookupVindexComplete(ctx, req.(*vtctldata.LookupVindexCompleteRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
 func _Vtctld_LookupVindexCreate_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
 	in := new(vtctldata.LookupVindexCreateRequest)
 	if err := dec(in); err != nil {
@@ -3483,6 +3663,24 @@ func _Vtctld_LookupVindexExternalize_Handler(srv interface{}, ctx context.Contex
 	return interceptor(ctx, in, info, handler)
 }
 
+func _Vtctld_LookupVindexInternalize_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(vtctldata.LookupVindexInternalizeRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(VtctldServer).LookupVindexInternalize(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: "/vtctlservice.Vtctld/LookupVindexInternalize",
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(VtctldServer).LookupVindexInternalize(ctx, req.(*vtctldata.LookupVindexInternalizeRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
 func _Vtctld_MaterializeCreate_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
 	in := new(vtctldata.MaterializeCreateRequest)
 	if err := dec(in); err != nil {
@@ -3497,6 +3695,24 @@ func _Vtctld_MaterializeCreate_Handler(srv interface{}, ctx context.Context, dec
 	}
 	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
 		return srv.(VtctldServer).MaterializeCreate(ctx, req.(*vtctldata.MaterializeCreateRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+func _Vtctld_WorkflowAddTables_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(vtctldata.WorkflowAddTablesRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(VtctldServer).WorkflowAddTables(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: "/vtctlservice.Vtctld/WorkflowAddTables",
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(VtctldServer).WorkflowAddTables(ctx, req.(*vtctldata.WorkflowAddTablesRequest))
 	}
 	return interceptor(ctx, in, info, handler)
 }
@@ -4260,6 +4476,24 @@ func _Vtctld_ValidateKeyspace_Handler(srv interface{}, ctx context.Context, dec 
 	return interceptor(ctx, in, info, handler)
 }
 
+func _Vtctld_ValidatePermissionsKeyspace_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(vtctldata.ValidatePermissionsKeyspaceRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(VtctldServer).ValidatePermissionsKeyspace(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: "/vtctlservice.Vtctld/ValidatePermissionsKeyspace",
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(VtctldServer).ValidatePermissionsKeyspace(ctx, req.(*vtctldata.ValidatePermissionsKeyspaceRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
 func _Vtctld_ValidateSchemaKeyspace_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
 	in := new(vtctldata.ValidateSchemaKeyspaceRequest)
 	if err := dec(in); err != nil {
@@ -4588,6 +4822,10 @@ var Vtctld_ServiceDesc = grpc.ServiceDesc{
 			Handler:    _Vtctld_CancelSchemaMigration_Handler,
 		},
 		{
+			MethodName: "ChangeTabletTags",
+			Handler:    _Vtctld_ChangeTabletTags_Handler,
+		},
+		{
 			MethodName: "ChangeTabletType",
 			Handler:    _Vtctld_ChangeTabletType_Handler,
 		},
@@ -4606,6 +4844,10 @@ var Vtctld_ServiceDesc = grpc.ServiceDesc{
 		{
 			MethodName: "ConcludeTransaction",
 			Handler:    _Vtctld_ConcludeTransaction_Handler,
+		},
+		{
+			MethodName: "CopySchemaShard",
+			Handler:    _Vtctld_CopySchemaShard_Handler,
 		},
 		{
 			MethodName: "CreateKeyspace",
@@ -4764,6 +5006,10 @@ var Vtctld_ServiceDesc = grpc.ServiceDesc{
 			Handler:    _Vtctld_GetTopologyPath_Handler,
 		},
 		{
+			MethodName: "GetTransactionInfo",
+			Handler:    _Vtctld_GetTransactionInfo_Handler,
+		},
+		{
 			MethodName: "GetUnresolvedTransactions",
 			Handler:    _Vtctld_GetUnresolvedTransactions_Handler,
 		},
@@ -4788,6 +5034,10 @@ var Vtctld_ServiceDesc = grpc.ServiceDesc{
 			Handler:    _Vtctld_LaunchSchemaMigration_Handler,
 		},
 		{
+			MethodName: "LookupVindexComplete",
+			Handler:    _Vtctld_LookupVindexComplete_Handler,
+		},
+		{
 			MethodName: "LookupVindexCreate",
 			Handler:    _Vtctld_LookupVindexCreate_Handler,
 		},
@@ -4796,8 +5046,16 @@ var Vtctld_ServiceDesc = grpc.ServiceDesc{
 			Handler:    _Vtctld_LookupVindexExternalize_Handler,
 		},
 		{
+			MethodName: "LookupVindexInternalize",
+			Handler:    _Vtctld_LookupVindexInternalize_Handler,
+		},
+		{
 			MethodName: "MaterializeCreate",
 			Handler:    _Vtctld_MaterializeCreate_Handler,
+		},
+		{
+			MethodName: "WorkflowAddTables",
+			Handler:    _Vtctld_WorkflowAddTables_Handler,
 		},
 		{
 			MethodName: "MigrateCreate",
@@ -4962,6 +5220,10 @@ var Vtctld_ServiceDesc = grpc.ServiceDesc{
 		{
 			MethodName: "ValidateKeyspace",
 			Handler:    _Vtctld_ValidateKeyspace_Handler,
+		},
+		{
+			MethodName: "ValidatePermissionsKeyspace",
+			Handler:    _Vtctld_ValidatePermissionsKeyspace_Handler,
 		},
 		{
 			MethodName: "ValidateSchemaKeyspace",

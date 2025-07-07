@@ -35,6 +35,7 @@ import (
 	"vitess.io/vitess/go/test/endtoend/onlineddl"
 	"vitess.io/vitess/go/test/endtoend/throttler"
 	"vitess.io/vitess/go/vt/schema"
+	"vitess.io/vitess/go/vt/utils"
 	"vitess.io/vitess/go/vt/vttablet/tabletserver/throttle/throttlerapp"
 
 	binlogdatapb "vitess.io/vitess/go/vt/proto/binlogdata"
@@ -80,6 +81,9 @@ var (
 		ALTER TABLE %s
 			DROP PRIMARY KEY,
 			DROP COLUMN vrepl_col`
+	alterTableFailedVreplicationStatement = `
+			ALTER TABLE %s
+				ADD UNIQUE KEY test_val_uidx (test_val)`
 	// We will run this query while throttling vreplication
 	alterTableThrottlingStatement = `
 		ALTER TABLE %s
@@ -157,7 +161,6 @@ const (
 )
 
 func TestMain(m *testing.M) {
-	defer cluster.PanicHandler(nil)
 	flag.Parse()
 
 	exitcode, err := func() (int, error) {
@@ -171,18 +174,18 @@ func TestMain(m *testing.M) {
 		}
 
 		clusterInstance.VtctldExtraArgs = []string{
-			"--schema_change_dir", schemaChangeDirectory,
-			"--schema_change_controller", "local",
-			"--schema_change_check_interval", "1s",
+			"--schema-change-dir", schemaChangeDirectory,
+			"--schema-change-controller", "local",
+			"--schema-change-check-interval", "1s",
 		}
 
 		clusterInstance.VtTabletExtraArgs = []string{
-			"--heartbeat_interval", "250ms",
-			"--migration_check_interval", "5s",
-			"--watch_replication_stream",
+			utils.GetFlagVariantForTests("--heartbeat-interval"), "250ms",
+			utils.GetFlagVariantForTests("--migration-check-interval"), "5s",
+			utils.GetFlagVariantForTests("--watch-replication-stream"),
 		}
 		clusterInstance.VtGateExtraArgs = []string{
-			"--ddl_strategy", "online",
+			utils.GetFlagVariantForTests("--ddl-strategy"), "online",
 		}
 
 		if err := clusterInstance.StartTopo(); err != nil {
@@ -221,7 +224,6 @@ func TestMain(m *testing.M) {
 }
 
 func TestVreplSchemaChanges(t *testing.T) {
-	defer cluster.PanicHandler(t)
 
 	shards = clusterInstance.Keyspaces[0].Shards
 	require.Equal(t, 2, len(shards))
@@ -301,6 +303,7 @@ func TestVreplSchemaChanges(t *testing.T) {
 		for _, row := range rs.Named().Rows {
 			retainArtifactSeconds := row.AsInt64("retain_artifacts_seconds", 0)
 			assert.Equal(t, int64(-1), retainArtifactSeconds)
+			assert.False(t, row["shadow_analyzed_timestamp"].IsNull())
 		}
 	})
 	t.Run("successful online alter, vtctl", func(t *testing.T) {
@@ -455,6 +458,19 @@ func TestVreplSchemaChanges(t *testing.T) {
 		onlineddl.CheckRetryMigration(t, &vtParams, shards, uuid, true)
 		onlineddl.CheckMigrationArtifacts(t, &vtParams, shards, uuid, true)
 		// migration will fail again
+	})
+	t.Run("failed migration due to vreplication", func(t *testing.T) {
+		insertRows(t, 2)
+		uuid := testOnlineDDLStatement(t, alterTableFailedVreplicationStatement, "online", providedUUID, providedMigrationContext, "vtgate", "vrepl_col", "", false)
+		onlineddl.WaitForMigrationStatus(t, &vtParams, shards, uuid, normalMigrationWait, schema.OnlineDDLStatusComplete, schema.OnlineDDLStatusFailed)
+		onlineddl.CheckMigrationStatus(t, &vtParams, shards, uuid, schema.OnlineDDLStatusFailed)
+
+		rs := onlineddl.ReadMigrations(t, &vtParams, uuid)
+		require.NotNil(t, rs)
+		for _, row := range rs.Named().Rows {
+			message := row["message"].ToString()
+			assert.Contains(t, message, "vreplication: terminal error:", "migration row: %v", row)
+		}
 	})
 	t.Run("cancel all migrations: nothing to cancel", func(t *testing.T) {
 		// no migrations pending at this time

@@ -37,6 +37,7 @@ import (
 	"vitess.io/vitess/go/vt/sqlparser"
 	"vitess.io/vitess/go/vt/throttler"
 	"vitess.io/vitess/go/vt/topo/topoproto"
+	"vitess.io/vitess/go/vt/utils"
 	"vitess.io/vitess/go/vt/vterrors"
 
 	querypb "vitess.io/vitess/go/vt/proto/query"
@@ -75,6 +76,7 @@ var (
 	heartbeatInterval            time.Duration
 	heartbeatOnDemandDuration    time.Duration
 	healthCheckInterval          time.Duration
+	semiSyncMonitorInterval      time.Duration
 	degradedThreshold            time.Duration
 	unhealthyThreshold           time.Duration
 	transitionGracePeriod        time.Duration
@@ -143,6 +145,9 @@ func registerTabletEnvFlags(fs *pflag.FlagSet) {
 	fs.DurationVar(&currentConfig.OltpReadPool.Timeout, "queryserver-config-query-pool-timeout", defaultConfig.OltpReadPool.Timeout, "query server query pool timeout, it is how long vttablet waits for a connection from the query pool. If set to 0 (default) then the overall query timeout is used instead.")
 	fs.DurationVar(&currentConfig.OlapReadPool.Timeout, "queryserver-config-stream-pool-timeout", defaultConfig.OlapReadPool.Timeout, "query server stream pool timeout, it is how long vttablet waits for a connection from the stream pool. If set to 0 (default) then there is no timeout.")
 	fs.DurationVar(&currentConfig.TxPool.Timeout, "queryserver-config-txpool-timeout", defaultConfig.TxPool.Timeout, "query server transaction pool timeout, it is how long vttablet waits if tx pool is full")
+	fs.IntVar(&currentConfig.OltpReadPool.MaxIdleCount, "queryserver-config-query-pool-max-idle-count", defaultConfig.OltpReadPool.MaxIdleCount, "query server query pool - maximum number of idle connections to retain in the pool. Use this to balance between faster response times during traffic bursts and resource efficiency during low-traffic periods.")
+	fs.IntVar(&currentConfig.OlapReadPool.MaxIdleCount, "queryserver-config-stream-pool-max-idle-count", defaultConfig.OlapReadPool.MaxIdleCount, "query server stream pool - maximum number of idle connections to retain in the pool. Use this to balance between faster response times during traffic bursts and resource efficiency during low-traffic periods.")
+	fs.IntVar(&currentConfig.TxPool.MaxIdleCount, "queryserver-config-txpool-max-idle-count", defaultConfig.TxPool.MaxIdleCount, "query server transaction pool - maximum number of idle connections to retain in the pool. Use this to balance between faster response times during traffic bursts and resource efficiency during low-traffic periods.")
 	fs.DurationVar(&currentConfig.OltpReadPool.IdleTimeout, "queryserver-config-idle-timeout", defaultConfig.OltpReadPool.IdleTimeout, "query server idle timeout, vttablet manages various mysql connection pools. This config means if a connection has not been used in given idle timeout, this connection will be removed from pool. This effectively manages number of connection objects and optimize the pool performance.")
 	fs.DurationVar(&currentConfig.OltpReadPool.MaxLifetime, "queryserver-config-pool-conn-max-lifetime", defaultConfig.OltpReadPool.MaxLifetime, "query server connection max lifetime, vttablet manages various mysql connection pools. This config means if a connection has lived at least this long, it connection will be removed from pool upon the next time it is returned to the pool.")
 
@@ -153,13 +158,17 @@ func registerTabletEnvFlags(fs *pflag.FlagSet) {
 	fs.BoolVar(&currentConfig.TerseErrors, "queryserver-config-terse-errors", defaultConfig.TerseErrors, "prevent bind vars from escaping in client error messages")
 	fs.IntVar(&currentConfig.TruncateErrorLen, "queryserver-config-truncate-error-len", defaultConfig.TruncateErrorLen, "truncate errors sent to client if they are longer than this value (0 means do not truncate)")
 	fs.BoolVar(&currentConfig.AnnotateQueries, "queryserver-config-annotate-queries", defaultConfig.AnnotateQueries, "prefix queries to MySQL backend with comment indicating vtgate principal (user) and target tablet type")
-	fs.BoolVar(&currentConfig.WatchReplication, "watch_replication_stream", false, "When enabled, vttablet will stream the MySQL replication stream from the local server, and use it to update schema when it sees a DDL.")
+	utils.SetFlagBoolVar(fs, &currentConfig.WatchReplication, "watch-replication-stream", false, "When enabled, vttablet will stream the MySQL replication stream from the local server, and use it to update schema when it sees a DDL.")
 	fs.BoolVar(&currentConfig.TrackSchemaVersions, "track_schema_versions", false, "When enabled, vttablet will store versions of schemas at each position that a DDL is applied and allow retrieval of the schema corresponding to a position")
 	fs.Int64Var(&currentConfig.SchemaVersionMaxAgeSeconds, "schema-version-max-age-seconds", 0, "max age of schema version records to kept in memory by the vreplication historian")
-	fs.BoolVar(&currentConfig.TwoPCEnable, "twopc_enable", defaultConfig.TwoPCEnable, "if the flag is on, 2pc is enabled. Other 2pc flags must be supplied.")
-	SecondsVar(fs, &currentConfig.TwoPCAbandonAge, "twopc_abandon_age", defaultConfig.TwoPCAbandonAge, "time in seconds. Any unresolved transaction older than this time will be sent to the coordinator to be resolved.")
+
+	_ = fs.Bool("twopc_enable", true, "TwoPC is enabled")
+	_ = fs.MarkDeprecated("twopc_enable", "TwoPC is always enabled, the transaction abandon age can be configured")
+	flagutil.FloatDuration(fs, &currentConfig.TwoPCAbandonAge, "twopc_abandon_age", defaultConfig.TwoPCAbandonAge,
+		"Any unresolved transaction older than this time will be sent to the coordinator to be resolved. NOTE: Providing time as seconds (float64) is deprecated. Use time.Duration format (e.g., '1s', '2m', '1h').")
+
 	// Tx throttler config
-	flagutil.DualFormatBoolVar(fs, &currentConfig.EnableTxThrottler, "enable_tx_throttler", defaultConfig.EnableTxThrottler, "If true replication-lag-based throttling on transactions will be enabled.")
+	utils.SetFlagBoolVar(fs, &currentConfig.EnableTxThrottler, "enable-tx-throttler", defaultConfig.EnableTxThrottler, "If true replication-lag-based throttling on transactions will be enabled.")
 	flagutil.DualFormatVar(fs, currentConfig.TxThrottlerConfig, "tx_throttler_config", "The configuration of the transaction throttler as a text-formatted throttlerdata.Configuration protocol buffer message.")
 	flagutil.DualFormatStringListVar(fs, &currentConfig.TxThrottlerHealthCheckCells, "tx_throttler_healthcheck_cells", defaultConfig.TxThrottlerHealthCheckCells, "A comma-separated list of cells. Only tabletservers running in these cells will be monitored for replication lag by the transaction throttler.")
 	fs.IntVar(&currentConfig.TxThrottlerDefaultPriority, "tx-throttler-default-priority", defaultConfig.TxThrottlerDefaultPriority, "Default priority assigned to queries that lack priority information")
@@ -167,47 +176,48 @@ func registerTabletEnvFlags(fs *pflag.FlagSet) {
 	fs.BoolVar(&currentConfig.TxThrottlerDryRun, "tx-throttler-dry-run", defaultConfig.TxThrottlerDryRun, "If present, the transaction throttler only records metrics about requests received and throttled, but does not actually throttle any requests.")
 	fs.DurationVar(&currentConfig.TxThrottlerTopoRefreshInterval, "tx-throttler-topo-refresh-interval", time.Minute*5, "The rate that the transaction throttler will refresh the topology to find cells.")
 
-	fs.BoolVar(&enableHotRowProtection, "enable_hot_row_protection", false, "If true, incoming transactions for the same row (range) will be queued and cannot consume all txpool slots.")
-	fs.BoolVar(&enableHotRowProtectionDryRun, "enable_hot_row_protection_dry_run", false, "If true, hot row protection is not enforced but logs if transactions would have been queued.")
-	fs.IntVar(&currentConfig.HotRowProtection.MaxQueueSize, "hot_row_protection_max_queue_size", defaultConfig.HotRowProtection.MaxQueueSize, "Maximum number of BeginExecute RPCs which will be queued for the same row (range).")
-	fs.IntVar(&currentConfig.HotRowProtection.MaxGlobalQueueSize, "hot_row_protection_max_global_queue_size", defaultConfig.HotRowProtection.MaxGlobalQueueSize, "Global queue limit across all row (ranges). Useful to prevent that the queue can grow unbounded.")
-	fs.IntVar(&currentConfig.HotRowProtection.MaxConcurrency, "hot_row_protection_concurrent_transactions", defaultConfig.HotRowProtection.MaxConcurrency, "Number of concurrent transactions let through to the txpool/MySQL for the same hot row. Should be > 1 to have enough 'ready' transactions in MySQL and benefit from a pipelining effect.")
+	utils.SetFlagBoolVar(fs, &enableHotRowProtection, "enable-hot-row-protection", false, "If true, incoming transactions for the same row (range) will be queued and cannot consume all txpool slots.")
+	utils.SetFlagBoolVar(fs, &enableHotRowProtectionDryRun, "enable-hot-row-protection-dry-run", false, "If true, hot row protection is not enforced but logs if transactions would have been queued.")
+	utils.SetFlagIntVar(fs, &currentConfig.HotRowProtection.MaxQueueSize, "hot-row-protection-max-queue-size", defaultConfig.HotRowProtection.MaxQueueSize, "Maximum number of BeginExecute RPCs which will be queued for the same row (range).")
+	utils.SetFlagIntVar(fs, &currentConfig.HotRowProtection.MaxGlobalQueueSize, "hot-row-protection-max-global-queue-size", defaultConfig.HotRowProtection.MaxGlobalQueueSize, "Global queue limit across all row (ranges). Useful to prevent that the queue can grow unbounded.")
+	utils.SetFlagIntVar(fs, &currentConfig.HotRowProtection.MaxConcurrency, "hot-row-protection-concurrent-transactions", defaultConfig.HotRowProtection.MaxConcurrency, "Number of concurrent transactions let through to the txpool/MySQL for the same hot row. Should be > 1 to have enough 'ready' transactions in MySQL and benefit from a pipelining effect.")
 
-	fs.BoolVar(&currentConfig.EnableTransactionLimit, "enable_transaction_limit", defaultConfig.EnableTransactionLimit, "If true, limit on number of transactions open at the same time will be enforced for all users. User trying to open a new transaction after exhausting their limit will receive an error immediately, regardless of whether there are available slots or not.")
-	fs.BoolVar(&currentConfig.EnableTransactionLimitDryRun, "enable_transaction_limit_dry_run", defaultConfig.EnableTransactionLimitDryRun, "If true, limit on number of transactions open at the same time will be tracked for all users, but not enforced.")
-	fs.Float64Var(&currentConfig.TransactionLimitPerUser, "transaction_limit_per_user", defaultConfig.TransactionLimitPerUser, "Maximum number of transactions a single user is allowed to use at any time, represented as fraction of -transaction_cap.")
-	fs.BoolVar(&currentConfig.TransactionLimitByUsername, "transaction_limit_by_username", defaultConfig.TransactionLimitByUsername, "Include VTGateCallerID.username when considering who the user is for the purpose of transaction limit.")
-	fs.BoolVar(&currentConfig.TransactionLimitByPrincipal, "transaction_limit_by_principal", defaultConfig.TransactionLimitByPrincipal, "Include CallerID.principal when considering who the user is for the purpose of transaction limit.")
-	fs.BoolVar(&currentConfig.TransactionLimitByComponent, "transaction_limit_by_component", defaultConfig.TransactionLimitByComponent, "Include CallerID.component when considering who the user is for the purpose of transaction limit.")
-	fs.BoolVar(&currentConfig.TransactionLimitBySubcomponent, "transaction_limit_by_subcomponent", defaultConfig.TransactionLimitBySubcomponent, "Include CallerID.subcomponent when considering who the user is for the purpose of transaction limit.")
+	utils.SetFlagBoolVar(fs, &currentConfig.EnableTransactionLimit, "enable-transaction-limit", defaultConfig.EnableTransactionLimit, "If true, limit on number of transactions open at the same time will be enforced for all users. User trying to open a new transaction after exhausting their limit will receive an error immediately, regardless of whether there are available slots or not.")
+	utils.SetFlagBoolVar(fs, &currentConfig.EnableTransactionLimitDryRun, "enable-transaction-limit-dry-run", defaultConfig.EnableTransactionLimitDryRun, "If true, limit on number of transactions open at the same time will be tracked for all users, but not enforced.")
+	utils.SetFlagFloat64Var(fs, &currentConfig.TransactionLimitPerUser, "transaction-limit-per-user", defaultConfig.TransactionLimitPerUser, "Maximum number of transactions a single user is allowed to use at any time, represented as fraction of -transaction_cap.")
+	utils.SetFlagBoolVar(fs, &currentConfig.TransactionLimitByUsername, "transaction-limit-by-username", defaultConfig.TransactionLimitByUsername, "Include VTGateCallerID.username when considering who the user is for the purpose of transaction limit.")
+	utils.SetFlagBoolVar(fs, &currentConfig.TransactionLimitByPrincipal, "transaction-limit-by-principal", defaultConfig.TransactionLimitByPrincipal, "Include CallerID.principal when considering who the user is for the purpose of transaction limit.")
+	utils.SetFlagBoolVar(fs, &currentConfig.TransactionLimitByComponent, "transaction-limit-by-component", defaultConfig.TransactionLimitByComponent, "Include CallerID.component when considering who the user is for the purpose of transaction limit.")
+	utils.SetFlagBoolVar(fs, &currentConfig.TransactionLimitBySubcomponent, "transaction-limit-by-subcomponent", defaultConfig.TransactionLimitBySubcomponent, "Include CallerID.subcomponent when considering who the user is for the purpose of transaction limit.")
 
-	fs.BoolVar(&enableHeartbeat, "heartbeat_enable", false, "If true, vttablet records (if master) or checks (if replica) the current time of a replication heartbeat in the sidecar database's heartbeat table. The result is used to inform the serving state of the vttablet via healthchecks.")
-	fs.DurationVar(&heartbeatInterval, "heartbeat_interval", 1*time.Second, "How frequently to read and write replication heartbeat.")
-	fs.DurationVar(&heartbeatOnDemandDuration, "heartbeat_on_demand_duration", 0, "If non-zero, heartbeats are only written upon consumer request, and only run for up to given duration following the request. Frequent requests can keep the heartbeat running consistently; when requests are infrequent heartbeat may completely stop between requests")
+	utils.SetFlagBoolVar(fs, &enableHeartbeat, "heartbeat-enable", false, "If true, vttablet records (if master) or checks (if replica) the current time of a replication heartbeat in the sidecar database's heartbeat table. The result is used to inform the serving state of the vttablet via healthchecks.")
+	utils.SetFlagDurationVar(fs, &heartbeatInterval, "heartbeat-interval", 1*time.Second, "How frequently to read and write replication heartbeat.")
+	utils.SetFlagDurationVar(fs, &heartbeatOnDemandDuration, "heartbeat-on-demand-duration", 0, "If non-zero, heartbeats are only written upon consumer request, and only run for up to given duration following the request. Frequent requests can keep the heartbeat running consistently; when requests are infrequent heartbeat may completely stop between requests")
 
-	fs.BoolVar(&currentConfig.EnforceStrictTransTables, "enforce_strict_trans_tables", defaultConfig.EnforceStrictTransTables, "If true, vttablet requires MySQL to run with STRICT_TRANS_TABLES or STRICT_ALL_TABLES on. It is recommended to not turn this flag off. Otherwise MySQL may alter your supplied values before saving them to the database.")
-	flagutil.DualFormatBoolVar(fs, &enableConsolidator, "enable_consolidator", true, "This option enables the query consolidator.")
-	flagutil.DualFormatBoolVar(fs, &enableConsolidatorReplicas, "enable_consolidator_replicas", false, "This option enables the query consolidator only on replicas.")
+	utils.SetFlagBoolVar(fs, &currentConfig.EnforceStrictTransTables, "enforce-strict-trans-tables", defaultConfig.EnforceStrictTransTables, "If true, vttablet requires MySQL to run with STRICT_TRANS_TABLES or STRICT_ALL_TABLES on. It is recommended to not turn this flag off. Otherwise MySQL may alter your supplied values before saving them to the database.")
+	utils.SetFlagBoolVar(fs, &enableConsolidator, "enable-consolidator", true, "This option enables the query consolidator.")
+	utils.SetFlagBoolVar(fs, &enableConsolidatorReplicas, "enable-consolidator-replicas", false, "This option enables the query consolidator only on replicas.")
 	fs.Int64Var(&currentConfig.ConsolidatorStreamQuerySize, "consolidator-stream-query-size", defaultConfig.ConsolidatorStreamQuerySize, "Configure the stream consolidator query size in bytes. Setting to 0 disables the stream consolidator.")
 	fs.Int64Var(&currentConfig.ConsolidatorStreamTotalSize, "consolidator-stream-total-size", defaultConfig.ConsolidatorStreamTotalSize, "Configure the stream consolidator total size in bytes. Setting to 0 disables the stream consolidator.")
 
-	fs.DurationVar(&healthCheckInterval, "health_check_interval", defaultConfig.Healthcheck.Interval, "Interval between health checks")
-	fs.DurationVar(&degradedThreshold, "degraded_threshold", defaultConfig.Healthcheck.DegradedThreshold, "replication lag after which a replica is considered degraded")
+	fs.Int64Var(&currentConfig.ConsolidatorQueryWaiterCap, "consolidator-query-waiter-cap", 0, "Configure the maximum number of clients allowed to wait on the consolidator.")
+	utils.SetFlagDurationVar(fs, &healthCheckInterval, "health-check-interval", defaultConfig.Healthcheck.Interval, "Interval between health checks")
+	utils.SetFlagDurationVar(fs, &degradedThreshold, "degraded-threshold", defaultConfig.Healthcheck.DegradedThreshold, "replication lag after which a replica is considered degraded")
 	fs.DurationVar(&unhealthyThreshold, "unhealthy_threshold", defaultConfig.Healthcheck.UnhealthyThreshold, "replication lag after which a replica is considered unhealthy")
 	fs.DurationVar(&transitionGracePeriod, "serving_state_grace_period", 0, "how long to pause after broadcasting health to vtgate, before enforcing a new serving state")
+	fs.DurationVar(&semiSyncMonitorInterval, "semi-sync-monitor-interval", defaultConfig.SemiSyncMonitor.Interval, "How frequently the semi-sync monitor checks if the primary is blocked on semi-sync ACKs")
 
-	fs.BoolVar(&enableReplicationReporter, "enable_replication_reporter", false, "Use polling to track replication lag.")
-	fs.BoolVar(&currentConfig.EnableOnlineDDL, "queryserver_enable_online_ddl", true, "Enable online DDL.")
+	utils.SetFlagBoolVar(fs, &enableReplicationReporter, "enable-replication-reporter", false, "Use polling to track replication lag.")
+	utils.SetFlagBoolVar(fs, &currentConfig.EnableOnlineDDL, "queryserver-enable-online-ddl", true, "Enable online DDL.")
 	fs.BoolVar(&currentConfig.SanitizeLogMessages, "sanitize_log_messages", false, "Remove potentially sensitive information in tablet INFO, WARNING, and ERROR log messages such as query parameters.")
-	_ = fs.Bool("queryserver-enable-settings-pool", true, "Enable pooling of connections with modified system settings")
-	_ = fs.MarkDeprecated("queryserver-enable-settings-pool", "New pool implementation does it internally and at the api level this has been enabled since v17")
 
-	fs.Int64Var(&currentConfig.RowStreamer.MaxInnoDBTrxHistLen, "vreplication_copy_phase_max_innodb_history_list_length", 1000000, "The maximum InnoDB transaction history that can exist on a vstreamer (source) before starting another round of copying rows. This helps to limit the impact on the source tablet.")
-	fs.Int64Var(&currentConfig.RowStreamer.MaxMySQLReplLagSecs, "vreplication_copy_phase_max_mysql_replication_lag", 43200, "The maximum MySQL replication lag (in seconds) that can exist on a vstreamer (source) before starting another round of copying rows. This helps to limit the impact on the source tablet.")
+	utils.SetFlagInt64Var(fs, &currentConfig.RowStreamer.MaxInnoDBTrxHistLen, "vreplication-copy-phase-max-innodb-history-list-length", 10000000, "The maximum InnoDB transaction history that can exist on a vstreamer (source) before starting another round of copying rows. This helps to limit the impact on the source tablet")
+	utils.SetFlagInt64Var(fs, &currentConfig.RowStreamer.MaxMySQLReplLagSecs, "vreplication-copy-phase-max-mysql-replication-lag", 43200, "The maximum MySQL replication lag (in seconds) that can exist on a vstreamer (source) before starting another round of copying rows. This helps to limit the impact on the source tablet")
 
 	fs.BoolVar(&currentConfig.EnableViews, "queryserver-enable-views", false, "Enable views support in vttablet.")
 
 	fs.BoolVar(&currentConfig.EnablePerWorkloadTableMetrics, "enable-per-workload-table-metrics", defaultConfig.EnablePerWorkloadTableMetrics, "If true, query counts and query error metrics include a label that identifies the workload")
+	fs.BoolVar(&currentConfig.SkipUserMetrics, "skip-user-metrics", defaultConfig.SkipUserMetrics, "If true, user based stats are not recorded.")
 
 	fs.BoolVar(&currentConfig.Unmanaged, "unmanaged", false, "Indicates an unmanaged tablet, i.e. using an external mysql-compatible database")
 }
@@ -270,12 +280,14 @@ func Init() {
 	currentConfig.Healthcheck.DegradedThreshold = degradedThreshold
 	currentConfig.Healthcheck.UnhealthyThreshold = unhealthyThreshold
 	currentConfig.GracePeriods.Transition = transitionGracePeriod
+	currentConfig.SemiSyncMonitor.Interval = semiSyncMonitorInterval
 
-	switch streamlog.GetQueryLogFormat() {
+	logFormat := streamlog.GetQueryLogConfig().Format
+	switch logFormat {
 	case streamlog.QueryLogFormatText:
 	case streamlog.QueryLogFormatJSON:
 	default:
-		log.Exitf("Invalid querylog-format value %v: must be either text or json", streamlog.GetQueryLogFormat())
+		log.Exitf("Invalid querylog-format value %v: must be either text or json", logFormat)
 	}
 
 	if queryLogHandler != "" {
@@ -308,6 +320,8 @@ type TabletConfig struct {
 	Healthcheck  HealthcheckConfig  `json:"healthcheck,omitempty"`
 	GracePeriods GracePeriodsConfig `json:"gracePeriods,omitempty"`
 
+	SemiSyncMonitor SemiSyncMonitorConfig `json:"semiSyncMonitor,omitempty"`
+
 	ReplicationTracker ReplicationTrackerConfig `json:"replicationTracker,omitempty"`
 
 	// Consolidator can be enable, disable, or notOnPrimary. Default is enable.
@@ -316,6 +330,7 @@ type TabletConfig struct {
 	StreamBufferSize            int           `json:"streamBufferSize,omitempty"`
 	ConsolidatorStreamTotalSize int64         `json:"consolidatorStreamTotalSize,omitempty"`
 	ConsolidatorStreamQuerySize int64         `json:"consolidatorStreamQuerySize,omitempty"`
+	ConsolidatorQueryWaiterCap  int64         `json:"consolidatorMaxQueryWait,omitempty"`
 	QueryCacheMemory            int64         `json:"queryCacheMemory,omitempty"`
 	QueryCacheDoorkeeper        bool          `json:"queryCacheDoorkeeper,omitempty"`
 	SchemaReloadInterval        time.Duration `json:"schemaReloadIntervalSeconds,omitempty"`
@@ -331,12 +346,11 @@ type TabletConfig struct {
 
 	ExternalConnections map[string]*dbconfigs.DBConfigs `json:"externalConnections,omitempty"`
 
-	SanitizeLogMessages  bool    `json:"-"`
-	StrictTableACL       bool    `json:"-"`
-	EnableTableACLDryRun bool    `json:"-"`
-	TableACLExemptACL    string  `json:"-"`
-	TwoPCEnable          bool    `json:"-"`
-	TwoPCAbandonAge      Seconds `json:"-"`
+	SanitizeLogMessages  bool          `json:"-"`
+	StrictTableACL       bool          `json:"-"`
+	EnableTableACLDryRun bool          `json:"-"`
+	TableACLExemptACL    string        `json:"-"`
+	TwoPCAbandonAge      time.Duration `json:"-"`
 
 	EnableTxThrottler              bool                          `json:"-"`
 	TxThrottlerConfig              *TxThrottlerConfigFlag        `json:"-"`
@@ -358,6 +372,7 @@ type TabletConfig struct {
 	EnableViews bool `json:"-"`
 
 	EnablePerWorkloadTableMetrics bool `json:"-"`
+	SkipUserMetrics               bool `json:"-"`
 }
 
 func (cfg *TabletConfig) MarshalJSON() ([]byte, error) {
@@ -421,6 +436,7 @@ type ConnPoolConfig struct {
 	Size               int           `json:"size,omitempty"`
 	Timeout            time.Duration `json:"timeoutSeconds,omitempty"`
 	IdleTimeout        time.Duration `json:"idleTimeoutSeconds,omitempty"`
+	MaxIdleCount       int           `json:"maxIdleCount,omitempty"`
 	MaxLifetime        time.Duration `json:"maxLifetimeSeconds,omitempty"`
 	PrefillParallelism int           `json:"prefillParallelism,omitempty"`
 }
@@ -430,9 +446,10 @@ func (cfg *ConnPoolConfig) MarshalJSON() ([]byte, error) {
 
 	tmp := struct {
 		Proxy
-		Timeout     string `json:"timeoutSeconds,omitempty"`
-		IdleTimeout string `json:"idleTimeoutSeconds,omitempty"`
-		MaxLifetime string `json:"maxLifetimeSeconds,omitempty"`
+		Timeout      string `json:"timeoutSeconds,omitempty"`
+		IdleTimeout  string `json:"idleTimeoutSeconds,omitempty"`
+		MaxIdleCount int    `json:"maxIdleCount,omitempty"`
+		MaxLifetime  string `json:"maxLifetimeSeconds,omitempty"`
 	}{
 		Proxy: Proxy(*cfg),
 	}
@@ -457,6 +474,7 @@ func (cfg *ConnPoolConfig) UnmarshalJSON(data []byte) (err error) {
 		Size               int    `json:"size,omitempty"`
 		Timeout            string `json:"timeoutSeconds,omitempty"`
 		IdleTimeout        string `json:"idleTimeoutSeconds,omitempty"`
+		MaxIdleCount       int    `json:"maxIdleCount,omitempty"`
 		MaxLifetime        string `json:"maxLifetimeSeconds,omitempty"`
 		PrefillParallelism int    `json:"prefillParallelism,omitempty"`
 	}
@@ -487,6 +505,7 @@ func (cfg *ConnPoolConfig) UnmarshalJSON(data []byte) (err error) {
 	}
 
 	cfg.Size = tmp.Size
+	cfg.MaxIdleCount = tmp.MaxIdleCount
 	cfg.PrefillParallelism = tmp.PrefillParallelism
 
 	return nil
@@ -598,6 +617,42 @@ type HotRowProtectionConfig struct {
 	MaxQueueSize       int    `json:"maxQueueSize,omitempty"`
 	MaxGlobalQueueSize int    `json:"maxGlobalQueueSize,omitempty"`
 	MaxConcurrency     int    `json:"maxConcurrency,omitempty"`
+}
+
+// SemiSyncMonitorConfig contains the config for the semi-sync monitor.
+type SemiSyncMonitorConfig struct {
+	Interval time.Duration
+}
+
+func (cfg *SemiSyncMonitorConfig) MarshalJSON() ([]byte, error) {
+	var tmp struct {
+		IntervalSeconds string `json:"intervalSeconds,omitempty"`
+	}
+
+	if d := cfg.Interval; d != 0 {
+		tmp.IntervalSeconds = d.String()
+	}
+
+	return json.Marshal(&tmp)
+}
+
+func (cfg *SemiSyncMonitorConfig) UnmarshalJSON(data []byte) (err error) {
+	var tmp struct {
+		Interval string `json:"intervalSeconds,omitempty"`
+	}
+
+	if err = json.Unmarshal(data, &tmp); err != nil {
+		return err
+	}
+
+	if tmp.Interval != "" {
+		cfg.Interval, err = time.ParseDuration(tmp.Interval)
+		if err != nil {
+			return err
+		}
+	}
+
+	return nil
 }
 
 // HealthcheckConfig contains the config for healthcheck.
@@ -848,16 +903,16 @@ func (c *TabletConfig) Verify() error {
 		return err
 	}
 	if v := c.HotRowProtection.MaxQueueSize; v <= 0 {
-		return fmt.Errorf("--hot_row_protection_max_queue_size must be > 0 (specified value: %v)", v)
+		return fmt.Errorf("--hot-row-protection-max-queue-size must be > 0 (specified value: %v)", v)
 	}
 	if v := c.HotRowProtection.MaxGlobalQueueSize; v <= 0 {
-		return fmt.Errorf("--hot_row_protection_max_global_queue_size must be > 0 (specified value: %v)", v)
+		return fmt.Errorf("--hot-row-protection-max-global-queue-size must be > 0 (specified value: %v)", v)
 	}
 	if globalSize, size := c.HotRowProtection.MaxGlobalQueueSize, c.HotRowProtection.MaxQueueSize; globalSize < size {
-		return fmt.Errorf("global queue size must be >= per row (range) queue size: -hot_row_protection_max_global_queue_size < hot_row_protection_max_queue_size (%v < %v)", globalSize, size)
+		return fmt.Errorf("global queue size must be >= per row (range) queue size: -hot-row-protection-max-global-queue-size < hot-row-protection-max-queue-size (%v < %v)", globalSize, size)
 	}
 	if v := c.HotRowProtection.MaxConcurrency; v <= 0 {
-		return fmt.Errorf("--hot_row_protection_concurrent_transactions must be > 0 (specified value: %v)", v)
+		return fmt.Errorf("--hot-row-protection-concurrent-transactions must be > 0 (specified value: %v)", v)
 	}
 	return nil
 }
@@ -877,7 +932,12 @@ func (c *TabletConfig) verifyUnmanagedTabletConfig() error {
 		return errors.New("database app user not specified")
 	}
 	if c.DB.App.Password == "" {
-		return errors.New("database app user password not specified")
+		_, pass, err := dbconfigs.GetCredentialsServer().GetUserAndPassword(c.DB.App.User)
+		if err == nil && pass != "" {
+			c.DB.App.Password = pass
+		} else {
+			return errors.New("database app user password not specified")
+		}
 	}
 	// Replication fixes should be disabled for Unmanaged tablets.
 	mysqlctl.DisableActiveReparents = true
@@ -910,7 +970,7 @@ func (c *TabletConfig) checkConnectionForExternalMysql() error {
 func (c *TabletConfig) verifyTransactionLimitConfig() error {
 	actual, dryRun := c.EnableTransactionLimit, c.EnableTransactionLimitDryRun
 	if actual && dryRun {
-		return errors.New("only one of two flags allowed: --enable_transaction_limit or --enable_transaction_limit_dry_run")
+		return errors.New("only one of two flags allowed: --enable-transaction-limit or --enable-transaction-limit-dry-run")
 	}
 
 	// Skip other checks if this is not enabled
@@ -928,10 +988,10 @@ func (c *TabletConfig) verifyTransactionLimitConfig() error {
 		return errors.New("no user discriminating fields selected for transaction limiter, everyone would share single chunk of transaction pool. Override with at least one of --transaction_limit_by flags set to true")
 	}
 	if v := c.TransactionLimitPerUser; v <= 0 || v >= 1 {
-		return fmt.Errorf("--transaction_limit_per_user should be a fraction within range (0, 1) (specified value: %v)", v)
+		return fmt.Errorf("--transaction-limit-per-user should be a fraction within range (0, 1) (specified value: %v)", v)
 	}
 	if limit := int(c.TransactionLimitPerUser * float64(c.TxPool.Size)); limit == 0 {
-		return fmt.Errorf("effective transaction limit per user is 0 due to rounding, increase --transaction_limit_per_user")
+		return fmt.Errorf("effective transaction limit per user is 0 due to rounding, increase --transaction-limit-per-user")
 	}
 	return nil
 }
@@ -995,6 +1055,9 @@ var defaultConfig = TabletConfig{
 		DegradedThreshold:  30 * time.Second,
 		UnhealthyThreshold: 2 * time.Hour,
 	},
+	SemiSyncMonitor: SemiSyncMonitorConfig{
+		Interval: 10 * time.Second,
+	},
 	ReplicationTracker: ReplicationTrackerConfig{
 		Mode:              Disable,
 		HeartbeatInterval: 250 * time.Millisecond,
@@ -1049,11 +1112,13 @@ var defaultConfig = TabletConfig{
 	EnableTableGC:            true,
 
 	RowStreamer: RowStreamerConfig{
-		MaxInnoDBTrxHistLen: 1000000,
+		MaxInnoDBTrxHistLen: 10000000,
 		MaxMySQLReplLagSecs: 43200,
 	},
 
 	EnablePerWorkloadTableMetrics: false,
+
+	TwoPCAbandonAge: 15 * time.Minute,
 }
 
 // defaultTxThrottlerConfig returns the default TxThrottlerConfigFlag object based on

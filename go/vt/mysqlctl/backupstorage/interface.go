@@ -25,7 +25,9 @@ import (
 
 	"github.com/spf13/pflag"
 
-	"vitess.io/vitess/go/vt/concurrency"
+	"vitess.io/vitess/go/vt/mysqlctl/errors"
+	"vitess.io/vitess/go/vt/utils"
+
 	"vitess.io/vitess/go/vt/servenv"
 )
 
@@ -40,7 +42,7 @@ var (
 )
 
 func registerBackupFlags(fs *pflag.FlagSet) {
-	fs.StringVar(&BackupStorageImplementation, "backup_storage_implementation", "", "Which backup storage implementation to use for creating and restoring backups.")
+	utils.SetFlagStringVar(fs, &BackupStorageImplementation, "backup-storage-implementation", "", "Which backup storage implementation to use for creating and restoring backups.")
 }
 
 func init() {
@@ -89,9 +91,9 @@ type BackupHandle interface {
 	// ReadCloser is closed.
 	ReadFile(ctx context.Context, filename string) (io.ReadCloser, error)
 
-	// concurrency.ErrorRecorder is embedded here to coordinate reporting and
-	// handling of errors among all the components involved in taking a backup.
-	concurrency.ErrorRecorder
+	// BackupErrorRecorder is embedded here to coordinate reporting and
+	// handling of errors among all the components involved in taking/restoring a backup.
+	errors.BackupErrorRecorder
 }
 
 // BackupStorage is the interface to the storage system

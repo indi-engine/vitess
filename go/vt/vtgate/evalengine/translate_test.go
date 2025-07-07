@@ -89,8 +89,8 @@ func TestTranslateSimplification(t *testing.T) {
 		{"coalesce(NULL, 2, NULL, 4)", ok("coalesce(null, 2, null, 4)"), ok("2")},
 		{"coalesce(NULL, NULL)", ok("coalesce(null, null)"), ok("null")},
 		{"coalesce(NULL)", ok("coalesce(null)"), ok("null")},
-		{"weight_string('foobar')", ok(`weight_string('foobar')`), ok("'\x1c\xe5\x1d\xdd\x1d\xdd\x1c`\x1cG\x1e3'")},
-		{"weight_string('foobar' as char(12))", ok(`weight_string('foobar' as char(12))`), ok("'\x1c\xe5\x1d\xdd\x1d\xdd\x1c`\x1cG\x1e3'")},
+		{"weight_string('foobar')", ok(`weight_string('foobar')`), ok("_binary'\x1c\xe5\x1d\xdd\x1d\xdd\x1c`\x1cG\x1e3'")},
+		{"weight_string('foobar' as char(12))", ok(`weight_string('foobar' as char(12))`), ok("_binary'\x1c\xe5\x1d\xdd\x1d\xdd\x1c`\x1cG\x1e3'")},
 		{"case when 1 = 1 then 2 else 3 end", ok("case when 1 = 1 then 2 else 3"), ok("2")},
 		{"case when null then 2 when 12 = 4 then 'ohnoes' else 42 end", ok(`case when null then 2 when 12 = 4 then 'ohnoes' else 42`), ok(`'42'`)},
 		{"convert('a', char(2) character set utf8mb4)", ok(`convert('a', CHAR(2) character set utf8mb4_0900_ai_ci)`), ok(`'a'`)},
@@ -134,7 +134,7 @@ func TestTranslateSimplification(t *testing.T) {
 				NoCompilation:     true,
 			}
 
-			astExpr := stmt.(*sqlparser.Select).SelectExprs[0].(*sqlparser.AliasedExpr).Expr
+			astExpr := stmt.(*sqlparser.Select).SelectExprs.Exprs[0].(*sqlparser.AliasedExpr).Expr
 			converted, err := Translate(astExpr, cfg)
 			if err != nil {
 				if tc.converted.err == "" {
@@ -305,7 +305,7 @@ func TestEvaluate(t *testing.T) {
 			// Given
 			stmt, err := sqlparser.NewTestParser().Parse("select " + test.expression)
 			require.NoError(t, err)
-			astExpr := stmt.(*sqlparser.Select).SelectExprs[0].(*sqlparser.AliasedExpr).Expr
+			astExpr := stmt.(*sqlparser.Select).SelectExprs.Exprs[0].(*sqlparser.AliasedExpr).Expr
 			sqltypesExpr, err := Translate(astExpr, &Config{
 				Collation:   venv.CollationEnv().DefaultConnectionCharset(),
 				Environment: venv,
@@ -354,7 +354,7 @@ func TestEvaluateTuple(t *testing.T) {
 			// Given
 			stmt, err := sqlparser.NewTestParser().Parse("select " + test.expression)
 			require.NoError(t, err)
-			astExpr := stmt.(*sqlparser.Select).SelectExprs[0].(*sqlparser.AliasedExpr).Expr
+			astExpr := stmt.(*sqlparser.Select).SelectExprs.Exprs[0].(*sqlparser.AliasedExpr).Expr
 			sqltypesExpr, err := Translate(astExpr, &Config{
 				Collation:   venv.CollationEnv().DefaultConnectionCharset(),
 				Environment: venv,
@@ -395,7 +395,7 @@ func TestTranslationFailures(t *testing.T) {
 			// Given
 			stmt, err := sqlparser.NewTestParser().Parse("select " + testcase.expression)
 			require.NoError(t, err)
-			astExpr := stmt.(*sqlparser.Select).SelectExprs[0].(*sqlparser.AliasedExpr).Expr
+			astExpr := stmt.(*sqlparser.Select).SelectExprs.Exprs[0].(*sqlparser.AliasedExpr).Expr
 			_, err = Translate(astExpr, &Config{
 				Collation:   venv.CollationEnv().DefaultConnectionCharset(),
 				Environment: venv,
@@ -435,7 +435,7 @@ func TestCardinalityWithBindVariables(t *testing.T) {
 					return err
 				}
 
-				astExpr := stmt.(*sqlparser.Select).SelectExprs[0].(*sqlparser.AliasedExpr).Expr
+				astExpr := stmt.(*sqlparser.Select).SelectExprs.Exprs[0].(*sqlparser.AliasedExpr).Expr
 				_, err = Translate(astExpr, &Config{
 					Collation:     venv.CollationEnv().DefaultConnectionCharset(),
 					Environment:   venv,
@@ -451,4 +451,20 @@ func TestCardinalityWithBindVariables(t *testing.T) {
 			}
 		})
 	}
+}
+
+func TestBindVarType(t *testing.T) {
+	lhs := sqlparser.NewTypedArgument("lhs", sqltypes.Int32)
+	rhs := sqlparser.NewTypedArgument("rhs", sqltypes.Int64)
+	venv := vtenv.NewTestEnv()
+	cmp := &sqlparser.ComparisonExpr{
+		Operator: sqlparser.EqualOp,
+		Left:     lhs,
+		Right:    rhs,
+	}
+	_, err := Translate(cmp, &Config{
+		Collation:   venv.CollationEnv().DefaultConnectionCharset(),
+		Environment: venv,
+	})
+	require.NoError(t, err)
 }

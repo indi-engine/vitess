@@ -30,6 +30,7 @@ import (
 
 	"vitess.io/vitess/go/vt/grpcclient"
 	"vitess.io/vitess/go/vt/log"
+	replicationdatapb "vitess.io/vitess/go/vt/proto/replicationdata"
 	"vitess.io/vitess/go/vt/vtgate/grpcvtgateconn"
 
 	"github.com/buger/jsonparser"
@@ -101,6 +102,15 @@ func GetPrimaryPosition(t *testing.T, vttablet Vttablet, hostname string) (strin
 	return pos, gtID
 }
 
+// FullStatus gets the full status from the given tablet.
+func FullStatus(t *testing.T, vttablet *Vttablet, hostname string) *replicationdatapb.FullStatus {
+	ctx := context.Background()
+	vtablet := getTablet(vttablet.GrpcPort, hostname)
+	status, err := tmClient.FullStatus(ctx, vtablet)
+	require.NoError(t, err)
+	return status
+}
+
 // VerifyRowsInTabletForTable verifies the total number of rows in a table.
 // This is used to check that replication has caught up with the changes on primary.
 func VerifyRowsInTabletForTable(t *testing.T, vttablet *Vttablet, ksName string, expectedRows int, tableName string) {
@@ -124,15 +134,6 @@ func VerifyRowsInTabletForTable(t *testing.T, vttablet *Vttablet, ksName string,
 // VerifyRowsInTablet Verify total number of rows in a tablet
 func VerifyRowsInTablet(t *testing.T, vttablet *Vttablet, ksName string, expectedRows int) {
 	VerifyRowsInTabletForTable(t, vttablet, ksName, expectedRows, "vt_insert_test")
-}
-
-// PanicHandler handles the panic in the testcase.
-func PanicHandler(t testing.TB) {
-	err := recover()
-	if t == nil {
-		return
-	}
-	require.Nilf(t, err, "panic occured in testcase %v", t.Name())
 }
 
 // ListBackups Lists back preset in shard
@@ -284,7 +285,7 @@ func positionAtLeast(t *testing.T, tablet *Vttablet, a string, b string) bool {
 
 // ExecuteQueriesUsingVtgate sends query to vtgate using vtgate session.
 func ExecuteQueriesUsingVtgate(t *testing.T, session *vtgateconn.VTGateSession, query string) {
-	_, err := session.Execute(context.Background(), query, nil)
+	_, err := session.Execute(context.Background(), query, nil, false)
 	require.Nil(t, err)
 }
 
@@ -306,22 +307,6 @@ func NewConnParams(port int, password, socketPath, keyspace string) mysql.ConnPa
 
 	return cp
 
-}
-
-func filterDoubleDashArgs(args []string, version int) (filtered []string) {
-	if version > 13 {
-		return args
-	}
-
-	for _, arg := range args {
-		if arg == "--" {
-			continue
-		}
-
-		filtered = append(filtered, arg)
-	}
-
-	return filtered
 }
 
 // WriteDbCredentialToTmp writes JSON formatted db credentials to the
@@ -389,11 +374,11 @@ func ExecuteOnTablet(t *testing.T, query string, vttablet Vttablet, ks string, e
 	_, _ = vttablet.VttabletProcess.QueryTablet("commit", ks, true)
 }
 
-func WaitForTabletSetup(vtctlClientProcess *VtctlClientProcess, expectedTablets int, expectedStatus []string) error {
+func WaitForTabletSetup(vtctldClientProcess *VtctldClientProcess, expectedTablets int, expectedStatus []string) error {
 	// wait for both tablet to get into replica state in topo
 	waitUntil := time.Now().Add(10 * time.Second)
 	for time.Now().Before(waitUntil) {
-		result, err := vtctlClientProcess.ExecuteCommandWithOutput("ListAllTablets")
+		result, err := vtctldClientProcess.ExecuteCommandWithOutput("GetTablets")
 		if err != nil {
 			return err
 		}

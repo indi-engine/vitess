@@ -23,7 +23,6 @@ import (
 	"time"
 
 	"github.com/stretchr/testify/assert"
-
 	"github.com/stretchr/testify/require"
 
 	"vitess.io/vitess/go/sqltypes"
@@ -37,7 +36,7 @@ import (
 )
 
 func TestPoolSize(t *testing.T) {
-	revert := changeVar(t, "PoolSize", "1")
+	revert := changeVar(t, "ReadPoolSize", "1")
 	defer revert()
 
 	vstart := framework.DebugVars()
@@ -71,6 +70,48 @@ func TestStreamPoolSize(t *testing.T) {
 
 	vstart := framework.DebugVars()
 	verifyIntValue(t, vstart, "StreamConnPoolCapacity", 1)
+}
+
+// TestTxPoolSize starts 2 transactions, one in normal pool and one in found rows pool of transaction pool.
+// Changing the pool size to 1, we verify that the pool size is updated and the pool is full when we try to acquire next transaction.
+func TestTxPoolSize(t *testing.T) {
+	vstart := framework.DebugVars()
+
+	verifyIntValue(t, vstart, "TransactionPoolCapacity", 20)
+	verifyIntValue(t, vstart, "FoundRowsPoolCapacity", 20)
+
+	client1 := framework.NewClient()
+	err := client1.Begin( /* found rows pool*/ false)
+	require.NoError(t, err)
+	defer client1.Rollback()
+	verifyIntValue(t, framework.DebugVars(), "TransactionPoolAvailable", framework.FetchInt(vstart, "TransactionPoolAvailable")-1)
+
+	client2 := framework.NewClient()
+	err = client2.Begin( /* found rows pool*/ true)
+	require.NoError(t, err)
+	defer client2.Rollback()
+	verifyIntValue(t, framework.DebugVars(), "FoundRowsPoolAvailable", framework.FetchInt(vstart, "FoundRowsPoolAvailable")-1)
+
+	revert := changeVar(t, "TransactionPoolSize", "1")
+	defer revert()
+	vend := framework.DebugVars()
+	verifyIntValue(t, vend, "TransactionPoolAvailable", 0)
+	verifyIntValue(t, vend, "TransactionPoolCapacity", 1)
+	verifyIntValue(t, vend, "FoundRowsPoolAvailable", 0)
+	verifyIntValue(t, vend, "FoundRowsPoolCapacity", 1)
+	assert.Equal(t, 1, framework.Server.TxPoolSize())
+
+	client3 := framework.NewClient()
+
+	// tx pool - normal
+	err = client3.Begin( /* found rows pool*/ false)
+	require.ErrorContains(t, err, "connection limit exceeded")
+	compareIntDiff(t, framework.DebugVars(), "Errors/RESOURCE_EXHAUSTED", vstart, 1)
+
+	// tx pool - found rows
+	err = client3.Begin( /* found rows pool*/ true)
+	require.ErrorContains(t, err, "connection limit exceeded")
+	compareIntDiff(t, framework.DebugVars(), "Errors/RESOURCE_EXHAUSTED", vstart, 2)
 }
 
 func TestDisableConsolidator(t *testing.T) {
@@ -277,6 +318,29 @@ func TestQueryTimeout(t *testing.T) {
 	vend := framework.DebugVars()
 	verifyIntValue(t, vend, "QueryTimeout", int(100*time.Millisecond))
 	compareIntDiff(t, vend, "Kills/Connections", vstart, 1)
+}
+
+// TestHeartbeatMetric validates the heartbeat metrics exists from the connection pool.
+func TestHeartbeatMetric(t *testing.T) {
+	tcases := []struct {
+		metricName string
+		exp        any
+	}{{
+		metricName: "HeartbeatWriteAppPoolCapacity",
+		exp:        2,
+	}, {
+		metricName: "HeartbeatWriteAllPrivsPoolCapacity",
+		exp:        2,
+	}}
+
+	metrics := framework.DebugVars()
+	for _, tcase := range tcases {
+		t.Run(tcase.metricName, func(t *testing.T) {
+			mValue, exists := metrics[tcase.metricName]
+			require.True(t, exists, "metric %s not found", tcase.metricName)
+			require.EqualValues(t, tcase.exp, mValue, "metric %s value is %d, want %d", tcase.metricName, mValue, tcase.exp)
+		})
+	}
 }
 
 func changeVar(t *testing.T, name, value string) (revert func()) {

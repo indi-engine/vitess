@@ -23,8 +23,6 @@ import (
 
 	"vitess.io/vitess/go/vt/vtgate/evalengine"
 
-	topodatapb "vitess.io/vitess/go/vt/proto/topodata"
-
 	"vitess.io/vitess/go/sqltypes"
 	"vitess.io/vitess/go/vt/srvtopo"
 	"vitess.io/vitess/go/vt/vtgate/vindexes"
@@ -42,8 +40,8 @@ type VindexValues struct {
 
 // Update represents the instructions to perform an update.
 type Update struct {
-	// Update does not take inputs
 	noInputs
+	noFields
 
 	*DML
 
@@ -63,6 +61,8 @@ func (upd *Update) TryExecute(ctx context.Context, vcursor VCursor, bindVars map
 	}
 
 	switch upd.Opcode {
+	case None:
+		return &sqltypes.Result{}, nil
 	case Unsharded:
 		return upd.execUnsharded(ctx, upd, vcursor, bindVars, rss)
 	case Equal, EqualUnique, IN, Scatter, ByDestination, SubShard, MultiEqual:
@@ -83,11 +83,6 @@ func (upd *Update) TryStreamExecute(ctx context.Context, vcursor VCursor, bindVa
 
 }
 
-// GetFields fetches the field info.
-func (upd *Update) GetFields(ctx context.Context, vcursor VCursor, bindVars map[string]*querypb.BindVariable) (*sqltypes.Result, error) {
-	return nil, fmt.Errorf("BUG: unreachable code for %q", upd.Query)
-}
-
 // updateVindexEntries performs an update when a vindex is being modified
 // by the statement.
 // Note: the commit order may be different from the DML order because it's possible
@@ -95,14 +90,14 @@ func (upd *Update) GetFields(ctx context.Context, vcursor VCursor, bindVars map[
 // Note 2: While changes are being committed, the changing row could be
 // unreachable by either the new or old column values.
 func (upd *Update) updateVindexEntries(ctx context.Context, vcursor VCursor, bindVars map[string]*querypb.BindVariable, rss []*srvtopo.ResolvedShard) error {
-	if len(upd.ChangedVindexValues) == 0 {
+	if !upd.isVindexModified() {
 		return nil
 	}
 	queries := make([]*querypb.BoundQuery, len(rss))
 	for i := range rss {
 		queries[i] = &querypb.BoundQuery{Sql: upd.OwnedVindexQuery, BindVariables: bindVars}
 	}
-	subQueryResult, errors := vcursor.ExecuteMultiShard(ctx, upd, rss, queries, false /* rollbackOnError */, false /* canAutocommit */)
+	subQueryResult, errors := vcursor.ExecuteMultiShard(ctx, upd, rss, queries, false /*rollbackOnError*/, false /*canAutocommit*/, upd.FetchLastInsertID)
 	for _, err := range errors {
 		if err != nil {
 			return err
@@ -194,10 +189,13 @@ func (upd *Update) updateVindexEntries(ctx context.Context, vcursor VCursor, bin
 	return nil
 }
 
+func (upd *Update) isVindexModified() bool {
+	return len(upd.ChangedVindexValues) != 0
+}
+
 func (upd *Update) description() PrimitiveDescription {
 	other := map[string]any{
 		"Query":                upd.Query,
-		"Table":                upd.GetTableName(),
 		"OwnedVindexQuery":     upd.OwnedVindexQuery,
 		"MultiShardAutocommit": upd.MultiShardAutocommit,
 		"QueryTimeout":         upd.QueryTimeout,
@@ -214,12 +212,14 @@ func (upd *Update) description() PrimitiveDescription {
 	if len(changedVindexes) > 0 {
 		other["ChangedVindexValues"] = changedVindexes
 	}
+	if upd.FetchLastInsertID {
+		other["FetchLastInsertID"] = upd.FetchLastInsertID
+	}
 
 	return PrimitiveDescription{
-		OperatorType:     "Update",
-		Keyspace:         upd.Keyspace,
-		Variant:          upd.Opcode.String(),
-		TargetTabletType: topodatapb.TabletType_PRIMARY,
-		Other:            other,
+		OperatorType: "Update",
+		Keyspace:     upd.Keyspace,
+		Variant:      upd.Opcode.String(),
+		Other:        other,
 	}
 }

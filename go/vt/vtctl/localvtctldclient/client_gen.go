@@ -171,6 +171,11 @@ func (client *localVtctldClient) CancelSchemaMigration(ctx context.Context, in *
 	return client.s.CancelSchemaMigration(ctx, in)
 }
 
+// ChangeTabletTags is part of the vtctlservicepb.VtctldClient interface.
+func (client *localVtctldClient) ChangeTabletTags(ctx context.Context, in *vtctldatapb.ChangeTabletTagsRequest, opts ...grpc.CallOption) (*vtctldatapb.ChangeTabletTagsResponse, error) {
+	return client.s.ChangeTabletTags(ctx, in)
+}
+
 // ChangeTabletType is part of the vtctlservicepb.VtctldClient interface.
 func (client *localVtctldClient) ChangeTabletType(ctx context.Context, in *vtctldatapb.ChangeTabletTypeRequest, opts ...grpc.CallOption) (*vtctldatapb.ChangeTabletTypeResponse, error) {
 	return client.s.ChangeTabletType(ctx, in)
@@ -194,6 +199,11 @@ func (client *localVtctldClient) CompleteSchemaMigration(ctx context.Context, in
 // ConcludeTransaction is part of the vtctlservicepb.VtctldClient interface.
 func (client *localVtctldClient) ConcludeTransaction(ctx context.Context, in *vtctldatapb.ConcludeTransactionRequest, opts ...grpc.CallOption) (*vtctldatapb.ConcludeTransactionResponse, error) {
 	return client.s.ConcludeTransaction(ctx, in)
+}
+
+// CopySchemaShard is part of the vtctlservicepb.VtctldClient interface.
+func (client *localVtctldClient) CopySchemaShard(ctx context.Context, in *vtctldatapb.CopySchemaShardRequest, opts ...grpc.CallOption) (*vtctldatapb.CopySchemaShardResponse, error) {
+	return client.s.CopySchemaShard(ctx, in)
 }
 
 // CreateKeyspace is part of the vtctlservicepb.VtctldClient interface.
@@ -391,6 +401,11 @@ func (client *localVtctldClient) GetTopologyPath(ctx context.Context, in *vtctld
 	return client.s.GetTopologyPath(ctx, in)
 }
 
+// GetTransactionInfo is part of the vtctlservicepb.VtctldClient interface.
+func (client *localVtctldClient) GetTransactionInfo(ctx context.Context, in *vtctldatapb.GetTransactionInfoRequest, opts ...grpc.CallOption) (*vtctldatapb.GetTransactionInfoResponse, error) {
+	return client.s.GetTransactionInfo(ctx, in)
+}
+
 // GetUnresolvedTransactions is part of the vtctlservicepb.VtctldClient interface.
 func (client *localVtctldClient) GetUnresolvedTransactions(ctx context.Context, in *vtctldatapb.GetUnresolvedTransactionsRequest, opts ...grpc.CallOption) (*vtctldatapb.GetUnresolvedTransactionsResponse, error) {
 	return client.s.GetUnresolvedTransactions(ctx, in)
@@ -421,6 +436,11 @@ func (client *localVtctldClient) LaunchSchemaMigration(ctx context.Context, in *
 	return client.s.LaunchSchemaMigration(ctx, in)
 }
 
+// LookupVindexComplete is part of the vtctlservicepb.VtctldClient interface.
+func (client *localVtctldClient) LookupVindexComplete(ctx context.Context, in *vtctldatapb.LookupVindexCompleteRequest, opts ...grpc.CallOption) (*vtctldatapb.LookupVindexCompleteResponse, error) {
+	return client.s.LookupVindexComplete(ctx, in)
+}
+
 // LookupVindexCreate is part of the vtctlservicepb.VtctldClient interface.
 func (client *localVtctldClient) LookupVindexCreate(ctx context.Context, in *vtctldatapb.LookupVindexCreateRequest, opts ...grpc.CallOption) (*vtctldatapb.LookupVindexCreateResponse, error) {
 	return client.s.LookupVindexCreate(ctx, in)
@@ -429,6 +449,11 @@ func (client *localVtctldClient) LookupVindexCreate(ctx context.Context, in *vtc
 // LookupVindexExternalize is part of the vtctlservicepb.VtctldClient interface.
 func (client *localVtctldClient) LookupVindexExternalize(ctx context.Context, in *vtctldatapb.LookupVindexExternalizeRequest, opts ...grpc.CallOption) (*vtctldatapb.LookupVindexExternalizeResponse, error) {
 	return client.s.LookupVindexExternalize(ctx, in)
+}
+
+// LookupVindexInternalize is part of the vtctlservicepb.VtctldClient interface.
+func (client *localVtctldClient) LookupVindexInternalize(ctx context.Context, in *vtctldatapb.LookupVindexInternalizeRequest, opts ...grpc.CallOption) (*vtctldatapb.LookupVindexInternalizeResponse, error) {
+	return client.s.LookupVindexInternalize(ctx, in)
 }
 
 // MaterializeCreate is part of the vtctlservicepb.VtctldClient interface.
@@ -722,6 +747,11 @@ func (client *localVtctldClient) ValidateKeyspace(ctx context.Context, in *vtctl
 	return client.s.ValidateKeyspace(ctx, in)
 }
 
+// ValidatePermissionsKeyspace is part of the vtctlservicepb.VtctldClient interface.
+func (client *localVtctldClient) ValidatePermissionsKeyspace(ctx context.Context, in *vtctldatapb.ValidatePermissionsKeyspaceRequest, opts ...grpc.CallOption) (*vtctldatapb.ValidatePermissionsKeyspaceResponse, error) {
+	return client.s.ValidatePermissionsKeyspace(ctx, in)
+}
+
 // ValidateSchemaKeyspace is part of the vtctlservicepb.VtctldClient interface.
 func (client *localVtctldClient) ValidateSchemaKeyspace(ctx context.Context, in *vtctldatapb.ValidateSchemaKeyspaceRequest, opts ...grpc.CallOption) (*vtctldatapb.ValidateSchemaKeyspaceResponse, error) {
 	return client.s.ValidateSchemaKeyspace(ctx, in)
@@ -745,6 +775,11 @@ func (client *localVtctldClient) ValidateVersionKeyspace(ctx context.Context, in
 // ValidateVersionShard is part of the vtctlservicepb.VtctldClient interface.
 func (client *localVtctldClient) ValidateVersionShard(ctx context.Context, in *vtctldatapb.ValidateVersionShardRequest, opts ...grpc.CallOption) (*vtctldatapb.ValidateVersionShardResponse, error) {
 	return client.s.ValidateVersionShard(ctx, in)
+}
+
+// WorkflowAddTables is part of the vtctlservicepb.VtctldClient interface.
+func (client *localVtctldClient) WorkflowAddTables(ctx context.Context, in *vtctldatapb.WorkflowAddTablesRequest, opts ...grpc.CallOption) (*vtctldatapb.WorkflowAddTablesResponse, error) {
+	return client.s.WorkflowAddTables(ctx, in)
 }
 
 // WorkflowDelete is part of the vtctlservicepb.VtctldClient interface.

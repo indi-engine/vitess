@@ -19,7 +19,6 @@ package sqltypes
 
 import (
 	"bytes"
-	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
@@ -27,11 +26,13 @@ import (
 	"math/big"
 	"strconv"
 	"strings"
+	"time"
 
 	"google.golang.org/protobuf/encoding/protowire"
 
 	"vitess.io/vitess/go/bytes2"
 	"vitess.io/vitess/go/hack"
+	"vitess.io/vitess/go/mysql/datetime"
 	"vitess.io/vitess/go/mysql/decimal"
 	"vitess.io/vitess/go/mysql/fastparse"
 	"vitess.io/vitess/go/mysql/format"
@@ -436,11 +437,79 @@ func (v Value) String() string {
 	return fmt.Sprintf("%v(%s)", Type(v.typ), v.val)
 }
 
+// ToTime returns the value as a time.Time in the provided location.
+// NULL values are returned as zero time.
+func (v Value) ToTime(loc *time.Location) (time.Time, error) {
+	if v.Type() == Null {
+		return time.Time{}, nil
+	}
+	switch v.Type() {
+	case Datetime, Timestamp:
+		return datetimeToTime(v, loc)
+	case Date:
+		return dateToTime(v, loc)
+	default:
+		return time.Time{}, ErrIncompatibleTypeCast
+	}
+}
+
+// ErrInvalidTime is returned when we fail to parse a datetime
+// string from MySQL. This should never happen unless things are
+// seriously messed up.
+var ErrInvalidTime = errors.New("invalid MySQL time string")
+
+func datetimeToTime(v Value, loc *time.Location) (time.Time, error) {
+	if v.IsNull() {
+		return time.Time{}, nil
+	}
+	// Valid format string offsets for a DATETIME
+	//  |DATETIME          |19+
+	//  |------------------|------|
+	// "2006-01-02 15:04:05.999999"
+	dt, _, ok := datetime.ParseDateTime(v.ToString(), -1)
+	if !ok {
+		return time.Time{}, ErrInvalidTime
+	}
+	if dt.IsZero() {
+		return time.Time{}, nil
+	}
+
+	if loc == nil {
+		loc = time.UTC
+	}
+	return time.Date(dt.Date.Year(), time.Month(dt.Date.Month()), dt.Date.Day(),
+		dt.Time.Hour(), dt.Time.Minute(), dt.Time.Second(), dt.Time.Nanosecond(), loc), nil
+}
+
+func dateToTime(v Value, loc *time.Location) (time.Time, error) {
+	if v.IsNull() {
+		return time.Time{}, nil
+	}
+	// Valid format string offsets for a DATE
+	//  |DATE     |10
+	//  |---------|
+	// "2006-01-02 00:00:00.000000"
+	d, ok := datetime.ParseDate(v.ToString())
+	if !ok {
+		return time.Time{}, ErrInvalidTime
+	}
+	if d.IsZero() {
+		return time.Time{}, nil
+	}
+
+	if loc == nil {
+		loc = time.UTC
+	}
+	return time.Date(d.Year(), time.Month(d.Month()), d.Day(), 0, 0, 0, 0, loc), nil
+}
+
 // EncodeSQL encodes the value into an SQL statement. Can be binary.
 func (v Value) EncodeSQL(b BinWriter) {
 	switch {
 	case v.Type() == Null:
 		b.Write(NullBytes)
+	case v.IsBinary():
+		encodeBinarySQL(v.val, b)
 	case v.IsQuoted():
 		encodeBytesSQL(v.val, b)
 	case v.Type() == Bit:
@@ -456,6 +525,8 @@ func (v Value) EncodeSQLStringBuilder(b *strings.Builder) {
 	switch {
 	case v.Type() == Null:
 		b.Write(NullBytes)
+	case v.IsBinary():
+		encodeBinarySQLStringBuilder(v.val, b)
 	case v.IsQuoted():
 		encodeBytesSQLStringBuilder(v.val, b)
 	case v.Type() == Bit:
@@ -482,22 +553,12 @@ func (v Value) EncodeSQLBytes2(b *bytes2.Buffer) {
 	switch {
 	case v.Type() == Null:
 		b.Write(NullBytes)
+	case v.IsBinary():
+		encodeBinarySQLBytes2(v.val, b)
 	case v.IsQuoted():
 		encodeBytesSQLBytes2(v.val, b)
 	case v.Type() == Bit:
 		encodeBytesSQLBits(v.val, b)
-	default:
-		b.Write(v.val)
-	}
-}
-
-// EncodeASCII encodes the value using 7-bit clean ascii bytes.
-func (v Value) EncodeASCII(b BinWriter) {
-	switch {
-	case v.Type() == Null:
-		b.Write(NullBytes)
-	case v.IsQuoted() || v.Type() == Bit:
-		encodeBytesASCII(v.val, b)
 	default:
 		b.Write(v.val)
 	}
@@ -758,6 +819,22 @@ func (v Value) TinyWeight() uint32 {
 	return v.tinyweight
 }
 
+func encodeBinarySQL(val []byte, b BinWriter) {
+	buf := &bytes2.Buffer{}
+	encodeBinarySQLBytes2(val, buf)
+	b.Write(buf.Bytes())
+}
+
+func encodeBinarySQLBytes2(val []byte, buf *bytes2.Buffer) {
+	buf.Write([]byte("_binary"))
+	encodeBytesSQLBytes2(val, buf)
+}
+
+func encodeBinarySQLStringBuilder(val []byte, buf *strings.Builder) {
+	buf.Write([]byte("_binary"))
+	encodeBytesSQLStringBuilder(val, buf)
+}
+
 func encodeBytesSQL(val []byte, b BinWriter) {
 	buf := &bytes2.Buffer{}
 	encodeBytesSQLBytes2(val, buf)
@@ -836,16 +913,6 @@ func encodeBytesSQLBits(val []byte, b BinWriter) {
 		fmt.Fprintf(b, "%08b", ch)
 	}
 	fmt.Fprint(b, "'")
-}
-
-func encodeBytesASCII(val []byte, b BinWriter) {
-	buf := &bytes2.Buffer{}
-	buf.WriteByte('\'')
-	encoder := base64.NewEncoder(base64.StdEncoding, buf)
-	encoder.Write(val)
-	encoder.Close()
-	buf.WriteByte('\'')
-	b.Write(buf.Bytes())
 }
 
 // SQLEncodeMap specifies how to escape binary data with '\'.

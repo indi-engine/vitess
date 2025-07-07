@@ -21,6 +21,7 @@ import (
 	"fmt"
 	"os"
 	"path"
+	"slices"
 	"strconv"
 	"strings"
 	"sync"
@@ -31,7 +32,8 @@ import (
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
-	"golang.org/x/exp/rand"
+
+	"math/rand/v2"
 
 	"vitess.io/vitess/go/mysql"
 	"vitess.io/vitess/go/syscallutil"
@@ -52,7 +54,9 @@ var (
 	}
 
 	insertIntoFuzzUpdate   = "INSERT INTO twopc_fuzzer_update (id, col) VALUES (%d, %d)"
+	insertIntoFuzzMulti    = "INSERT INTO twopc_fuzzer_multi (id) VALUES (%d)"
 	updateFuzzUpdate       = "UPDATE twopc_fuzzer_update SET col = col + %d WHERE id = %d"
+	updateFuzzUpdateMulti  = "UPDATE twopc_fuzzer_update join twopc_fuzzer_multi using (id) SET col = col + %d WHERE id = %d"
 	insertIntoFuzzInsert   = "INSERT INTO twopc_fuzzer_insert (id, updateSet, threadId) VALUES (%d, %d, %d)"
 	selectFromFuzzUpdate   = "SELECT col FROM twopc_fuzzer_update WHERE id = %d"
 	selectIdFromFuzzInsert = "SELECT threadId FROM twopc_fuzzer_insert WHERE updateSet = %d AND id = %d ORDER BY col"
@@ -105,12 +109,12 @@ func TestTwoPCFuzzTest(t *testing.T) {
 			timeForTesting: 5 * time.Second,
 		},
 		{
-			name:                  "Multiple Threads - Multiple Set - PRS, ERS, and MySQL & Vttablet restart, OnlineDDL, MoveTables disruptions",
+			name:                  "Multiple Threads - Multiple Set - PRS, ERS, and MySQL & Vttablet restart, OnlineDDL, MoveTables, Reshard disruptions",
 			threads:               4,
 			updateSets:            4,
 			timeForTesting:        5 * time.Second,
-			clusterDisruptions:    []func(t *testing.T){prs, ers, mysqlRestarts, vttabletRestarts, onlineDDLFuzzer, moveTablesFuzzer},
-			disruptionProbability: []int{5, 5, 5, 5, 5, 5},
+			clusterDisruptions:    []func(t *testing.T){prs, ers, mysqlRestarts, vttabletRestarts, onlineDDLFuzzer, moveTablesFuzzer, reshardFuzzer},
+			disruptionProbability: []int{5, 5, 5, 5, 5, 5, 5},
 		},
 	}
 
@@ -126,7 +130,18 @@ func TestTwoPCFuzzTest(t *testing.T) {
 			fz.start(t)
 
 			// Wait for the timeForTesting so that the threads continue to run.
-			time.Sleep(tt.timeForTesting)
+			timeout := time.After(tt.timeForTesting)
+			loop := true
+			for loop {
+				select {
+				case <-timeout:
+					loop = false
+				case <-time.After(1 * time.Second):
+					if t.Failed() {
+						loop = false
+					}
+				}
+			}
 
 			// Signal the fuzzer to stop.
 			fz.stop()
@@ -282,6 +297,10 @@ func (fz *fuzzer) initialize(t *testing.T, conn *mysql.Conn) {
 		for _, id := range updateSet {
 			_, err := conn.ExecuteFetch(fmt.Sprintf(insertIntoFuzzUpdate, id, 0), 0, false)
 			require.NoError(t, err)
+			// We insert the same id values in multi table as we in the update table. We use this for running
+			// multi-table updates and inserts.
+			_, err = conn.ExecuteFetch(fmt.Sprintf(insertIntoFuzzMulti, id), 0, false)
+			require.NoError(t, err)
 		}
 	}
 }
@@ -295,16 +314,18 @@ func (fz *fuzzer) generateAndExecuteTransaction(threadId int) {
 	}
 	defer conn.Close()
 	// randomly generate an update set to use and the value to increment it by.
-	updateSetVal := rand.Intn(fz.updateSets)
-	incrementVal := rand.Int31()
+	updateSetVal := rand.IntN(fz.updateSets)
+	incrementVal := rand.Int32()
 	// We have to generate the update queries first. We can run the inserts only after the update queries.
 	// Otherwise, our check to see that the ids in the twopc_fuzzer_insert table in all the shards are the exact same
 	// for each update set ordered by the auto increment column will not be true.
 	// That assertion depends on all the transactions running updates first to ensure that for any given update set,
 	// no two transactions are running the insert queries.
-	queries := []string{"begin"}
+	var queries []string
 	queries = append(queries, fz.generateUpdateQueries(updateSetVal, incrementVal)...)
 	queries = append(queries, fz.generateInsertQueries(updateSetVal, threadId)...)
+	queries = fz.addRandomSavePoints(queries)
+	queries = append([]string{"begin"}, queries...)
 	finalCommand := "commit"
 	for _, query := range queries {
 		_, err := conn.ExecuteFetch(query, 0, false)
@@ -317,12 +338,20 @@ func (fz *fuzzer) generateAndExecuteTransaction(threadId int) {
 	_, _ = conn.ExecuteFetch(finalCommand, 0, false)
 }
 
+func getUpdateQuery(incrementVal int32, id int) string {
+	if rand.IntN(2) == 1 {
+		return fmt.Sprintf(updateFuzzUpdateMulti, incrementVal, id)
+	}
+	return fmt.Sprintf(updateFuzzUpdate, incrementVal, id)
+}
+
 // generateUpdateQueries generates the queries to run updates on the twopc_fuzzer_update table.
 // It takes the update set index and the value to increment the set by.
 func (fz *fuzzer) generateUpdateQueries(updateSet int, incrementVal int32) []string {
 	var queries []string
 	for _, id := range fz.updateRowsVals[updateSet] {
-		queries = append(queries, fmt.Sprintf(updateFuzzUpdate, incrementVal, id))
+		// Use multi table DML queries half the time.
+		queries = append(queries, getUpdateQuery(incrementVal, id))
 	}
 	rand.Shuffle(len(queries), func(i, j int) {
 		queries[i], queries[j] = queries[j], queries[i]
@@ -370,11 +399,50 @@ func (fz *fuzzer) runClusterDisruptionThread(t *testing.T) {
 // runClusterDisruption tries to run a single cluster disruption.
 func (fz *fuzzer) runClusterDisruption(t *testing.T) {
 	for idx, prob := range fz.disruptionProbability {
-		if rand.Intn(100) < prob {
+		if rand.IntN(100) < prob {
 			fz.clusterDisruptions[idx](fz.t)
 			return
 		}
 	}
+}
+
+// addRandomSavePoints will add random savepoints and queries to the list of queries.
+// It still ensures that all the new queries added are rolledback so that the assertions of queries
+// don't change.
+func (fz *fuzzer) addRandomSavePoints(queries []string) []string {
+	savePointCount := 1
+	for {
+		shouldAddSavePoint := rand.IntN(2)
+		if shouldAddSavePoint == 0 {
+			return queries
+		}
+
+		savePointQueries := []string{"SAVEPOINT sp" + strconv.Itoa(savePointCount)}
+		randomDmlCount := rand.IntN(2) + 1
+		for i := 0; i < randomDmlCount; i++ {
+			savePointQueries = append(savePointQueries, fz.randomDML())
+		}
+		savePointQueries = append(savePointQueries, "ROLLBACK TO sp"+strconv.Itoa(savePointCount))
+		savePointCount++
+
+		savePointPosition := rand.IntN(len(queries))
+		newQueries := slices.Clone(queries[:savePointPosition])
+		newQueries = append(newQueries, savePointQueries...)
+		newQueries = append(newQueries, queries[savePointPosition:]...)
+		queries = newQueries
+	}
+}
+
+// randomDML generates a random DML to be used.
+func (fz *fuzzer) randomDML() string {
+	queryType := rand.IntN(2)
+	if queryType == 0 {
+		// Generate INSERT
+		return fmt.Sprintf(insertIntoFuzzInsert, updateRowBaseVals[rand.IntN(len(updateRowBaseVals))], rand.IntN(fz.updateSets), rand.IntN(fz.threads))
+	}
+	// Generate UPDATE
+	updateId := fz.updateRowsVals[rand.IntN(len(fz.updateRowsVals))][rand.IntN(len(updateRowBaseVals))]
+	return getUpdateQuery(rand.Int32N(100000), updateId)
 }
 
 /*
@@ -383,9 +451,9 @@ Cluster Level Disruptions for the fuzzer
 
 func prs(t *testing.T) {
 	shards := clusterInstance.Keyspaces[0].Shards
-	shard := shards[rand.Intn(len(shards))]
+	shard := shards[rand.IntN(len(shards))]
 	vttablets := shard.Vttablets
-	newPrimary := vttablets[rand.Intn(len(vttablets))]
+	newPrimary := vttablets[rand.IntN(len(vttablets))]
 	log.Errorf("Running PRS for - %v/%v with new primary - %v", keyspaceName, shard.Name, newPrimary.Alias)
 	err := clusterInstance.VtctldClientProcess.PlannedReparentShard(keyspaceName, shard.Name, newPrimary.Alias)
 	if err != nil {
@@ -395,9 +463,9 @@ func prs(t *testing.T) {
 
 func ers(t *testing.T) {
 	shards := clusterInstance.Keyspaces[0].Shards
-	shard := shards[rand.Intn(len(shards))]
+	shard := shards[rand.IntN(len(shards))]
 	vttablets := shard.Vttablets
-	newPrimary := vttablets[rand.Intn(len(vttablets))]
+	newPrimary := vttablets[rand.IntN(len(vttablets))]
 	log.Errorf("Running ERS for - %v/%v with new primary - %v", keyspaceName, shard.Name, newPrimary.Alias)
 	_, err := clusterInstance.VtctldClientProcess.ExecuteCommandWithOutput("EmergencyReparentShard", fmt.Sprintf("%s/%s", keyspaceName, shard.Name), "--new-primary", newPrimary.Alias)
 	if err != nil {
@@ -407,9 +475,9 @@ func ers(t *testing.T) {
 
 func vttabletRestarts(t *testing.T) {
 	shards := clusterInstance.Keyspaces[0].Shards
-	shard := shards[rand.Intn(len(shards))]
+	shard := shards[rand.IntN(len(shards))]
 	vttablets := shard.Vttablets
-	tablet := vttablets[rand.Intn(len(vttablets))]
+	tablet := vttablets[rand.IntN(len(vttablets))]
 	log.Errorf("Restarting vttablet for - %v/%v - %v", keyspaceName, shard.Name, tablet.Alias)
 	err := tablet.VttabletProcess.TearDown()
 	if err != nil {
@@ -486,11 +554,28 @@ func moveTablesFuzzer(t *testing.T) {
 	assert.NoError(t, err, output)
 }
 
+// reshardFuzzer runs a Reshard workflow.
+func reshardFuzzer(t *testing.T) {
+	var srcShards, targetShards string
+	shardCount := len(clusterInstance.Keyspaces[0].Shards)
+	if shardCount == 2 {
+		srcShards = "40-"
+		targetShards = "40-80,80-"
+	} else {
+		srcShards = "40-80,80-"
+		targetShards = "40-"
+	}
+	log.Errorf("Reshard from - \"%v\" to \"%v\"", srcShards, targetShards)
+	twopcutil.AddShards(t, clusterInstance, keyspaceName, strings.Split(targetShards, ","))
+	err := twopcutil.RunReshard(t, clusterInstance, "TestTwoPCFuzzTest", keyspaceName, srcShards, targetShards)
+	require.NoError(t, err)
+}
+
 func mysqlRestarts(t *testing.T) {
 	shards := clusterInstance.Keyspaces[0].Shards
-	shard := shards[rand.Intn(len(shards))]
+	shard := shards[rand.IntN(len(shards))]
 	vttablets := shard.Vttablets
-	tablet := vttablets[rand.Intn(len(vttablets))]
+	tablet := vttablets[rand.IntN(len(vttablets))]
 	log.Errorf("Restarting MySQL for - %v/%v tablet - %v", keyspaceName, shard.Name, tablet.Alias)
 	pidFile := path.Join(os.Getenv("VTDATAROOT"), fmt.Sprintf("/vt_%010d/mysql.pid", tablet.TabletUID))
 	pidBytes, err := os.ReadFile(pidFile)

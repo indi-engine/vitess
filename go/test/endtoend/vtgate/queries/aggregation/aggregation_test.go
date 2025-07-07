@@ -27,7 +27,6 @@ import (
 	"github.com/stretchr/testify/require"
 
 	"vitess.io/vitess/go/sqltypes"
-	"vitess.io/vitess/go/test/endtoend/cluster"
 	"vitess.io/vitess/go/test/endtoend/utils"
 )
 
@@ -55,6 +54,9 @@ func start(t *testing.T) (utils.MySQLCompare, func()) {
 			"emp",
 			"dept",
 			"bet_logs",
+			"example",
+			"example_enum_unknown",
+			"example_set_unknown",
 		}
 		for _, table := range tables {
 			_, _ = mcmp.ExecAndIgnore("delete from " + table)
@@ -66,7 +68,6 @@ func start(t *testing.T) (utils.MySQLCompare, func()) {
 	return mcmp, func() {
 		deleteAll()
 		mcmp.Close()
-		cluster.PanicHandler(t)
 	}
 }
 
